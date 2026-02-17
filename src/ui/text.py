@@ -24,6 +24,7 @@ import asyncio
 import sys
 import tty
 import termios
+import threading
 from collections import deque
 from dataclasses import dataclass
 from rich.console import Console
@@ -105,6 +106,23 @@ class ChatUI:
             spinner="dots",
             console=self.console
         )
+        self._spinner_messages = [
+            "On it...",
+            "Analyzing your request...",
+            "Thinking...",
+            "Planning...",
+            "Reasoning...",
+            "Searching for answers...",
+            "Connecting the dots...",
+            "Analyzing the details...",
+            "Crunching the numbers...",
+            "Almost there...",
+            "Piecing it together...",
+            "Diving deeper...",
+            "Finalizing...",
+        ]
+        self._spinner_step = 0
+        self._spinner_timer: Optional[threading.Timer] = None
         self.initialize()
         
     def set_theme(self, theme: str) -> None:
@@ -325,10 +343,6 @@ class ChatUI:
                 subtitle_align="right"
             )
 
-            # Scroll to the last message by printing enough newlines to push content up
-            if self.messages:
-                self.console.print()  # Add spacing after panel
-
             return panel
 
         except Exception as e:
@@ -408,12 +422,43 @@ class ChatUI:
             height=3
         )
     
+    def start_status(self) -> None:
+        """Start the status spinner with rotating messages."""
+        self._spinner_step = 0
+        self._update_spinner_text()
+        self.status.start()
+        self._schedule_spinner_rotation()
+
+    def _update_spinner_text(self) -> None:
+        """Update the spinner text to the current message."""
+        msg = self._spinner_messages[self._spinner_step % len(self._spinner_messages)]
+        style = self.theme.styles.get('prompt', 'bold dark_blue')
+        self.status.update(f"[{style}] 💡 {msg}[/]")
+
+    def _schedule_spinner_rotation(self) -> None:
+        """Schedule the next spinner message rotation."""
+        self._spinner_timer = threading.Timer(3.0, self._rotate_spinner)
+        self._spinner_timer.daemon = True
+        self._spinner_timer.start()
+
+    def _rotate_spinner(self) -> None:
+        """Advance to the next spinner message and schedule the next rotation."""
+        self._spinner_step += 1
+        self._update_spinner_text()
+        self._schedule_spinner_rotation()
+
     def stop_status(self) -> None:
         """
-        Safely stop the status spinner.
+        Safely stop the status spinner and cancel message rotation.
 
         Handles cases where status might not be initialized or already stopped.
         """
+        try:
+            if self._spinner_timer:
+                self._spinner_timer.cancel()
+                self._spinner_timer = None
+        except Exception:
+            pass
         try:
             if self.status and hasattr(self.status, 'stop'):
                 self.status.stop()
@@ -431,7 +476,6 @@ class ChatUI:
         Returns:
             Panel: The rendered chat UI panel (logs panel is printed separately if enabled)
         """
-        self.stop_status()
         messages_panel = self.render_messages()
 
         if self.show_logs:
@@ -598,6 +642,7 @@ class ChatUI:
 
     def get_user_input(self) -> str:
         """Get user input from the console with history support (up/down arrows)"""
+        self.stop_status()
         while True:
             self.console.print(self.render())
             self.console.print(Align.center(Text("OnIt may produce inaccurate information. Verify important details independently.", style="dim italic")))
@@ -611,8 +656,7 @@ class ChatUI:
                 self.console.print(self.render())
                 self.console.print(Align.center(Text("OnIt may produce inaccurate information. Verify important details independently.", style="dim italic")))
                 self.console.print()
-                self.status.update(f"[{self.theme.styles.get('prompt', 'bold dark_blue')}] 💡 On it...[/]")
-                self.status.start()
+                self.start_status()
                 return user_input
             # capture control-d
             except EOFError:
