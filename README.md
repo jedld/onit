@@ -136,15 +136,20 @@ docker run -it --rm -v $(pwd)/configs:/app/configs --env-file .env onit --config
 
 ### Docker Compose
 
-Start the web UI and A2A server together:
+Start the MCP servers, web UI, and A2A server together:
 
 ```bash
 docker compose up --build
 ```
 
-This launches the services defined in `docker-compose.yml` (web UI on port 9000 and A2A server on port 9001).
+This launches three services defined in `docker-compose.yml`:
+- **onit-mcp** — MCP servers on ports 18200-18204
+- **onit-web** — Web UI on port 9000 (depends on MCP servers)
+- **onit-a2a** — A2A server on port 9001 (depends on MCP servers)
 
-> **Note:** Pass API keys via an `.env` file or individual `-e KEY=value` flags. Never bake secrets into the image. If you run MCP servers inside the container (`onit --mcp`), expose ports 18200-18204 as well.
+The web and A2A services automatically use `--mcp-host onit-mcp` to route MCP requests to the MCP container via Docker networking.
+
+> **Note:** Pass API keys via an `.env` file or individual `-e KEY=value` flags. Never bake secrets into the image.
 
 ## Quick Start
 
@@ -210,7 +215,7 @@ servers:
     description: "MCP server for web search"
     enabled: true
     host: 0.0.0.0
-    port: 8080
+    port: 18201
     path: /search
     transport: 'streamable-http'
 ```
@@ -261,7 +266,7 @@ onit --a2a-client --a2a-host http://127.0.0.1:9001 --a2a-task "what is the weath
 | `--host` | LLM serving host URL (overrides config and `ONIT_HOST` env var) | — |
 | `--model` | Model name (overrides `serving.model` in config) | — |
 | `--verbose` | Enable verbose logging | `false` |
-| `--timeout` | Request timeout in seconds (`-1` = none) | `60` |
+| `--timeout` | Request timeout in seconds (`-1` = none) | `600` |
 | `--template-path` | Path to custom prompt template YAML file | — |
 
 **Text UI:**
@@ -317,19 +322,34 @@ persona: "assistant"
 verbose: false
 show_logs: false
 theme: dark
-timeout: 60
+timeout: 600
 
 # Paths
 session_path: "~/.onit/sessions"
 template_path:                # optional path to custom prompt template YAML
 
+# Web UI settings
+web_title: "OnIt Chat"
+web: false
+web_port: 9000
+web_share: false
+
+# Google OAuth2 Authentication (optional)
+web_google_client_id:
+web_google_client_secret:
+
 # MCP servers the agent connects to as a client
 mcp:
   # mcp_host: 192.168.1.100    # override host/IP in all server URLs (or use --mcp-host)
   servers:
+    - name: PromptsMCPServer
+      description: Provides prompt templates for instruction generation
+      url: http://127.0.0.1:18200/prompts
+      enabled: true
+
     - name: WebSearchHandler
-      description: Handles web search queries
-      url: http://127.0.0.1:8080/search
+      description: Handles web, news and weather search queries
+      url: http://127.0.0.1:18201/search
       enabled: true
 ```
 

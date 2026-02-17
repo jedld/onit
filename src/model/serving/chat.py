@@ -194,14 +194,14 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 chat_ui.add_log(error_message, level="error")
             elif verbose:
                 print(error_message)
-            return error_message
+            return None
         except OpenAIError as e:
             error_message = f"Error communicating with {host}: {e}."
             if chat_ui:
                 chat_ui.add_log(error_message, level="warning")
             elif verbose:
                 print(error_message)
-            return error_message
+            return None
         except Exception as e:
             error_message = f"Unexpected error: {e}"
             if chat_ui:

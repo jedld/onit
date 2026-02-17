@@ -1,14 +1,29 @@
 services:
+  onit-mcp:
+    build: .
+    ports:
+      - "18200:18200"
+      - "18201:18201"
+      - "18202:18202"
+      - "18203:18203"
+      - "18204:18204"
+    env_file: .env
+    command: ["--mcp"]
+
   onit-web:
     build: .
     ports:
       - "9000:9000"
     env_file: .env
-    command: ["--web", "--web-port", "9000"]
+    depends_on:
+      - onit-mcp
+    command: ["--web", "--web-port", "9000", "--mcp-host", "onit-mcp"]
 
   onit-a2a:
     build: .
     ports:
       - "9001:9001"
     env_file: .env
-    command: ["--a2a", "--a2a-port", "9001"]
+    depends_on:
+      - onit-mcp
+    command: ["--a2a", "--a2a-port", "9001", "--mcp-host", "onit-mcp"]
