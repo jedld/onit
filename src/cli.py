@@ -328,6 +328,24 @@ def main():
     if args.mcp_host:
         config_data.setdefault('mcp', {})['mcp_host'] = args.mcp_host
 
+    # Check that essential environment variables are set
+    serving = config_data.get('serving', {})
+    host = serving.get('host') or os.environ.get('ONIT_HOST')
+    host_key = serving.get('host_key', '')
+
+    missing = []
+    if not host:
+        missing.append('ONIT_HOST (or set serving.host in config)')
+    elif 'openrouter' in (host or '').lower():
+        if not host_key and not os.environ.get('OPENROUTER_API_KEY'):
+            missing.append('OPENROUTER_API_KEY (or set serving.host_key in config)')
+
+    if missing:
+        print("Warning: missing environment variable(s):", file=sys.stderr)
+        for var in missing:
+            print(f"  - {var}", file=sys.stderr)
+        print("Set them in your .env file or environment before running.", file=sys.stderr)
+
     onit = OnIt(config=config_data)
     asyncio.run(onit.run())
 

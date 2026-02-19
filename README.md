@@ -397,7 +397,9 @@ See example templates in `src/mcp/prompts/prompt_templates/`.
 | Bash | `tasks.os.bash` | Execute shell commands |
 | Document Search | `tasks.os.filesystem` | Search patterns in documents (text, PDF, markdown) with table extraction |
 | Microsoft Office | `tasks.office.microsoft` | Create Word, Excel, PowerPoint documents |
-| Google Workspace | `tasks.office.google` | Create Google Docs, Sheets, Slides |
+| Google Workspace | `tasks.office.google` | Create Google Docs, Sheets, Slides (disabled by default) |
+
+> **Google Workspace:** The Google Workspace MCP server is disabled by default in the agent config. To enable it, first set up the Google Workspace API by following the [Google Workspace and OAuth guide](docs/GOOGLE_WORKSPACE_AND_OAUTH.md), then set `enabled: true` for `GoogleWorkspaceMCPServer` in your `configs/default.yaml`.
 
 ### Running MCP servers
 
