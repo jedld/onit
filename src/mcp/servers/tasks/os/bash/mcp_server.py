@@ -18,7 +18,7 @@ Bash MCP Server - System and Document Operations
 Execute shell commands, read/write files, and search documents on the local system.
 
 Requires:
-    pip install fastmcp PyPDF2 pdfplumber
+    pip install fastmcp pypdf pdfplumber
 
 10 Core Tools:
 1. bash - Execute bash/shell commands with timeout and directory control
@@ -274,7 +274,7 @@ def _read_binary(file_path: str, file_size: int, file_ext: str) -> str:
 def _read_pdf(file_path: str, file_size: int, max_chars: int) -> str:
     """Extract text from PDF file."""
     try:
-        from PyPDF2 import PdfReader
+        from pypdf import PdfReader
 
         reader = PdfReader(file_path)
         pages = []
@@ -304,7 +304,7 @@ def _read_pdf(file_path: str, file_size: int, max_chars: int) -> str:
 
     except ImportError:
         return json.dumps({
-            "error": "PyPDF2 not installed. Run: pip install PyPDF2",
+            "error": "pypdf not installed. Run: pip install pypdf",
             "path": file_path
         })
     except Exception as e:
@@ -560,7 +560,7 @@ def _run_command(command: str, cwd: str = ".", timeout: int = 60) -> Dict[str, A
 def _extract_pdf_text(file_path: str) -> str:
     """Extract text from PDF file."""
     try:
-        from PyPDF2 import PdfReader
+        from pypdf import PdfReader
         reader = PdfReader(file_path)
         pages = []
         for page in reader.pages:
@@ -568,7 +568,7 @@ def _extract_pdf_text(file_path: str) -> str:
             pages.append(text)
         return "\n\n".join(pages)
     except ImportError:
-        logger.warning("PyPDF2 not installed")
+        logger.warning("pypdf not installed")
         return ""
     except Exception as e:
         logger.error(f"Failed to read PDF: {e}")

@@ -20,7 +20,7 @@ Supports plain text, PDF, markdown files with table understanding.
 Provides context for LLM question answering and task completion.
 
 Requires:
-    pip install fastmcp PyPDF2 pdfplumber
+    pip install fastmcp pypdf pdfplumber
 
 Core Tools:
 1. search_document - Search for patterns in a document (text, PDF, markdown)
@@ -102,7 +102,7 @@ def _run_command(command: str, cwd: str = ".", timeout: int = DEFAULT_TIMEOUT) -
 def _extract_pdf_text(file_path: str) -> str:
     """Extract text from PDF file."""
     try:
-        from PyPDF2 import PdfReader
+        from pypdf import PdfReader
         reader = PdfReader(file_path)
         pages = []
         for page in reader.pages:
@@ -110,7 +110,7 @@ def _extract_pdf_text(file_path: str) -> str:
             pages.append(text)
         return "\n\n".join(pages)
     except ImportError:
-        logger.warning("PyPDF2 not installed")
+        logger.warning("pypdf not installed")
         return ""
     except Exception as e:
         logger.error(f"Failed to read PDF: {e}")

@@ -45,6 +45,7 @@ mcp-servers = [
     "geopy",
     "python-pptx",
     "ddgs",
+    "pypdf",
 ]
 google = [
     "google-api-python-client",

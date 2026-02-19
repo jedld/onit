@@ -11,3 +11,4 @@ python-pptx
 ddgs
 beautifulsoup4
 geopy
+pypdf

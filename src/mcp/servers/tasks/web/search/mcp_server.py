@@ -18,7 +18,7 @@ Web Search and Content MCP Server - Consolidated API
 Search the web, fetch content, extract media, and get weather information.
 
 Requires:
-    pip install ddgs geopy requests beautifulsoup4 PyPDF2 PyMuPDF python-dateutil
+    pip install ddgs geopy requests beautifulsoup4 pypdf PyMuPDF python-dateutil
 
     Environment variables:
     - OPENWEATHER_API_KEY or OPENWEATHERMAP_API_KEY for weather data
@@ -114,7 +114,7 @@ def _read_pdf(url: str) -> str:
     """Extract text content from a PDF URL."""
     try:
         response = requests.get(url, timeout=READ_TIMEOUT)
-        from PyPDF2 import PdfReader
+        from pypdf import PdfReader
         pdf_file = BytesIO(response.content)
         reader = PdfReader(pdf_file)
         text = "\n".join(page.extract_text() or "" for page in reader.pages)
