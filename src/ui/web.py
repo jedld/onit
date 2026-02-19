@@ -643,7 +643,12 @@ class WebChatUI:
                     display_msg += f"\n📎 [{fname}]({file_url})"
                     queue_msg += f"\nRelevant files: {uploaded_path}"
 
-                history = history + [gr.ChatMessage(role="user", content=display_msg)]
+                # Route user message through _pending_responses so poll_response
+                # handles all chatbot updates — avoids race where the timer
+                # overwrites handle_send's returned history with stale state.
+                self._pending_responses.append(
+                    gr.ChatMessage(role="user", content=display_msg)
+                )
 
                 # enqueue for OnIt event loop
                 self._processing = True
