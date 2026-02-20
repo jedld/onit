@@ -3,19 +3,37 @@ import re
 def remove_tags(text: str) -> str:
     """
     Remove all tags in the format <tag> and </tag> from the text.
+    Preserves <img> tags so that image-handling code downstream can process them.
     
     Args:
         text: The text to process
     Returns:
-        The text with all tags removed
+        The text with all tags removed (except <img>)
     """
     
     if not text:
         return text
+    # Preserve <img ...> tags — they carry image data that downstream UI code
+    # (e.g. WebChatUI._extract_data_url_images) needs to process.
+    # Temporarily replace them with a placeholder, strip other tags, then restore.
+    img_tags = []
+    def _stash_img(m):
+        idx = len(img_tags)
+        img_tags.append(m.group(0))
+        return f"\x00IMG{idx}\x00"
+
+    img_pattern = re.compile(r'<img\b[^>]*>', re.IGNORECASE | re.DOTALL)
+    text = img_pattern.sub(_stash_img, text)
+
     # Regular expression to match tags like <tag> or </tag>
     tag_pattern = re.compile(r'</?[^>]+>')
     # Substitute tags with an empty string
     cleaned_text = tag_pattern.sub('', text)
+
+    # Restore <img> tags
+    for idx, tag in enumerate(img_tags):
+        cleaned_text = cleaned_text.replace(f"\x00IMG{idx}\x00", tag)
+
     return cleaned_text
 
 def text_between_tags(text: str, tag: str) -> tuple[bool, str]:

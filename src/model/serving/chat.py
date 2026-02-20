@@ -273,7 +273,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     messages.append({
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "The tool returned the following image(s). Analyze them to complete the task:"},
+                            {"type": "text", "text": "The tool returned the following image(s). Analyze them carefully to complete the task. Describe what you see in plain text. Do NOT reproduce, re-encode, or embed the raw base64 image data anywhere in your response."},
                             *[{"type": "image_url", "image_url": {"url": url}} for url in pending_imgs],
                         ],
                     })
@@ -349,7 +349,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             messages.append({
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "The tool returned the following image(s). Analyze them to complete the task:"},
+                    {"type": "text", "text": "The tool returned the following image(s). Analyze them carefully to complete the task. Describe what you see in plain text. Do NOT reproduce, re-encode, or embed the raw base64 image data anywhere in your response."},
                     *[{"type": "image_url", "image_url": {"url": url}} for url in pending_imgs],
                 ],
             })

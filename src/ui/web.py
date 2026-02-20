@@ -387,6 +387,63 @@ class WebChatUI:
 
         return cleaned, found_files
 
+    def _extract_data_url_images(self, text: str) -> tuple[str, list[str]]:
+        """Extract data-URL images from assistant response text.
+
+        Handles two forms the model may produce:
+          - Markdown: ![alt](data:image/jpeg;base64,...)
+          - HTML:     <img src="data:image/jpeg;base64,..." ...>
+
+        Returns the cleaned text (data URLs replaced by placeholder) and a
+        list of saved image file paths in data_path.
+        """
+        import re, base64, uuid
+        saved = []
+
+        # 1. Markdown image syntax: ![alt](data:image/TYPE;base64,DATA)
+        md_pattern = re.compile(
+            r'!\[([^\]]*)\]\((data:image/([^;]+);base64,([A-Za-z0-9+/=\s]+?))\)',
+            re.DOTALL,
+        )
+        def _save_md(m):
+            mime_sub = m.group(3).strip()   # e.g. "jpeg"
+            b64      = m.group(4).replace("\n", "").replace("\r", "").strip()
+            ext      = "jpg" if mime_sub in ("jpeg", "jpg") else mime_sub
+            fname    = f"{uuid.uuid4()}.{ext}"
+            fpath    = os.path.join(self.data_path, fname)
+            try:
+                with open(fpath, "wb") as f:
+                    f.write(base64.b64decode(b64))
+                saved.append(fpath)
+            except Exception:
+                pass
+            return ""  # remove from text
+
+        text = md_pattern.sub(_save_md, text)
+
+        # 2. HTML <img src="data:image/TYPE;base64,DATA" ...>
+        html_pattern = re.compile(
+            r'<img\b[^>]*\bsrc=["\']?(data:image/([^;]+);base64,([A-Za-z0-9+/=\s]+?))["\']?[^>]*>',
+            re.DOTALL | re.IGNORECASE,
+        )
+        def _save_html(m):
+            mime_sub = m.group(2).strip()
+            b64      = m.group(3).replace("\n", "").replace("\r", "").strip()
+            ext      = "jpg" if mime_sub in ("jpeg", "jpg") else mime_sub
+            fname    = f"{uuid.uuid4()}.{ext}"
+            fpath    = os.path.join(self.data_path, fname)
+            try:
+                with open(fpath, "wb") as f:
+                    f.write(base64.b64decode(b64))
+                saved.append(fpath)
+            except Exception:
+                pass
+            return ""
+
+        text = html_pattern.sub(_save_html, text)
+
+        return text.strip(), saved
+
     def add_message(
         self,
         role: Literal["user", "assistant", "system"],
@@ -394,14 +451,27 @@ class WebChatUI:
         elapsed: str = "",
     ) -> None:
         """Called by chat.py and onit.py to record messages."""
+        image_paths = []
         file_paths = []
         if role == "assistant":
-            display, file_paths = self._extract_file_paths(response)
+            # First pull out any inline data-URL images (Markdown or HTML)
+            # so Gradio can display them as real image components.
+            display, image_paths = self._extract_data_url_images(response)
+            display, file_paths = self._extract_file_paths(display)
         else:
             display = response
         if elapsed:
             display = f"{display}\n\n_({elapsed})_"
         self._pending_responses.append(gr.ChatMessage(role=role, content=display))
+        # Show extracted data-URL images as proper Gradio image bubbles
+        for fpath in image_paths:
+            if os.path.isfile(fpath):
+                self._pending_responses.append(
+                    gr.ChatMessage(
+                        role="assistant",
+                        content=gr.FileData(path=fpath, mime_type="image/jpeg"),
+                    )
+                )
         for fpath in file_paths:
             if os.path.isfile(fpath):
                 self._pending_responses.append(
