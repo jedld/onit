@@ -21,6 +21,8 @@ import asyncio
 import base64
 import os
 import json
+import re
+import tempfile
 import uuid
 from openai import AsyncOpenAI, OpenAIError, APITimeoutError
 from typing import List, Optional, Any
@@ -85,6 +87,34 @@ def _parse_tool_call_from_content(content: str, tool_registry) -> Optional[dict]
     return None
 
 
+def _save_data_url_images(data_urls: list[str], data_path: str | None) -> list[str]:
+    """Decode data-URL images and save them to data_path (or tempdir).
+
+    Returns a list of absolute file paths, one per data URL.
+    The caller can embed these paths as markdown ``![alt](path)`` so the
+    web UI's _extract_file_paths picks them up and serves them via /uploads/.
+    """
+    save_dir = data_path or tempfile.gettempdir()
+    os.makedirs(save_dir, exist_ok=True)
+    saved = []
+    for url in data_urls:
+        m = re.match(r'data:image/([^;]+);base64,(.+)', url, re.DOTALL)
+        if not m:
+            continue
+        mime_sub = m.group(1).strip()
+        b64 = m.group(2).replace("\n", "").replace("\r", "").strip()
+        ext = "jpg" if mime_sub in ("jpeg", "jpg") else mime_sub
+        fname = f"{uuid.uuid4()}.{ext}"
+        fpath = os.path.join(save_dir, fname)
+        try:
+            with open(fpath, "wb") as f:
+                f.write(base64.b64decode(b64))
+            saved.append(fpath)
+        except Exception:
+            pass
+    return saved
+
+
 async def chat(host: str = "http://127.0.0.1:8001/v1",
          host_key: str = "EMPTY",
          model: str = "Qwen/Qwen3-8B",
@@ -103,6 +133,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     max_tokens = kwargs.get('max_tokens', 262144)
     memories = kwargs.get('memories', None)
     prompt_intro = kwargs.get('prompt_intro', "I am a helpful AI assistant. My name is OnIt.")
+    data_path = kwargs.get('data_path', None)
 
     images_bytes = []
     if isinstance(images, list):
@@ -268,12 +299,18 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                             and isinstance(m.get("content"), str)
                             and m["content"].startswith("data:image/")):
                         pending_imgs.append(m["content"])
-                        m["content"] = "[image returned by tool — see visual content below]"
+                        m["content"] = "[image captured — displayed below]"
                 if pending_imgs:
+                    saved_paths = _save_data_url_images(pending_imgs, data_path)
+                    path_hints = " ".join(f"`{p}`" for p in saved_paths)
                     messages.append({
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "The tool returned the following image(s). Analyze them carefully to complete the task. Describe what you see in plain text. Do NOT reproduce, re-encode, or embed the raw base64 image data anywhere in your response."},
+                            {"type": "text", "text": (
+                                "The tool returned an image. Analyze it carefully to complete the task. "
+                                "Include the image in your response using this exact markdown so the user can see it: "
+                                + " ".join(f"![camera image]({p})" for p in saved_paths)
+                            )},
                             *[{"type": "image_url", "image_url": {"url": url}} for url in pending_imgs],
                         ],
                     })
@@ -335,8 +372,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
         # Inject data-URL images returned by tools as visual content so that
         # vision-language models (e.g. Qwen-VL) can actually see the images.
         # ToolHandler produces "data:image/{mime};base64,..." for ImageContent.
-        # Replace each data-URL tool response with a placeholder then add a
-        # single user turn containing all image_url parts.
+        # Save them to disk so the model can embed a markdown path the UI serves.
         pending_imgs = []
         for m in messages:
             if (isinstance(m, dict)
@@ -344,12 +380,17 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     and isinstance(m.get("content"), str)
                     and m["content"].startswith("data:image/")):
                 pending_imgs.append(m["content"])
-                m["content"] = "[image returned by tool — see visual content below]"
+                m["content"] = "[image captured — displayed below]"
         if pending_imgs:
+            saved_paths = _save_data_url_images(pending_imgs, data_path)
             messages.append({
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "The tool returned the following image(s). Analyze them carefully to complete the task. Describe what you see in plain text. Do NOT reproduce, re-encode, or embed the raw base64 image data anywhere in your response."},
+                    {"type": "text", "text": (
+                        "The tool returned an image. Analyze it carefully to complete the task. "
+                        "Include the image in your response using this exact markdown so the user can see it: "
+                        + " ".join(f"![camera image]({p})" for p in saved_paths)
+                    )},
                     *[{"type": "image_url", "image_url": {"url": url}} for url in pending_imgs],
                 ],
             })

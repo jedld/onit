@@ -408,6 +408,7 @@ class OnIt(BaseModel):
             'verbose': self.verbose,
             'max_tokens': self.model_serving.get('max_tokens', 262144),
             'session_history': self.load_session_history(),
+            'data_path': self.data_path,
         }
         last_response = await chat(
             host=self.model_serving["host"],
@@ -472,7 +473,8 @@ class OnIt(BaseModel):
                           'memories': None,
                           'verbose': self.verbose,
                           'max_tokens': self.model_serving.get('max_tokens', 262144),
-                          'session_history': self.load_session_history()}
+                          'session_history': self.load_session_history(),
+                          'data_path': self.data_path}
                 last_response = await chat(host=self.model_serving["host"],
                                             host_key=self.model_serving.get("host_key", "EMPTY"),
                                             model=self.model_serving["model"],
@@ -730,7 +732,8 @@ class OnIt(BaseModel):
                           'memories': None,
                           'verbose': self.verbose,
                           'max_tokens': self.model_serving.get('max_tokens', 262144),
-                          'session_history': self.load_session_history()}
+                          'session_history': self.load_session_history(),
+                          'data_path': self.data_path}
                 last_response = await chat(host=self.model_serving["host"],
                                             host_key=self.model_serving.get("host_key", "EMPTY"),
                                             model=self.model_serving["model"],
