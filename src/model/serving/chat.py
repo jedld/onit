@@ -263,7 +263,8 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 # Inject data-URL images from this raw-JSON tool response so VLMs can see them
                 pending_imgs = []
                 for m in messages:
-                    if (m.get("role") == "tool"
+                    if (isinstance(m, dict)
+                            and m.get("role") == "tool"
                             and isinstance(m.get("content"), str)
                             and m["content"].startswith("data:image/")):
                         pending_imgs.append(m["content"])
@@ -338,7 +339,8 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
         # single user turn containing all image_url parts.
         pending_imgs = []
         for m in messages:
-            if (m.get("role") == "tool"
+            if (isinstance(m, dict)
+                    and m.get("role") == "tool"
                     and isinstance(m.get("content"), str)
                     and m["content"].startswith("data:image/")):
                 pending_imgs.append(m["content"])
