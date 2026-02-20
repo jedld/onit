@@ -155,7 +155,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     "role": "user",
                     "content": [
                         {"type": "text", "text": instruction},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{images_bytes[0]}"}}
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{images_bytes[0]}"}}
                     ],})
     else:
         messages.append({"role": "user", "content": instruction})
@@ -260,6 +260,22 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     # Tool not found in registry
                     tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found', 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
                     messages.append(tool_message)
+                # Inject data-URL images from this raw-JSON tool response so VLMs can see them
+                pending_imgs = []
+                for m in messages:
+                    if (m.get("role") == "tool"
+                            and isinstance(m.get("content"), str)
+                            and m["content"].startswith("data:image/")):
+                        pending_imgs.append(m["content"])
+                        m["content"] = "[image returned by tool — see visual content below]"
+                if pending_imgs:
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "The tool returned the following image(s). Analyze them to complete the task:"},
+                            *[{"type": "image_url", "image_url": {"url": url}} for url in pending_imgs],
+                        ],
+                    })
                 continue  # loop back for the model to generate the final response
 
             if "</think>" in last_response:
@@ -315,3 +331,23 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 # Tool not found in registry
                 tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found', 'name': function_name, 'parameters': function_arguments, "tool_call_id": tool.id}
                 messages.append(tool_message)
+        # Inject data-URL images returned by tools as visual content so that
+        # vision-language models (e.g. Qwen-VL) can actually see the images.
+        # ToolHandler produces "data:image/{mime};base64,..." for ImageContent.
+        # Replace each data-URL tool response with a placeholder then add a
+        # single user turn containing all image_url parts.
+        pending_imgs = []
+        for m in messages:
+            if (m.get("role") == "tool"
+                    and isinstance(m.get("content"), str)
+                    and m["content"].startswith("data:image/")):
+                pending_imgs.append(m["content"])
+                m["content"] = "[image returned by tool — see visual content below]"
+        if pending_imgs:
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "The tool returned the following image(s). Analyze them to complete the task:"},
+                    *[{"type": "image_url", "image_url": {"url": url}} for url in pending_imgs],
+                ],
+            })
