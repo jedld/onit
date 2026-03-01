@@ -61,14 +61,12 @@ class TestDiscoverServerTools:
         assert handlers[0].tool_item["function"]["name"] == "search"
 
     @pytest.mark.asyncio
-    async def test_discovers_prompts_with_arguments(self):
+    async def test_prompts_not_discovered_as_tools(self):
         server = {"name": "Prompts", "url": "http://127.0.0.1:18200/sse", "enabled": True}
         mock = _mock_client(prompts=[_fake_prompt("assistant")])
         with patch("lib.tools.Client", return_value=mock):
             handlers = await _discover_server_tools(server)
-        assert len(handlers) == 1
-        props = handlers[0].tool_item["function"]["parameters"]["properties"]
-        assert "task" in props
+        assert len(handlers) == 0
 
     @pytest.mark.asyncio
     async def test_skips_disabled_server(self):

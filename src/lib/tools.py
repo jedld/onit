@@ -45,9 +45,7 @@ async def _discover_server_tools(server: dict) -> list[ToolHandler]:
     async with Client(url) as client:
         tools_list = await client.list_tools()
         resources_list = await client.list_resources()
-        prompts_list = await client.list_prompts()
         tools_list.extend(resources_list)
-        tools_list.extend(prompts_list)
 
         for tool_item in tools_list:
             if hasattr(tool_item, 'inputSchema'):

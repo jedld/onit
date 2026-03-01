@@ -1,5 +1,29 @@
 # Release Notes
 
+## v0.1.3c
+
+### New Features
+
+- **Session Persistence** — Browser sessions now survive server restarts. A session cookie (`onit_session`) ties each browser tab to its session, and sessions are restored from disk (JSONL files) on reconnect.
+- **Inline File Upload (A2A)** — The `--file` flag now embeds files as base64 `FilePart` in the A2A JSON-RPC payload instead of uploading via a separate HTTP request. The A2A executor saves non-image files to the session data folder and appends file references to the task prompt.
+- **Chat Clear** — The "Clear" button in the web UI now also clears the session working directory (uploaded/generated files) and resets the session JSONL history file.
+
+### Improvements
+
+- **Scroll Lock (Web UI)** — Added a MutationObserver-based scroll controller that prevents auto-scroll when the user has scrolled up (2px threshold). Spinner and response updates only re-render the chatbot component when there are actual changes, reducing unnecessary DOM thrashing.
+- **Reduced Chatbot Re-renders** — The polling loop now returns `gr.skip()` for the chatbot and stop button when nothing has changed, avoiding re-renders that fight user scrolling.
+- **Spinner Efficiency** — Spinner text only updates the DOM when the message actually changes (tick threshold), not on every poll cycle.
+- **Session ID Validation** — Session IDs are validated against a UUID regex to prevent path traversal attacks via crafted cookies.
+- **Tool Discovery** — `PromptsMCPServer` is now excluded from tool discovery (`discover_tools`) since prompts are not callable tools. Removed `list_prompts()` from the tool discovery pipeline.
+- **Cleaner Footer** — Removed Gradio branding/footer links; replaced with a minimal "OnIt" attribution link.
+- **File Path Display** — Chat history now shows friendly filenames (e.g. `📎 report.pdf`) instead of raw absolute paths for uploaded files.
+- **Download Path Fix** — Files downloaded from A2A servers are now saved with `os.path.basename()` to avoid creating nested directories from session-scoped upload paths.
+- **Prompt Wording** — Clarified "provide a download link to the file" in assistant prompt templates; simplified "Working directory or data_path" label.
+
+### Bug Fixes
+
+- Fixed regex pattern for file URL extraction to also exclude backticks and asterisks, preventing malformed download filenames from Markdown-formatted responses.
+
 ## v0.1.3b
 
 ### Security

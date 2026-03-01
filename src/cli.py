@@ -30,7 +30,7 @@ def _download_files(text: str, server_url: str) -> str:
     """Download any files referenced in the response text from the A2A server."""
     import re
     # Match /uploads/filename patterns in the text
-    pattern = re.compile(r'/uploads/([^\s\)\]"\'<>]+)')
+    pattern = re.compile(r'/uploads/([^\s\)\]"\'<>`*]+)')
     downloaded = []
     for match in pattern.finditer(text):
         filename = match.group(1)
@@ -38,7 +38,7 @@ def _download_files(text: str, server_url: str) -> str:
         try:
             resp = requests.get(download_url, timeout=60)
             resp.raise_for_status()
-            local_path = os.path.join(os.getcwd(), filename)
+            local_path = os.path.join(os.getcwd(), os.path.basename(filename))
             with open(local_path, "wb") as f:
                 f.write(resp.content)
             downloaded.append(local_path)
@@ -69,13 +69,26 @@ def _send_task(url: str, task: str, file: str = None, image: str = None) -> str:
     """Send a task to an OnIt A2A server and return the answer."""
     import threading
     import time
-
-    # Upload file first if provided, then reference it in the task
-    if file:
-        filename = _upload_file(url, file)
-        task = f"{task}\n\nFile uploaded to server: /uploads/{filename}"
+    import mimetypes as _mimetypes
 
     parts = [{"kind": "text", "text": task}]
+
+    # Embed file inline as a FilePart in the JSON-RPC payload
+    if file:
+        filepath = os.path.abspath(os.path.expanduser(file))
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(f"File not found: {filepath}")
+        mime_type = _mimetypes.guess_type(filepath)[0] or 'application/octet-stream'
+        with open(filepath, 'rb') as f:
+            file_data = base64.b64encode(f.read()).decode('utf-8')
+        parts.append({
+            "kind": "file",
+            "file": {
+                "bytes": file_data,
+                "mimeType": mime_type,
+                "name": os.path.basename(filepath),
+            }
+        })
 
     # Embed image inline as a FilePart in the same JSON-RPC payload
     if image:

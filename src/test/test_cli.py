@@ -123,29 +123,31 @@ class TestSendTask:
 
         assert "Error" in result
 
-    def test_sends_with_file_upload(self, tmp_path):
+    def test_sends_with_file_inline(self, tmp_path):
         test_file = tmp_path / "data.csv"
         test_file.write_text("a,b\n1,2")
 
-        # Mock upload
-        mock_upload_resp = MagicMock()
-        mock_upload_resp.raise_for_status = MagicMock()
-
-        # Mock task send
         response_data = {
             "result": {
                 "status": {"state": "completed"},
                 "artifacts": [{"parts": [{"kind": "text", "text": "Processed."}]}],
             }
         }
-        mock_task_resp = MagicMock()
-        mock_task_resp.json.return_value = response_data
-        mock_task_resp.raise_for_status = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = response_data
+        mock_resp.raise_for_status = MagicMock()
 
-        with patch("src.cli.requests.post", side_effect=[mock_upload_resp, mock_task_resp]):
+        with patch("src.cli.requests.post", return_value=mock_resp) as mock_post:
             result = _send_task("http://localhost:9001", "analyze this", file=str(test_file))
 
         assert "Processed" in result
+        # Verify file was embedded inline (single POST, not upload + send)
+        assert mock_post.call_count == 1
+        payload = mock_post.call_args[1].get("json") or mock_post.call_args[0][1] if len(mock_post.call_args[0]) > 1 else mock_post.call_args[1]["json"]
+        parts = payload["params"]["message"]["parts"]
+        assert len(parts) == 2
+        assert parts[1]["kind"] == "file"
+        assert parts[1]["file"]["name"] == "data.csv"
 
     def test_direct_message_response_format(self):
         """Handle A2A responses that have parts directly in result."""

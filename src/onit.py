@@ -99,18 +99,26 @@ class OnItA2AExecutor(AgentExecutor):
 
         session = self._get_session(context)
 
-        # Extract inline image parts from the A2A message and save to session data folder
+        # Extract inline file parts from the A2A message and save to session data folder
         import base64
         image_paths = []
+        file_paths = []
         for part in context.message.parts:
             if isinstance(part.root, FilePart) and isinstance(part.root.file, FileWithBytes):
                 file_obj = part.root.file
+                safe_name = os.path.basename(file_obj.name or 'file')
+                filepath = os.path.join(session["data_path"], safe_name)
+                with open(filepath, 'wb') as f:
+                    f.write(base64.b64decode(file_obj.bytes))
                 if file_obj.mime_type and file_obj.mime_type.startswith('image/'):
-                    safe_name = os.path.basename(file_obj.name or 'image.png')
-                    filepath = os.path.join(session["data_path"], safe_name)
-                    with open(filepath, 'wb') as f:
-                        f.write(base64.b64decode(file_obj.bytes))
                     image_paths.append(filepath)
+                else:
+                    file_paths.append(filepath)
+
+        # Append file references to task so the agent knows about them
+        if file_paths:
+            file_refs = "\n".join(f"- {fp}" for fp in file_paths)
+            task = f"{task}\n\nFiles uploaded to data folder:\n{file_refs}"
 
         # Register safety_queue for disconnect middleware
         current_task_id = id(asyncio.current_task())
@@ -304,7 +312,8 @@ class OnIt(BaseModel):
                 "PromptsMCPServer not found or disabled in MCP server config. "
                 "Ensure it is listed under mcp.servers with a valid URL."
             )
-        self.tool_registry = asyncio.run(discover_tools(self.mcp_servers))
+        tool_servers = [s for s in self.mcp_servers if s.get('name') != 'PromptsMCPServer']
+        self.tool_registry = asyncio.run(discover_tools(tool_servers))
         # List discovered tools
         for tool_name in self.tool_registry:
             print(f"  - {tool_name}")

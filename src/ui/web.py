@@ -351,22 +351,48 @@ class WebChatUI:
     # Session management
     # ------------------------------------------------------------------
 
+    # Pattern for validating session IDs (UUIDs only)
+    _UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
     def _get_or_create_session(self, session_id: str | None = None) -> tuple[str, WebSession]:
         """Get an existing session or create a new one.
 
+        If *session_id* is provided and the session exists in memory, return it.
+        If the session is not in memory but a JSONL file exists on disk (e.g.
+        after a server restart or browser refresh), restore it.  Otherwise
+        create a brand-new session, reusing *session_id* when supplied so the
+        browser cookie and server-side record stay in sync.
+
         Returns (session_id, WebSession) tuple.
         """
+        # Reject invalid session IDs to prevent path traversal
+        if session_id and not self._UUID_RE.match(session_id):
+            session_id = None
+
         if session_id and session_id in self._web_sessions:
             return session_id, self._web_sessions[session_id]
 
-        # Create new session
-        session = WebSession()
         # Derive sessions dir from the configured session_path
         if self.session_path:
             sessions_dir = os.path.dirname(self.session_path)
         else:
             sessions_dir = os.path.expanduser("~/.onit/sessions")
         os.makedirs(sessions_dir, exist_ok=True)
+
+        # Try to restore session from disk (survives server restarts)
+        if session_id:
+            session_file = os.path.join(sessions_dir, f"{session_id}.jsonl")
+            if os.path.exists(session_file):
+                session = WebSession(session_id=session_id)
+                session.session_path = session_file
+                session.data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / session_id)
+                os.makedirs(session.data_path, exist_ok=True)
+                self._web_sessions[session_id] = session
+                logger.info("Restored web session %s from disk", session_id)
+                return session_id, session
+
+        # Create new session, reusing the cookie session_id when available
+        session = WebSession(session_id=session_id) if session_id else WebSession()
         session.session_path = os.path.join(sessions_dir, f"{session.session_id}.jsonl")
         if not os.path.exists(session.session_path):
             with open(session.session_path, "w", encoding="utf-8") as f:
@@ -487,7 +513,14 @@ class WebChatUI:
                     try:
                         entry = json.loads(line)
                         if "task" in entry and "response" in entry:
-                            messages.append(gr.ChatMessage(role="user", content=entry["task"]))
+                            # Replace raw absolute file paths with friendly basenames
+                            task_display = entry["task"]
+                            task_display = re.sub(
+                                r'Relevant files:\s*/[^\s]+/([^\s/]+)',
+                                lambda m: f'📎 {m.group(1)}',
+                                task_display,
+                            )
+                            messages.append(gr.ChatMessage(role="user", content=task_display))
                             display, file_paths = self._extract_file_paths(entry["response"], data_path=data_path, session_id=session_id)
                             messages.append(gr.ChatMessage(role="assistant", content=display))
                             for fpath in file_paths:
@@ -538,15 +571,68 @@ class WebChatUI:
         .action-btn button { font-size: 0.875rem !important; padding: 0 10px !important; height: 100% !important; width: 100% !important; }
         .login-container { max-width: 500px !important; margin: 100px auto !important; text-align: center !important; }
         .google-signin { margin: 20px 0 !important; }
-        footer { display: none !important; }
-        .built-with { display: none !important; }
-        a[href*="gradio.app"] { display: none !important; }
         button[title="Share"], .share-button, [class*="share"] { display: none !important; }
         button[aria-label="Share"] { display: none !important; }
         .message-buttons-bot button:not([title="Copy"]):not([aria-label="Copy"]) { display: none !important; }
         .bot .actions button:not([title="Copy"]):not([aria-label="Copy"]) { display: none !important; }
         """
-        with gr.Blocks(title=self.title, css=custom_css) as app:
+        self._custom_css = custom_css
+        # JavaScript to prevent auto-scroll when user has scrolled up.
+        # Gradio re-renders the chatbot on every update, which can reset
+        # scroll position. This script observes DOM mutations on the chat
+        # scroll container and restores the previous scroll position when
+        # the user has scrolled away from the bottom.
+        scroll_js = """
+        () => {
+            function attach() {
+                // The scrollable chat container has class bubble-wrap or
+                // panel-wrap inside the .chatbot element.
+                const scroller =
+                    document.querySelector('.chatbot .bubble-wrap') ||
+                    document.querySelector('.chatbot .panel-wrap') ||
+                    document.querySelector('.chatbot .wrapper') ||
+                    document.querySelector('.chatbot');
+                if (!scroller) { setTimeout(attach, 500); return; }
+
+                let userScrolledUp = false;
+                let savedScrollTop = scroller.scrollTop;
+                let ignoreScroll = false;
+
+                scroller.addEventListener('scroll', () => {
+                    if (ignoreScroll) return;
+                    const gap = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+                    // Very small threshold: even 2px of scroll-up is respected
+                    userScrolledUp = gap > 2;
+                    savedScrollTop = scroller.scrollTop;
+                }, { passive: true });
+
+                let rafPending = false;
+                const observer = new MutationObserver(() => {
+                    if (rafPending) return;
+                    rafPending = true;
+                    requestAnimationFrame(() => {
+                        rafPending = false;
+                        if (userScrolledUp) {
+                            // Restore position so DOM changes don't yank user down
+                            ignoreScroll = true;
+                            scroller.scrollTop = savedScrollTop;
+                            ignoreScroll = false;
+                        } else {
+                            // User is at the bottom – follow new content
+                            ignoreScroll = true;
+                            scroller.scrollTop = scroller.scrollHeight;
+                            ignoreScroll = false;
+                            savedScrollTop = scroller.scrollTop;
+                        }
+                    });
+                });
+
+                observer.observe(scroller, { childList: true, subtree: true });
+            }
+            setTimeout(attach, 1500);
+        }
+        """
+        with gr.Blocks(title=self.title, analytics_enabled=False, js=scroll_js) as app:
             # Session state
             session_state = gr.State(value=None)
             authenticated_email = gr.State(value=None)
@@ -585,7 +671,8 @@ class WebChatUI:
                 chatbot = gr.Chatbot(
                     label="Chat",
                     height="calc(100vh - 220px)",
-                    buttons=["copy"],
+                    buttons=["copy", "clear"],
+                    autoscroll=True,
                 )
 
                 with gr.Row(elem_classes=["input-row"]):
@@ -622,9 +709,9 @@ class WebChatUI:
                     )
 
                 gr.Markdown(
-                    "<p style='text-align: center; color: #999; font-size: 0.8em; margin-top: 4px;'>"
-                    "OnIt may produce inaccurate information. Verify important details independently.<br/>"
-                    "<a href='https://github.com/sibyl-oracles/onit' target='_blank' style='color: #999;'>github.com/sibyl-oracles/onit</a></p>"
+                    "<p style='text-align: center; color: #999; font-size: 0.95em; margin-top: 4px;'>"
+                    "<a href='https://github.com/sibyl-oracles/onit' target='_blank' style='color: #999; text-decoration: none;'>OnIt</a>"
+                    " may produce inaccurate information. Verify important details independently.</p>"
                 )
 
             # state for uploaded file path
@@ -745,11 +832,16 @@ class WebChatUI:
 
                 session = self._web_sessions[sess_id]
 
+                has_new_responses = bool(session.pending_responses)
+                was_spinner_shown = session.spinner_shown
+                chatbot_changed = False
+
                 # Remove spinner before appending real responses or when done
                 if session.spinner_shown and (session.pending_responses or not session.processing):
                     if history:
                         history = history[:-1]
                     session.spinner_shown = False
+                    chatbot_changed = True
                     if not session.processing:
                         session.spinner_step = 0
                         session.spinner_tick = 0
@@ -757,28 +849,38 @@ class WebChatUI:
                 while session.pending_responses:
                     resp = session.pending_responses.pop(0)
                     history = history + [resp]
+                    chatbot_changed = True
 
                 # Add or update spinner while processing
                 if session.processing:
+                    session.spinner_tick += 1
+                    spinner_text_changed = session.spinner_tick >= self._spinner_ticks_per_message
+                    if spinner_text_changed:
+                        session.spinner_tick = 0
+                        session.spinner_step += 1
                     status_msg = self._spinner_messages[
                         session.spinner_step % len(self._spinner_messages)
                     ]
-                    session.spinner_tick += 1
-                    if session.spinner_tick >= self._spinner_ticks_per_message:
-                        session.spinner_tick = 0
-                        session.spinner_step += 1
-                    spinner_msg = gr.ChatMessage(
-                        role="assistant",
-                        content=f"### {status_msg}",
-                        metadata={"title": "_On it_"},
-                    )
-                    if session.spinner_shown:
-                        history = history[:-1] + [spinner_msg]
-                    else:
-                        history = history + [spinner_msg]
-                        session.spinner_shown = True
+                    # Only update chatbot when spinner first appears or text changes
+                    if not session.spinner_shown or spinner_text_changed:
+                        spinner_msg = gr.ChatMessage(
+                            role="assistant",
+                            content=f"### {status_msg}",
+                            metadata={"title": "_On it_"},
+                        )
+                        if session.spinner_shown:
+                            history = history[:-1] + [spinner_msg]
+                        else:
+                            history = history + [spinner_msg]
+                            session.spinner_shown = True
+                        chatbot_changed = True
 
                 logs_md = self._format_logs() if self.execution_logs else "*No execution logs yet.*"
+
+                # Only update the chatbot when there are actual changes
+                # to avoid unnecessary re-renders that fight user scrolling.
+                if not chatbot_changed:
+                    return gr.skip(), gr.skip(), logs_md, sess_id
                 return history, gr.update(visible=session.processing), logs_md, sess_id
 
             # wire events
@@ -796,14 +898,33 @@ class WebChatUI:
 
             stop_btn.click(handle_stop, [session_state], [stop_btn])
 
+            def handle_clear(sess_id):
+                """Delete all files in the session working directory when chat is cleared."""
+                if not sess_id or sess_id not in self._web_sessions:
+                    return sess_id
+                session = self._web_sessions[sess_id]
+                if session.data_path and os.path.isdir(session.data_path):
+                    shutil.rmtree(session.data_path, ignore_errors=True)
+                    os.makedirs(session.data_path, exist_ok=True)
+                # Clear the session JSONL file
+                if session.session_path and os.path.exists(session.session_path):
+                    with open(session.session_path, "w", encoding="utf-8") as f:
+                        f.write("")
+                return sess_id
+
+            chatbot.clear(handle_clear, [session_state], [session_state])
+
             # poll for assistant responses every 0.5s
             timer = gr.Timer(value=0.5)
             timer.tick(poll_response, [chatbot, session_state], [chatbot, stop_btn, logs_display, session_state])
 
             # Initialize session and restore chat history on page load
-            def init_session():
-                """Create a new session for each browser tab."""
-                sess_id, session = self._get_or_create_session()
+            def init_session(request: gr.Request):
+                """Restore an existing session (via cookie) or create a new one."""
+                cookie_sess_id = None
+                if request:
+                    cookie_sess_id = request.cookies.get("onit_session")
+                sess_id, session = self._get_or_create_session(cookie_sess_id)
                 history = self._load_chat_from_session(
                     session_path=session.session_path,
                     data_path=session.data_path,
@@ -814,7 +935,10 @@ class WebChatUI:
             if self.auth_enabled:
                 def check_auth_and_restore(request: gr.Request):
                     """Check auth via cookie and restore chat history."""
-                    sess_id, session = self._get_or_create_session()
+                    cookie_sess_id = None
+                    if request:
+                        cookie_sess_id = request.cookies.get("onit_session")
+                    sess_id, session = self._get_or_create_session(cookie_sess_id)
                     history = self._load_chat_from_session(
                         session_path=session.session_path,
                         data_path=session.data_path,
@@ -1096,6 +1220,21 @@ class WebChatUI:
         # Create our own FastAPI app
         fastapi_app = FastAPI()
 
+        # Middleware: set a session cookie so the browser remembers its
+        # session across page refreshes / reconnects.
+        @fastapi_app.middleware("http")
+        async def session_cookie_middleware(request: Request, call_next):
+            response = await call_next(request)
+            if not request.cookies.get("onit_session"):
+                response.set_cookie(
+                    key="onit_session",
+                    value=str(uuid.uuid4()),
+                    max_age=86400 * 7,   # 7 days
+                    httponly=True,
+                    samesite="lax",
+                )
+            return response
+
         # Setup routes
         self._setup_oauth_routes(fastapi_app)
         self._setup_file_routes(fastapi_app)
@@ -1106,7 +1245,8 @@ class WebChatUI:
         data_root = str(Path(tempfile.gettempdir()) / "onit" / "data")
         allowed = [data_root, self.data_path]
         fastapi_app = gr.mount_gradio_app(
-            fastapi_app, self.app, path="/", allowed_paths=allowed
+            fastapi_app, self.app, path="/", allowed_paths=allowed,
+            css=self._custom_css, footer_links=[],
         )
 
         print(f"\n{'='*60}")
