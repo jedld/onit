@@ -89,7 +89,7 @@ When using create_presentation, create_excel, or create_document tools, always p
 
    if documents_path and documents_path != "null":
       instruction += f"""
-## Background Documents
+## Relevant Information
 Start with documents (PDF, TXT, DOCX, XLSX, PPTX, and Markdown (MD)) in `{documents_path}`.
 Search the web for additional information if needed.
 """
