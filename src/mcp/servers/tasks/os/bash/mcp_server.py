@@ -1491,6 +1491,148 @@ def get_document_context(
 
 
 # =============================================================================
+# DATETIME TOOLS
+# =============================================================================
+
+@mcp.tool()
+def get_datetime(timezone: str = None) -> str:
+    """Get the current date and time with full calendar information.
+
+    Args:
+        timezone: IANA timezone name (e.g. 'Asia/Manila', 'America/New_York', 'Europe/London', 'UTC').
+                  If not provided, uses the system's local timezone.
+
+    Returns:
+        JSON with date, time (12h and 24h), timezone, weekday, week number, day of year,
+        days in month, leap year flag, and unix timestamp.
+    """
+    from datetime import datetime
+    import zoneinfo
+    import calendar as cal_mod
+
+    try:
+        tz = None
+        tz_name = timezone
+
+        if timezone and timezone.lower() != 'local':
+            tz = zoneinfo.ZoneInfo(timezone)
+        else:
+            # Detect system timezone
+            try:
+                localtime_path = "/etc/localtime"
+                if os.path.islink(localtime_path):
+                    link = os.readlink(localtime_path)
+                    if "zoneinfo/" in link:
+                        tz_name = link.split("zoneinfo/")[-1]
+            except Exception:
+                pass
+            if tz_name is None or tz_name == timezone:
+                try:
+                    with open("/etc/timezone") as f:
+                        tz_name = f.read().strip()
+                except Exception:
+                    pass
+            if tz_name and tz_name != timezone:
+                tz = zoneinfo.ZoneInfo(tz_name)
+
+        now = datetime.now(tz) if tz else datetime.now().astimezone()
+        if tz_name is None or tz_name == timezone:
+            tz_name = str(now.tzinfo)
+
+        days_in_month = cal_mod.monthrange(now.year, now.month)[1]
+
+        return json.dumps({
+            "date": now.strftime("%Y-%m-%d"),
+            "time_24h": now.strftime("%H:%M:%S"),
+            "time_12h": now.strftime("%I:%M:%S %p"),
+            "datetime_iso": now.isoformat(),
+            "timezone": tz_name,
+            "timezone_abbr": now.strftime("%Z"),
+            "utc_offset": now.strftime("%z"),
+            "weekday": now.strftime("%A"),
+            "weekday_short": now.strftime("%a"),
+            "day_of_year": now.timetuple().tm_yday,
+            "week_of_year": now.isocalendar()[1],
+            "days_in_month": days_in_month,
+            "is_leap_year": cal_mod.isleap(now.year),
+            "unix_timestamp": int(now.timestamp()),
+        })
+    except zoneinfo.ZoneInfoNotFoundError:
+        return json.dumps({"error": f"Unknown timezone: '{timezone}'. Use IANA names like 'America/New_York', 'Asia/Manila', 'Europe/London', or 'UTC'."})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def convert_timezone(datetime_str: str, from_timezone: str, to_timezone: str) -> str:
+    """Convert a datetime string from one timezone to another.
+
+    Args:
+        datetime_str: Datetime in ISO 8601 or common formats, e.g. '2026-02-24T14:30:00',
+                      '2026-02-24 14:30', '2026-02-24'. Time defaults to 00:00 if omitted.
+        from_timezone: Source IANA timezone (e.g. 'UTC', 'America/New_York').
+                       Use 'local' to use the system timezone.
+        to_timezone:   Target IANA timezone (e.g. 'Asia/Tokyo', 'Europe/London').
+                       Use 'local' to use the system timezone.
+
+    Returns:
+        JSON with the converted datetime, both timezone details, and the UTC offset difference.
+    """
+    from datetime import datetime
+    import zoneinfo
+
+    def resolve_tz(name: str):
+        if name.lower() == 'local':
+            tz_name = None
+            try:
+                localtime_path = "/etc/localtime"
+                if os.path.islink(localtime_path):
+                    link = os.readlink(localtime_path)
+                    if "zoneinfo/" in link:
+                        tz_name = link.split("zoneinfo/")[-1]
+            except Exception:
+                pass
+            if tz_name is None:
+                try:
+                    with open("/etc/timezone") as f:
+                        tz_name = f.read().strip()
+                except Exception:
+                    pass
+            return zoneinfo.ZoneInfo(tz_name) if tz_name else datetime.now().astimezone().tzinfo, tz_name or 'local'
+        return zoneinfo.ZoneInfo(name), name
+
+    try:
+        src_tz, src_name = resolve_tz(from_timezone)
+        dst_tz, dst_name = resolve_tz(to_timezone)
+
+        # Parse datetime string
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M",
+                    "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                naive_dt = datetime.strptime(datetime_str.strip(), fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return json.dumps({"error": f"Could not parse datetime string: '{datetime_str}'. Use ISO 8601 format like '2026-02-24T14:30:00'."})
+
+        src_dt = naive_dt.replace(tzinfo=src_tz)
+        dst_dt = src_dt.astimezone(dst_tz)
+
+        offset_diff = int((dst_dt.utcoffset() - src_dt.utcoffset()).total_seconds() / 3600)
+
+        return json.dumps({
+            "input": {"datetime": src_dt.strftime("%Y-%m-%d %H:%M:%S"), "timezone": src_name, "utc_offset": src_dt.strftime("%z")},
+            "output": {"datetime": dst_dt.strftime("%Y-%m-%d %H:%M:%S"), "datetime_iso": dst_dt.isoformat(), "time_12h": dst_dt.strftime("%I:%M %p"), "timezone": dst_name, "utc_offset": dst_dt.strftime("%z"), "weekday": dst_dt.strftime("%A")},
+            "offset_difference_hours": offset_diff,
+        })
+    except zoneinfo.ZoneInfoNotFoundError as e:
+        return json.dumps({"error": f"Unknown timezone: {e}. Use IANA names like 'America/New_York', 'Asia/Manila', 'UTC'."})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# =============================================================================
 # SERVER ENTRY POINT
 # =============================================================================
 
@@ -1523,7 +1665,7 @@ def run(
 
     logger.info(f"Starting Bash MCP Server at {host}:{port}{path}")
     logger.info(f"Data path: {DATA_PATH}")
-    logger.info("10 Core Tools: bash, read_file, write_file, send_file, search_document, search_directory, extract_tables, find_files, transform_text, get_document_context")
+    logger.info("12 Core Tools: bash, read_file, write_file, send_file, search_document, search_directory, extract_tables, find_files, transform_text, get_document_context, get_datetime, convert_timezone")
 
     quiet = 'verbose' not in options
     if quiet:

@@ -829,11 +829,36 @@ class OnIt(BaseModel):
                 await self.input_queue.put(instruction)
 
                 final_answer_task = asyncio.create_task(self.output_queue.get())
-                done, pending = await asyncio.wait([final_answer_task],
-                                                   return_when=asyncio.FIRST_COMPLETED)
+
+                # Watch safety_queue so Enter-key cancellation is detected
+                # immediately even while chat() is blocked on an API call.
+                async def _safety_watcher():
+                    while self.safety_queue.empty():
+                        await asyncio.sleep(0.2)
+                    return STOP_TAG
+
+                safety_watch_task = asyncio.create_task(_safety_watcher())
+                done, pending = await asyncio.wait(
+                    [final_answer_task, safety_watch_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
                 for t in pending:
                     t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
+
+                # Enter pressed — cancel the agent and break
+                if safety_watch_task in done and final_answer_task not in done:
+                    agent_task.cancel()
+                    try:
+                        await agent_task
+                    except asyncio.CancelledError:
+                        pass
+                    self.chat_ui.add_message("system", "Task stopped by user.")
+                    break
 
                 if final_answer_task not in done:
                     await self.safety_queue.put(STOP_TAG)
@@ -848,11 +873,18 @@ class OnIt(BaseModel):
                     self.chat_ui.add_message("system", "Task stopped by user.")
                     break
 
+                if isinstance(response, tuple) and response[0] is None:
+                    _, error_reason = response
+                    response = None
+                else:
+                    error_reason = None
+
                 if response is None:
                     # API error — ask user whether to retry
                     if not self.web:
                         loop.remove_reader(sys.stdin.fileno())
-                    self.chat_ui.add_message("system", "Unable to get a response from the model. Would you like to retry? (yes/no)")
+                    error_detail = f"\nReason: {error_reason}" if error_reason else ""
+                    self.chat_ui.add_message("system", f"Unable to get a response from the model.{error_detail}\nWould you like to retry? (yes/no)")
                     if self.web:
                         retry_input = await self.chat_ui.get_user_input_async()
                     else:
@@ -897,6 +929,7 @@ class OnIt(BaseModel):
                 if not self.safety_queue.empty():
                     await self.output_queue.put(STOP_TAG)
                     break
+                error_container = []
                 kwargs = {'console': self.chat_ui.console,
                           'chat_ui': self.chat_ui,
                           'cursor': AGENT_CURSOR,
@@ -915,9 +948,10 @@ class OnIt(BaseModel):
                                             safety_queue=self.safety_queue,
                                             think=self.model_serving["think"],
                                             timeout=self.timeout,
+                                            error_container=error_container,
                                             **kwargs)
                 if last_response is None and self.safety_queue.empty():
-                    await self.output_queue.put(None)
+                    await self.output_queue.put((None, error_container[0] if error_container else None))
                     return
                 if not self.safety_queue.empty():
                     await self.output_queue.put(STOP_TAG)

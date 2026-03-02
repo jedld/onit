@@ -23,6 +23,7 @@ import logging
 import os
 import json
 import re
+import tempfile
 import uuid
 from openai import AsyncOpenAI, OpenAIError, APITimeoutError
 from typing import List, Optional, Any
@@ -105,6 +106,58 @@ def _parse_tool_call_from_content(content: str, tool_registry) -> Optional[dict]
             return None
         return obj
     return None
+
+
+def _strip_image_content(messages: list) -> int:
+    """Remove all image_url content parts from messages in-place.
+
+    Replaces multipart user messages that contain image_url items with a
+    plain-text version, keeping only the text parts.  Tool messages that
+    were already replaced with '[image captured — displayed below]' are
+    left untouched.
+
+    Returns the number of image items removed.
+    """
+    removed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            img_parts  = [p for p in content if isinstance(p, dict) and p.get("type") == "image_url"]
+            if img_parts:
+                removed += len(img_parts)
+                msg["content"] = " ".join(p["text"] for p in text_parts) if text_parts else ""
+    return removed
+
+
+def _save_data_url_images(data_urls: list[str], data_path: str | None) -> list[str]:
+    """Decode data-URL images and save them to data_path (or tempdir).
+
+    Returns a list of absolute file paths, one per data URL.
+    The caller can embed these paths as markdown ``![alt](path)`` so the
+    web UI's _extract_file_paths picks them up and serves them via /uploads/.
+    """
+    save_dir = data_path or tempfile.gettempdir()
+    os.makedirs(save_dir, exist_ok=True)
+    saved = []
+    for url in data_urls:
+        m = re.match(r'data:image/([^;]+);base64,(.+)', url, re.DOTALL)
+        if not m:
+            continue
+        mime_sub = m.group(1).strip()
+        b64 = m.group(2).replace("\n", "").replace("\r", "").strip()
+        ext = "jpg" if mime_sub in ("jpeg", "jpg") else mime_sub
+        fname = f"{uuid.uuid4()}.{ext}"
+        fpath = os.path.join(save_dir, fname)
+        try:
+            with open(fpath, "wb") as f:
+                f.write(base64.b64decode(b64))
+            saved.append(fpath)
+        except Exception:
+            pass
+    return saved
 
 
 def _parse_truncated_tool_call(text: str, tool_registry) -> Optional[dict]:
@@ -220,6 +273,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
          stream: bool = False,
          think: bool = False,
          safety_queue: Optional[asyncio.Queue] = None,
+         error_container: Optional[list] = None,
          **kwargs) -> Optional[str]:
 
     tools = tool_registry.get_tool_items() if tool_registry else []
@@ -302,6 +356,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     MAX_REPEATED_TOOL_CALLS = 30
     iteration_count = 0
     tool_call_history = []  # list of (name, args_json) tuples
+    non_vlm_mode = False  # set True after a "not a multimodal model" error
 
     while True:
         iteration_count += 1
@@ -334,7 +389,11 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             )
             if tools: # and not images_bytes:  # vLLM doesn't support tools + images in the same message, so only include tools if no images are present
                 completion_kwargs["tools"] = tools
-                
+
+            # In non-VLM mode strip any image_url content before every request
+            if non_vlm_mode:
+                _strip_image_content(messages)
+
             chat_completion = await client.chat.completions.create(**completion_kwargs)
 
             await asyncio.sleep(0.1)
@@ -348,14 +407,53 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 chat_ui.add_log(error_message, level="error")
             elif verbose:
                 print(error_message)
+            if error_container is not None:
+                error_container.append(error_message)
             return None
         except OpenAIError as e:
+            error_str = str(e)
+            # Auto-recover: model rejected image content because it is text-only
+            if "not a multimodal model" in error_str or ("400" in error_str and "multimodal" in error_str):
+                non_vlm_mode = True
+                removed = _strip_image_content(messages)
+                # Detect available vision tools for the hint
+                vision_tools = []
+                if tool_registry:
+                    for tname in ("ask_vision_agent", "ask_cosmos_agent", "ask_vlm"):
+                        if tname in tool_registry.tools:
+                            vision_tools.append(tname)
+                if vision_tools:
+                    hint = (
+                        f"Note: this model cannot process images directly. "
+                        f"Use the {' or '.join(vision_tools)} tool to analyze any camera images instead."
+                    )
+                else:
+                    hint = (
+                        "Note: this model cannot process images directly. "
+                        "Describe what the camera tool would normally show based on context, "
+                        "or inform the user that a vision-capable model is required."
+                    )
+                warn = f"Model is not multimodal — stripped {removed} image(s) and retrying with vision tool hint."
+                if chat_ui:
+                    chat_ui.add_log(warn, level="warning")
+                elif verbose:
+                    print(warn)
+                # Inject the hint into the last user message, or append a new one
+                for msg in reversed(messages):
+                    if isinstance(msg, dict) and msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                        msg["content"] = msg["content"].rstrip() + f"\n\n[System hint: {hint}]"
+                        break
+                else:
+                    messages.append({"role": "user", "content": f"[System hint: {hint}]"})
+                continue  # retry without images
             error_message = f"Error communicating with {host}: {e}."
             logger.error(error_message)
             if chat_ui:
                 chat_ui.add_log(error_message, level="warning")
             elif verbose:
                 print(error_message)
+            if error_container is not None:
+                error_container.append(error_message)
             return None
         except Exception as e:
             error_message = f"Unexpected error: {e}"
@@ -364,7 +462,9 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 chat_ui.add_log(error_message, level="error")
             elif verbose:
                 print(error_message)
-            return None
+            if error_container is not None:
+                error_container.append(error_message)
+            return error_message
             
         tool_calls = chat_completion.choices[0].message.tool_calls
         if tool_calls is None or len(tool_calls) == 0:

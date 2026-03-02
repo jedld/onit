@@ -41,3 +41,6 @@ htmlcov/
 # Scripts
 scripts/
 *example.yaml
+
+# Local-only config (do not commit)
+configs/default.yaml

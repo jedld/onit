@@ -20,8 +20,60 @@ import yaml
 
 import logging
 from pathlib import Path
+from datetime import datetime
+import zoneinfo
 
 logger = logging.getLogger(__name__)
+
+
+def _datetime_context() -> str:
+   """Return a formatted string with the current local date, time, timezone, and calendar info."""
+   try:
+      # Read system timezone from /etc/localtime symlink or /etc/timezone file
+      tz_name = None
+      try:
+         import os
+         localtime_path = "/etc/localtime"
+         if os.path.islink(localtime_path):
+            link = os.readlink(localtime_path)
+            # Extract timezone name from path like .../zoneinfo/Asia/Manila
+            if "zoneinfo/" in link:
+               tz_name = link.split("zoneinfo/")[-1]
+      except Exception:
+         pass
+
+      if tz_name is None:
+         try:
+            with open("/etc/timezone") as f:
+               tz_name = f.read().strip()
+         except Exception:
+            pass
+
+      if tz_name:
+         tz = zoneinfo.ZoneInfo(tz_name)
+      else:
+         tz = datetime.now().astimezone().tzinfo
+
+      now = datetime.now(tz)
+      tz_display = now.strftime("%Z")  # e.g. PST, PHT, EST
+
+      # Calendar info
+      weekday = now.strftime("%A")
+      day_of_year = now.timetuple().tm_yday
+      week_num = now.isocalendar()[1]
+      days_in_month = (now.replace(month=now.month % 12 + 1, day=1) - __import__('datetime').timedelta(days=1)).day if now.month < 12 else 31
+
+      return (
+         f"Current date: {now.strftime('%B %d, %Y')} ({weekday})\n"
+         f"Current time: {now.strftime('%I:%M %p')} ({tz_display}, UTC{now.strftime('%z')[:3]}:{now.strftime('%z')[3:]})\n"
+         f"Timezone: {tz_name or tz_display}\n"
+         f"Week: {week_num} of {now.year} | Day {day_of_year} of the year | "
+         f"Day {now.day} of {days_in_month} in {now.strftime('%B %Y')}"
+      )
+   except Exception as e:
+      # Fallback: best-effort local time without timezone
+      now = datetime.now()
+      return f"Current date and time: {now.strftime('%B %d, %Y %I:%M %p')} (local time)"
 
 
 mcp_prompts = FastMCP("Prompts MCP")
@@ -62,7 +114,9 @@ You are an autonomous agent with access to tools and a file system.
                config = yaml.safe_load(f)
                template = config.get('instruction_template', default_template)
 
-   instruction = template.format(
+   datetime_block = "## Current Date & Time\n" + _datetime_context() + "\n\n"
+
+   instruction = datetime_block + template.format(
       task=task,
       current_date=current_date,
       data_path=data_path
