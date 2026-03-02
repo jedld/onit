@@ -648,6 +648,13 @@ class WebChatUI:
                 indicator = f"<p style='color: #4caf50; font-size: 0.8em; margin: 2px 0;'>📎 {fname}</p>"
                 return dest, gr.update(value=indicator, visible=True), sess_id
 
+            # Image extensions recognised for VLM vision input
+            _IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+
+            def _is_image_file(path: str) -> bool:
+                """Return True if *path* looks like an image based on its extension."""
+                return os.path.splitext(path)[1].lower() in _IMAGE_EXTENSIONS
+
             def handle_send(user_msg, uploaded_path, history, sess_id, request: gr.Request = None):
                 hide_indicator = gr.update(value="", visible=False)
                 # Verify authentication if enabled
@@ -676,11 +683,18 @@ class WebChatUI:
 
                 display_msg = user_msg or ""
                 queue_msg = user_msg or ""
+                image_paths = []  # image files to pass as vision input
                 if uploaded_path:
                     fname = os.path.basename(uploaded_path)
                     file_url = f"/uploads/{sess_id}/{fname}"
                     display_msg += f"\n📎 [{fname}]({file_url})"
-                    queue_msg += f"\nRelevant files: {uploaded_path}"
+                    if _is_image_file(uploaded_path):
+                        # Pass image as vision input for VLM models
+                        image_paths.append(uploaded_path)
+                        if not queue_msg.strip():
+                            queue_msg = "Describe this image."
+                    else:
+                        queue_msg += f"\nRelevant files: {uploaded_path}"
 
                 # Route user message through per-session pending_responses
                 session.pending_responses.append(
@@ -690,10 +704,11 @@ class WebChatUI:
                 # Fire-and-forget: call process_task() directly (like Telegram gateway)
                 session.processing = True
                 if self._loop and self._onit:
-                    async def _run_task(s=session, task=queue_msg):
+                    async def _run_task(s=session, task=queue_msg, imgs=image_paths or None):
                         try:
                             response = await self._onit.process_task(
                                 task,
+                                images=imgs,
                                 session_id=s.session_id,
                                 session_path=s.session_path,
                                 data_path=s.data_path,

@@ -118,17 +118,12 @@ class ToolHandler(RequestHandler):
 
         # MCP data types: https://github.com/modelcontextprotocol/python-sdk/blob/main/src/mcp/types.py
         if isinstance(content, ImageContent):
-            # decode the image data
-            image_data = base64.b64decode(content.data)
-            # if empty, return None
-            unique_filename = f"{uuid.uuid4()}.png"
-            # save the image to a temporary file   
-            # FIXME: not secure, but works for now
-            default_image = os.path.join(tempfile.gettempdir(), unique_filename)
-            # Write the binary data to a PNG file
-            with open(default_image, "wb") as f:
-                f.write(image_data)
-            return f"{default_image}"
+            # Return as a data URL so vision-language models can receive the
+            # image inline through the tool-response message chain.
+            # content.data is already a base64 string; content.mimeType carries
+            # the correct type (e.g. "image/jpeg") set by the MCP server.
+            mime = content.mimeType or "image/jpeg"
+            return f"data:{mime};base64,{content.data}"
         elif isinstance(content, TextContent):
             # if content is TextContent, return the text
             return content.text

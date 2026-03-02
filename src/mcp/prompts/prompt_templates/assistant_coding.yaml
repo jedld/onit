@@ -59,6 +59,8 @@ instruction_template: |
   - Example usage or test cases if applicable
 
   ## Guidelines
+  - For current date/time or timezone queries, use the `get_datetime` tool
+  - For timezone conversions, use the `convert_timezone` tool
   - Prioritize code quality and maintainability
   - Use standard library functions when possible
   - Create subdirectories for organized project structure

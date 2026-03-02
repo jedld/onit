@@ -11,6 +11,8 @@ instruction_template: |
    If you know the answer right away, provide it without further ado.
    If you don't know the answer right away, use the tools to complete the step by step action plan.
    If the task requires a place or address, use the tool to retrieve the address based on ip address.
+   For any task involving the current date, time, or timezone, use the get_datetime tool.
+   For timezone conversions, use the convert_timezone tool.
 
    ## File Operations Policy
    - **Working directory**: `{data_path}` — all file operations must use this directory.

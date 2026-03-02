@@ -16,3 +16,19 @@ servers:
     port : 18201
     path : /sse
     transport : 'sse'
+
+  - name: EcoFlowMCPServer
+    module: tasks.iot.ecoflow.mcp_server
+    description: "EcoFlow PowerStream — local MQTT solar generation and power-flow data"
+    enabled: false   # set to true after configuring env vars below
+    host : 0.0.0.0
+    port : 18215
+    path : /sse
+    transport : 'sse'
+    options:
+      # device_ip: "192.168.1.42"     # LAN IP of the PowerStream
+      # device_sn: "HW51xxxxxxxxxxxx" # Serial number (also the MQTT username)
+      # mqtt_password: ""             # Local MQTT password from EcoFlow app
+      # mqtt_port: 1883
+      # Alternatively set env vars: ECOFLOW_DEVICE_IP, ECOFLOW_DEVICE_SN,
+      #   ECOFLOW_MQTT_PASS, ECOFLOW_MQTT_PORT
