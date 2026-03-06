@@ -817,7 +817,10 @@ class OnIt(BaseModel):
                 def _on_enter():
                     sys.stdin.readline()
                     self.safety_queue.put_nowait(STOP_TAG)
-                loop.add_reader(sys.stdin.fileno(), _on_enter)
+                try:
+                    loop.add_reader(sys.stdin.fileno(), _on_enter)
+                except NotImplementedError:
+                    pass  # Windows ProactorEventLoop does not support add_reader
 
             # submit instruction with retry on API error
             start_time = loop.time()
@@ -851,7 +854,10 @@ class OnIt(BaseModel):
                 if response is None:
                     # API error — ask user whether to retry
                     if not self.web:
-                        loop.remove_reader(sys.stdin.fileno())
+                        try:
+                            loop.remove_reader(sys.stdin.fileno())
+                        except (NotImplementedError, Exception):
+                            pass
                     self.chat_ui.add_message("system", "Unable to get a response from the model. Would you like to retry? (yes/no)")
                     if self.web:
                         retry_input = await self.chat_ui.get_user_input_async()
@@ -860,7 +866,10 @@ class OnIt(BaseModel):
                             None, self.chat_ui.get_user_input)
                     if retry_input.lower().strip() in ('yes', 'y'):
                         if not self.web:
-                            loop.add_reader(sys.stdin.fileno(), _on_enter)
+                            try:
+                                loop.add_reader(sys.stdin.fileno(), _on_enter)
+                            except NotImplementedError:
+                                pass  # Windows ProactorEventLoop does not support add_reader
                         continue
                     break
 

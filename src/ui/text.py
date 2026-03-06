@@ -22,9 +22,13 @@ If not, it will fall back to standard print statements.
 '''
 import asyncio
 import sys
-import tty
-import termios
 import threading
+
+if sys.platform != "win32":
+    import tty
+    import termios
+else:
+    import msvcrt
 from collections import deque
 from dataclasses import dataclass
 from rich.console import Console
@@ -505,8 +509,15 @@ class ChatUI:
         self.console.print(Align.center(Text("OnIt may produce inaccurate information. Verify important details independently.", style="dim italic")))
     
     def _input_with_history(self, prompt: str = "➤ ") -> str:
+        """Dispatch to the platform-appropriate raw-input implementation."""
+        if sys.platform == "win32":
+            return self._input_with_history_windows(prompt)
+        return self._input_with_history_unix(prompt)
+
+    def _input_with_history_unix(self, prompt: str = "➤ ") -> str:
         """
         Get user input with history navigation using up/down arrow keys.
+        Uses termios/tty for raw terminal control (Unix/Linux/macOS only).
 
         Args:
             prompt: The prompt string to display
@@ -519,10 +530,10 @@ class ChatUI:
         sys.stdout.flush()
 
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        old_settings = termios.tcgetattr(fd)  # type: ignore[name-defined]
 
         try:
-            tty.setraw(fd)
+            tty.setraw(fd)  # type: ignore[name-defined]
 
             current_input = []
             cursor_pos = 0
@@ -638,7 +649,122 @@ class ChatUI:
                     sys.stdout.flush()
 
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)  # type: ignore[name-defined]
+
+    def _input_with_history_windows(self, prompt: str = "➤ ") -> str:
+        """
+        Get user input with history navigation using up/down arrow keys.
+        Uses msvcrt for raw character reading (Windows only).
+
+        Arrow keys on Windows emit two bytes via msvcrt.getwch():
+          prefix \x00 or \xe0, then a scan code:
+            \x48 = Up, \x50 = Down, \x4d = Right, \x4b = Left, \x53 = Delete
+
+        Args:
+            prompt: The prompt string to display
+
+        Returns:
+            The user's input string
+        """
+        sys.stdout.write(f"\033[1;32m{prompt}\033[0m")  # Bold green prompt
+        sys.stdout.flush()
+
+        current_input = []
+        cursor_pos = 0
+        temp_history_index = -1
+        saved_input = ""
+
+        while True:
+            char = msvcrt.getwch()
+
+            if char in ('\r', '\n'):  # Enter key
+                sys.stdout.write('\r\n')
+                sys.stdout.flush()
+                result = ''.join(current_input)
+                if result.strip() and (not self.input_history or self.input_history[-1] != result):
+                    self.input_history.append(result)
+                self.history_index = -1
+                return result
+
+            elif char == '\x03':  # Ctrl+C
+                sys.stdout.write('\r\n')
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+
+            elif char == '\x04':  # Ctrl+D
+                sys.stdout.write('\r\n')
+                sys.stdout.flush()
+                raise EOFError
+
+            elif char in ('\x00', '\xe0'):  # Special key prefix (arrows, Delete, etc.)
+                scan = msvcrt.getwch()
+
+                if scan == '\x48':  # Up arrow
+                    if self.input_history:
+                        if temp_history_index == -1:
+                            saved_input = ''.join(current_input)
+                            temp_history_index = len(self.input_history) - 1
+                        elif temp_history_index > 0:
+                            temp_history_index -= 1
+
+                        if temp_history_index >= 0:
+                            sys.stdout.write('\r' + ' ' * (len(prompt) + len(current_input) + 5) + '\r')
+                            sys.stdout.write(f"\033[1;32m{prompt}\033[0m")
+                            current_input = list(self.input_history[temp_history_index])
+                            cursor_pos = len(current_input)
+                            sys.stdout.write(''.join(current_input))
+                            sys.stdout.flush()
+
+                elif scan == '\x50':  # Down arrow
+                    if temp_history_index != -1:
+                        temp_history_index += 1
+                        sys.stdout.write('\r' + ' ' * (len(prompt) + len(current_input) + 5) + '\r')
+                        sys.stdout.write(f"\033[1;32m{prompt}\033[0m")
+
+                        if temp_history_index >= len(self.input_history):
+                            temp_history_index = -1
+                            current_input = list(saved_input)
+                        else:
+                            current_input = list(self.input_history[temp_history_index])
+
+                        cursor_pos = len(current_input)
+                        sys.stdout.write(''.join(current_input))
+                        sys.stdout.flush()
+
+                elif scan == '\x4d':  # Right arrow
+                    if cursor_pos < len(current_input):
+                        cursor_pos += 1
+                        sys.stdout.write('\033[C')
+                        sys.stdout.flush()
+
+                elif scan == '\x4b':  # Left arrow
+                    if cursor_pos > 0:
+                        cursor_pos -= 1
+                        sys.stdout.write('\033[D')
+                        sys.stdout.flush()
+
+                elif scan == '\x53':  # Delete key
+                    if cursor_pos < len(current_input):
+                        del current_input[cursor_pos]
+                        sys.stdout.write(''.join(current_input[cursor_pos:]) + ' ')
+                        sys.stdout.write('\033[' + str(len(current_input) - cursor_pos + 1) + 'D')
+                        sys.stdout.flush()
+
+            elif char in ('\x7f', '\x08'):  # Backspace
+                if cursor_pos > 0:
+                    cursor_pos -= 1
+                    del current_input[cursor_pos]
+                    sys.stdout.write('\b' + ''.join(current_input[cursor_pos:]) + ' ')
+                    sys.stdout.write('\033[' + str(len(current_input) - cursor_pos + 1) + 'D')
+                    sys.stdout.flush()
+
+            elif char >= ' ' and char <= '~':  # Printable characters
+                current_input.insert(cursor_pos, char)
+                cursor_pos += 1
+                sys.stdout.write(char + ''.join(current_input[cursor_pos:]))
+                if cursor_pos < len(current_input):
+                    sys.stdout.write('\033[' + str(len(current_input) - cursor_pos) + 'D')
+                sys.stdout.flush()
 
     def get_user_input(self) -> str:
         """Get user input from the console with history support (up/down arrows)"""
