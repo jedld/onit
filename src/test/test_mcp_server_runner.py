@@ -31,8 +31,8 @@ class TestLoadConfig:
         with pytest.raises(FileNotFoundError):
             load_config("/nonexistent/config.yaml")
 
-    def test_default_config_has_two_servers(self):
-        """The built-in default config should have PromptsMCPServer and ToolsMCPServer."""
+    def test_default_config_has_three_servers(self):
+        """The built-in default config should have PromptsMCPServer, ToolsMCPServer, and VLMToolsMCPServer."""
         default_path = os.path.join(
             os.path.dirname(__file__), "..", "mcp", "servers", "configs", "default.yaml"
         )
@@ -42,7 +42,8 @@ class TestLoadConfig:
             names = [s["name"] for s in result["servers"]]
             assert "PromptsMCPServer" in names
             assert "ToolsMCPServer" in names
-            assert len(result["servers"]) == 2
+            assert "VLMToolsMCPServer" in names
+            assert len(result["servers"]) == 3
             for s in result["servers"]:
                 assert s.get("transport") == "sse"
 

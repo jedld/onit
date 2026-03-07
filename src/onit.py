@@ -814,6 +814,7 @@ class OnIt(BaseModel):
             if not self.web:
                 import sys
                 self.chat_ui.console.print(safety_warning, style="dim")
+                self.chat_ui.start_thinking()
                 def _on_enter():
                     sys.stdin.readline()
                     self.safety_queue.put_nowait(STOP_TAG)
@@ -876,8 +877,27 @@ class OnIt(BaseModel):
                 # success
                 elapsed_time = loop.time() - start_time
                 elapsed_time = f"{elapsed_time:.2f} secs"
-                response = remove_tags(response)
-                self.chat_ui.add_message("assistant", response, elapsed=elapsed_time)
+                response = remove_tags(response).strip()
+                # Skip empty responses — model returned nothing useful.
+                if not response:
+                    self.chat_ui.add_message(
+                        "assistant",
+                        "I wasn't able to generate a response. Please try again or rephrase your question.",
+                        elapsed=elapsed_time,
+                    )
+                    break
+                # If streaming already persisted the message via stream_end(),
+                # just update the elapsed time instead of adding a duplicate.
+                _last = self.chat_ui.messages[-1] if self.chat_ui.messages else None
+                if _last and hasattr(_last, 'role') and _last.role == "assistant" and _last.content == response:
+                    from src.ui.text import Message
+                    self.chat_ui.messages[-1] = Message(
+                        role=_last.role, content=_last.content,
+                        timestamp=_last.timestamp, elapsed=elapsed_time,
+                        name=getattr(_last, 'name', ''),
+                    )
+                else:
+                    self.chat_ui.add_message("assistant", response, elapsed=elapsed_time)
                 try:
                     with open(self.session_path, "a", encoding="utf-8") as f:
                         session_data = {
@@ -913,7 +933,8 @@ class OnIt(BaseModel):
                           'verbose': self.verbose,
                           'data_path': self.data_path,
                           'max_tokens': self.model_serving.get('max_tokens', 262144),
-                          'session_history': self.load_session_history()}
+                          'session_history': self.load_session_history(),
+                          'stream': not self.web}  # stream tokens live for text UI only
                 if self.prompt_intro:
                     kwargs['prompt_intro'] = self.prompt_intro
                 last_response = await chat(host=self.model_serving["host"],

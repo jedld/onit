@@ -23,6 +23,7 @@ import logging
 import os
 import json
 import re
+import types
 import uuid
 from openai import AsyncOpenAI, OpenAIError, APITimeoutError
 from typing import List, Optional, Any
@@ -177,24 +178,36 @@ def _looks_like_raw_tool_call(content: str) -> bool:
     return bool(re.search(r'"name"\s*:\s*"[^"]+"', text) and re.search(r'"arguments"\s*:', text))
 
 
-def _extract_base64_file(tool_response: str, data_path: str) -> str:
+def _extract_base64_file(tool_response: str, data_path: str) -> tuple[str, str | None, str | None]:
     """Detect base64-encoded file data in a tool response and save it to disk.
 
     If the response is JSON containing a 'file_data_base64' field, decode it,
-    write the file to data_path, and return a cleaned JSON string with the
-    base64 data replaced by the local file path.  Otherwise return the
-    original response unchanged.
+    write the file to data_path, and return a tuple:
+      (cleaned_json_str, image_base64_or_None, mime_type_or_None)
+
+    When the file is an image (mime_type starts with 'image/'), the base64 data
+    and mime_type are returned so callers can inject the image into the
+    conversation for VLM processing.  Otherwise return
+    (original_response, None, None).
     """
     try:
         data = json.loads(tool_response)
     except (json.JSONDecodeError, TypeError):
-        return tool_response
+        return tool_response, None, None
 
     if not isinstance(data, dict) or "file_data_base64" not in data:
-        return tool_response
+        return tool_response, None, None
 
     file_data_b64 = data.pop("file_data_base64")
-    file_name = data.get("file_name", f"{uuid.uuid4()}.bin")
+    mime_type = data.get("mime_type", "application/octet-stream")
+
+    # Pick a sensible extension from the mime type
+    _ext_map = {
+        "image/jpeg": ".jpg", "image/png": ".png",
+        "image/gif": ".gif", "image/webp": ".webp",
+    }
+    ext = _ext_map.get(mime_type, ".bin")
+    file_name = data.get("file_name", f"{uuid.uuid4()}{ext}")
     safe_name = os.path.basename(file_name)
     filepath = os.path.join(data_path, safe_name)
     os.makedirs(data_path, exist_ok=True)
@@ -207,7 +220,39 @@ def _extract_base64_file(tool_response: str, data_path: str) -> str:
     data["saved_path"] = filepath
     data["download_url"] = f"/uploads/{safe_name}"
     data["file_size_bytes"] = len(file_bytes)
-    return json.dumps(data)
+
+    # Return image base64 + mime for VLM injection when the file is an image
+    image_b64 = file_data_b64 if mime_type.startswith("image/") else None
+    return json.dumps(data), image_b64, mime_type if image_b64 else None
+
+
+def _strip_old_images(messages: list) -> None:
+    """Replace base64 image payloads in stale tool messages with a short placeholder.
+
+    The image is kept intact in the most-recently-added image-bearing tool message
+    so the model sees it once, then stripped from all older messages to avoid
+    re-sending large base64 blobs on every subsequent turn.
+    """
+    last_image_idx = -1
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "tool" and isinstance(msg.get("content"), list):
+            if any(part.get("type") == "image_url" for part in msg["content"]):
+                last_image_idx = i
+
+    if last_image_idx == -1:
+        return
+
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if i == last_image_idx:
+            continue  # keep the latest image intact
+        if msg.get("role") == "tool" and isinstance(msg.get("content"), list):
+            if any(part.get("type") == "image_url" for part in msg["content"]):
+                text = next((p["text"] for p in msg["content"] if p.get("type") == "text"), "")
+                msg["content"] = text + "\n[image omitted — already analyzed]"
 
 
 async def chat(host: str = "http://127.0.0.1:8001/v1",
@@ -313,6 +358,8 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 print(f"Chat loop exceeded {MAX_CHAT_ITERATIONS} iterations, stopping.")
             return msg
 
+        _strip_old_images(messages)
+
         try:
             if not safety_queue.empty():
                 logger.warning("Safety queue triggered before API call, exiting chat loop.")
@@ -336,6 +383,113 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 completion_kwargs["tools"] = tools
                 
             chat_completion = await client.chat.completions.create(**completion_kwargs)
+
+            # Streaming path: iterate chunks, populate shared variables
+            if stream:
+                _full_content = ""
+                _full_reasoning = ""
+                _full_tool_calls: dict = {}  # index -> {id, name, arguments}
+                _ui_streaming = False
+                _in_think = think  # True if we expect <think>...</think> in delta.content
+
+                async for chunk in chat_completion:
+                    if not safety_queue.empty():
+                        if _ui_streaming and chat_ui:
+                            chat_ui.stream_end()
+                        return None
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+
+                    # Accumulate structured tool-call deltas
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in _full_tool_calls:
+                                _full_tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                            if tc.id:
+                                _full_tool_calls[idx]["id"] = tc.id
+                            if tc.function:
+                                if tc.function.name:
+                                    _full_tool_calls[idx]["name"] += tc.function.name
+                                if tc.function.arguments:
+                                    _full_tool_calls[idx]["arguments"] += tc.function.arguments
+
+                    # vLLM/OpenAI reasoning_content: thinking tokens in a dedicated field
+                    reasoning_tok = getattr(delta, 'reasoning_content', None)
+                    if reasoning_tok and not _full_tool_calls:
+                        _full_reasoning += reasoning_tok
+                        if chat_ui:
+                            if not _ui_streaming:
+                                chat_ui.stream_start()
+                                _ui_streaming = True
+                            chat_ui.stream_think_token(reasoning_tok)
+
+                    # Stream content (answer) tokens to UI
+                    if delta.content:
+                        token = delta.content
+                        _full_content += token
+                        if chat_ui and not _full_tool_calls:
+                            if _in_think:
+                                # Three cases:
+                                # 1. vLLM sends thinking via reasoning_content → no <think> in content
+                                # 2. Model chose not to think → no <think> in content
+                                # 3. Model embeds <think>...</think> inside content
+                                if "<think>" not in _full_content:
+                                    # Cases 1 & 2 — stream answer directly
+                                    _in_think = False
+                                    if not _ui_streaming:
+                                        chat_ui.stream_start()
+                                        _ui_streaming = True
+                                    chat_ui.stream_token(token)
+                                elif "</think>" in _full_content:
+                                    # Case 3 end: think block closed, stream the answer part
+                                    _in_think = False
+                                    post_think = _full_content.split("</think>", 1)[1]
+                                    if post_think:
+                                        if not _ui_streaming:
+                                            chat_ui.stream_start()
+                                            _ui_streaming = True
+                                        chat_ui.stream_token(post_think)
+                                else:
+                                    # Case 3 mid: inside inline <think> block
+                                    if not _ui_streaming:
+                                        chat_ui.stream_start()
+                                        _ui_streaming = True
+                                    chat_ui.stream_think_token(token.replace("<think>", ""))
+                            else:
+                                if not _ui_streaming:
+                                    chat_ui.stream_start()
+                                    _ui_streaming = True
+                                chat_ui.stream_token(token)
+
+                if _ui_streaming and chat_ui:
+                    chat_ui.stream_end()
+
+                # Reconstruct into unified variables
+                if _full_tool_calls:
+                    _tool_call_objs = [
+                        types.SimpleNamespace(
+                            id=v["id"],
+                            function=types.SimpleNamespace(name=v["name"], arguments=v["arguments"])
+                        )
+                        for v in _full_tool_calls.values()
+                    ]
+                    _content = None
+                    _tool_calls = _tool_call_objs
+                    _message_for_history = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {"id": v["id"], "type": "function",
+                             "function": {"name": v["name"], "arguments": v["arguments"]}}
+                            for v in _full_tool_calls.values()
+                        ]
+                    }
+                else:
+                    _content = _full_content
+                    _tool_calls = None
+                    _message_for_history = {"role": "assistant", "content": _full_content}
 
             await asyncio.sleep(0.1)
             if not safety_queue.empty():
@@ -365,10 +519,17 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             elif verbose:
                 print(error_message)
             return None
-            
-        tool_calls = chat_completion.choices[0].message.tool_calls
+
+        # Non-streaming: extract from response object into unified variables
+        if not stream:
+            _msg = chat_completion.choices[0].message
+            _content = _msg.content
+            _tool_calls = _msg.tool_calls if _msg.tool_calls else None
+            _message_for_history = _msg
+
+        tool_calls = _tool_calls
         if tool_calls is None or len(tool_calls) == 0:
-            last_response = chat_completion.choices[0].message.content
+            last_response = _content
             # Check if the model returned a tool call as raw JSON in the content
             raw_tool = _parse_tool_call_from_content(last_response, tool_registry)
             if raw_tool:
@@ -376,8 +537,9 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 function_arguments = raw_tool["arguments"]
                 synthetic_id = f"call_{uuid.uuid4().hex[:24]}"
                 if chat_ui:
-                    chat_ui.add_log(f"Calling: {function_name}({function_arguments})", level="info")
-                    chat_ui.render()
+                    chat_ui.add_tool_call(function_name, function_arguments)
+                    chat_ui.show_tool_start(function_name, function_arguments)
+                    chat_ui.start_tool_spinner(function_name, function_arguments)
                 elif verbose:
                     print(f"{function_name}({function_arguments})")
                 messages.append({"role": "assistant", "content": last_response})
@@ -397,14 +559,22 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                                 elif verbose:
                                     print(f"{function_name} timed out after {timeout}s")
                             tool_response = "" if tool_response is None else str(tool_response)
+                            _vision_b64, _vision_mime = None, None
                             if data_path and "file_data_base64" in tool_response:
-                                tool_response = _extract_base64_file(tool_response, data_path)
-                            tool_message = {'role': 'tool', 'content': tool_response, 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
+                                tool_response, _vision_b64, _vision_mime = _extract_base64_file(tool_response, data_path)
+                            if _vision_b64:
+                                tool_content = [
+                                    {"type": "text", "text": tool_response},
+                                    {"type": "image_url", "image_url": {"url": f"data:{_vision_mime};base64,{_vision_b64}"}},
+                                ]
+                            else:
+                                tool_content = tool_response
+                            tool_message = {'role': 'tool', 'content': tool_content, 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
                             messages.append(tool_message)
-                            truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
                             if chat_ui:
-                                chat_ui.add_log(f"{function_name}({function_arguments}) returned: {truncated}", level="debug")
+                                chat_ui.add_tool_result(function_name, tool_response)
                             elif verbose:
+                                truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
                                 print(f"{function_name}({function_arguments}) returned: {truncated}")
                         except Exception as e:
                             if chat_ui:
@@ -444,9 +614,19 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
 
             if "</think>" in last_response:
                 last_response = last_response.split("</think>")[1]
+            # Fallback: if delta.content was empty but reasoning_content had the answer,
+            # surface the reasoning so the user gets a non-empty reply.
+            if not last_response or not last_response.strip():
+                if _full_reasoning and _full_reasoning.strip():
+                    last_response = _full_reasoning.strip()
+                elif _full_content and "<think>" in _full_content:
+                    # Model put entire answer inside inline <think> tags
+                    think_body = _full_content.split("<think>", 1)[1].split("</think>", 1)[0].strip()
+                    if think_body:
+                        last_response = think_body
             return last_response
 
-        messages.append(chat_completion.choices[0].message)
+        messages.append(_message_for_history)
         for tool in tool_calls:
             await asyncio.sleep(0.1)
             if not safety_queue.empty():
@@ -456,8 +636,9 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             function_name = tool.function.name
             function_arguments = json.loads(tool.function.arguments)
             if chat_ui:
-                chat_ui.add_log(f"Calling: {function_name}({function_arguments})", level="info")
-                chat_ui.render()
+                chat_ui.add_tool_call(function_name, function_arguments)
+                chat_ui.show_tool_start(function_name, function_arguments)
+                chat_ui.start_tool_spinner(function_name, function_arguments)
             elif verbose:
                 print(f"{function_name}({function_arguments})")
             # Ensure the function is available, and then call it
@@ -475,19 +656,30 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                             tool_response = f"- tool call timed out after {timeout} seconds. Tool might have succeeded but no response was received. Check expected output."
                             if chat_ui:
                                 chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
+                        if chat_ui:
+                            chat_ui.stop_tool_spinner()
                         tool_response = "" if tool_response is None else str(tool_response)
                         # Extract base64 file data from tool response and save to disk
+                        _vision_b64, _vision_mime = None, None
                         if data_path and "file_data_base64" in tool_response:
-                            tool_response = _extract_base64_file(tool_response, data_path)
-                        tool_message = {'role': 'tool', 'content': tool_response, 'name': tool.function.name, 'parameters': function_arguments, "tool_call_id": tool.id,}
+                            tool_response, _vision_b64, _vision_mime = _extract_base64_file(tool_response, data_path)
+                        if _vision_b64:
+                            tool_content = [
+                                {"type": "text", "text": tool_response},
+                                {"type": "image_url", "image_url": {"url": f"data:{_vision_mime};base64,{_vision_b64}"}},
+                            ]
+                        else:
+                            tool_content = tool_response
+                        tool_message = {'role': 'tool', 'content': tool_content, 'name': tool.function.name, 'parameters': function_arguments, "tool_call_id": tool.id,}
                         messages.append(tool_message)
 
-                        # Log tool response (truncated for display)
-                        truncated_response = tool_response[:200] + "..." if len(tool_response) > 200 else tool_response
                         if chat_ui:
-                            chat_ui.add_log(f"{function_name}({function_arguments}) returned: {truncated_response}", level="debug")
+                            chat_ui.add_tool_result(function_name, tool_response)
+                            chat_ui.show_tool_done(function_name, tool_response)
                     except Exception as e:
                         if chat_ui:
+                            chat_ui.stop_tool_spinner()
+                            chat_ui.show_tool_done(function_name, str(e), success=False)
                             chat_ui.add_log(f"{tool_name} error: {e}", level="error")
                         elif verbose:
                             print(f"{tool_name} encountered an error: {e}")
