@@ -261,6 +261,8 @@ class WebSession:
     spinner_tick: int = 0
     safety_queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=10))
     created: datetime = field(default_factory=datetime.now)
+    streaming_content: str = ""
+    streaming_active: bool = False
 
 
 class WebChatUI:
@@ -779,12 +781,19 @@ class WebChatUI:
                 if self._loop and self._onit:
                     async def _run_task(s=session, task=queue_msg):
                         try:
+                            def _on_stream_token(_token, full_content):
+                                s.streaming_content = full_content
+                                s.streaming_active = True
+
                             response = await self._onit.process_task(
                                 task,
                                 session_path=s.session_path,
                                 data_path=s.data_path,
                                 safety_queue=s.safety_queue,
+                                stream_callback=_on_stream_token,
                             )
+                            s.streaming_active = False
+                            s.streaming_content = ""
                             if response:
                                 display, file_paths = self._extract_file_paths(
                                     response, data_path=s.data_path, session_id=s.session_id
@@ -810,6 +819,8 @@ class WebChatUI:
                                 gr.ChatMessage(role="assistant", content=f"Error: {e}")
                             )
                         finally:
+                            s.streaming_active = False
+                            s.streaming_content = ""
                             s.processing = False
 
                     asyncio.run_coroutine_threadsafe(_run_task(), self._loop)
@@ -836,7 +847,7 @@ class WebChatUI:
                 was_spinner_shown = session.spinner_shown
                 chatbot_changed = False
 
-                # Remove spinner before appending real responses or when done
+                # Remove spinner/streaming placeholder before appending real responses or when done
                 if session.spinner_shown and (session.pending_responses or not session.processing):
                     if history:
                         history = history[:-1]
@@ -851,29 +862,43 @@ class WebChatUI:
                     history = history + [resp]
                     chatbot_changed = True
 
-                # Add or update spinner while processing
+                # Show streaming content or spinner while processing
                 if session.processing:
-                    session.spinner_tick += 1
-                    spinner_text_changed = session.spinner_tick >= self._spinner_ticks_per_message
-                    if spinner_text_changed:
-                        session.spinner_tick = 0
-                        session.spinner_step += 1
-                    status_msg = self._spinner_messages[
-                        session.spinner_step % len(self._spinner_messages)
-                    ]
-                    # Only update chatbot when spinner first appears or text changes
-                    if not session.spinner_shown or spinner_text_changed:
-                        spinner_msg = gr.ChatMessage(
+                    if session.streaming_active and session.streaming_content:
+                        # Show live streaming content
+                        stream_msg = gr.ChatMessage(
                             role="assistant",
-                            content=f"### {status_msg}",
-                            metadata={"title": "_On it_"},
+                            content=session.streaming_content,
                         )
                         if session.spinner_shown:
-                            history = history[:-1] + [spinner_msg]
+                            history = history[:-1] + [stream_msg]
                         else:
-                            history = history + [spinner_msg]
+                            history = history + [stream_msg]
                             session.spinner_shown = True
                         chatbot_changed = True
+                    else:
+                        # Fall back to spinner while waiting (e.g. tool calls)
+                        session.spinner_tick += 1
+                        spinner_text_changed = session.spinner_tick >= self._spinner_ticks_per_message
+                        if spinner_text_changed:
+                            session.spinner_tick = 0
+                            session.spinner_step += 1
+                        status_msg = self._spinner_messages[
+                            session.spinner_step % len(self._spinner_messages)
+                        ]
+                        # Only update chatbot when spinner first appears or text changes
+                        if not session.spinner_shown or spinner_text_changed:
+                            spinner_msg = gr.ChatMessage(
+                                role="assistant",
+                                content=f"### {status_msg}",
+                                metadata={"title": "_On it_"},
+                            )
+                            if session.spinner_shown:
+                                history = history[:-1] + [spinner_msg]
+                            else:
+                                history = history + [spinner_msg]
+                                session.spinner_shown = True
+                            chatbot_changed = True
 
                 logs_md = self._format_logs() if self.execution_logs else "*No execution logs yet.*"
 

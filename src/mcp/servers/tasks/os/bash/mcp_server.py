@@ -275,6 +275,10 @@ def bash(
             })
 
         # Validate and normalize working directory
+        # Default to DATA_PATH when cwd is "." (default) to avoid
+        # rejecting commands when process cwd is outside allowed dirs
+        if cwd == ".":
+            cwd = DATA_PATH
         work_dir = os.path.abspath(os.path.expanduser(cwd))
         try:
             work_dir = _validate_dir_path(work_dir)

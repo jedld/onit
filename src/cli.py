@@ -65,15 +65,12 @@ def _upload_file(url: str, filepath: str) -> str:
     return filename
 
 
-def _send_task(url: str, task: str, file: str = None, image: str = None) -> str:
-    """Send a task to an OnIt A2A server and return the answer."""
-    import threading
-    import time
+def _build_a2a_parts(task: str, file: str = None, image: str = None) -> list:
+    """Build the A2A message parts list from task text and optional files."""
     import mimetypes as _mimetypes
 
     parts = [{"kind": "text", "text": task}]
 
-    # Embed file inline as a FilePart in the JSON-RPC payload
     if file:
         filepath = os.path.abspath(os.path.expanduser(file))
         if not os.path.isfile(filepath):
@@ -90,7 +87,6 @@ def _send_task(url: str, task: str, file: str = None, image: str = None) -> str:
             }
         })
 
-    # Embed image inline as a FilePart in the same JSON-RPC payload
     if image:
         mime_types = {
             '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -110,10 +106,53 @@ def _send_task(url: str, task: str, file: str = None, image: str = None) -> str:
             }
         })
 
+    return parts
+
+
+def _extract_a2a_text(result: dict) -> str | None:
+    """Extract text from an A2A result dict (Task or Message)."""
+    text = None
+    if "status" in result:
+        for artifact in result.get("artifacts", []):
+            for part in artifact.get("parts", []):
+                if part.get("kind") == "text":
+                    text = part["text"]
+                    break
+            if text:
+                break
+        if not text:
+            task_result = result.get("result")
+            if task_result:
+                for part in task_result.get("parts", []):
+                    if part.get("kind") == "text":
+                        text = part["text"]
+                        break
+    if not text and "parts" in result:
+        for part in result.get("parts", []):
+            if part.get("kind") == "text":
+                text = part["text"]
+                break
+    return text
+
+
+def _send_task(url: str, task: str, file: str = None, image: str = None) -> str:
+    """Send a task to an OnIt A2A server using SSE streaming.
+
+    Uses ``message/stream`` so the server can push incremental
+    ``TaskStatusUpdateEvent`` (state=working) events.  Each event
+    carries the accumulated text so far; the client prints only the
+    new delta.  The "Waiting ..." spinner is replaced by live output
+    as soon as the first token arrives.
+
+    Falls back to the non-streaming ``message/send`` path if the SSE
+    request fails (e.g. older server without streaming support).
+    """
+    parts = _build_a2a_parts(task, file=file, image=image)
+
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
-        "method": "message/send",
+        "method": "message/stream",
         "params": {
             "message": {
                 "role": "user",
@@ -136,61 +175,157 @@ def _send_task(url: str, task: str, file: str = None, image: str = None) -> str:
             sys.stderr.flush()
             stop_timer.wait(1.0)
 
-    # Print initial message immediately on main thread
     sys.stderr.write("\rWaiting... 00:00:00")
     sys.stderr.flush()
 
     timer_thread = threading.Thread(target=_show_elapsed, daemon=True)
     timer_thread.start()
+
+    printed_len = 0       # how much of the streamed text we already printed
+    final_text = None      # set when the completed task arrives
+    raw_result = {}        # raw result dict for fallback JSON dump
+    spinner_cleared = False
+    cursor_shown = False   # whether a blinking cursor char is on screen
+
+    def _erase_cursor():
+        """Remove the blinking block cursor and restore the terminal cursor."""
+        nonlocal cursor_shown
+        if cursor_shown:
+            sys.stdout.write("\b \b")   # erase the block char
+            sys.stdout.write("\033[?25h")  # restore terminal cursor
+            sys.stdout.flush()
+            cursor_shown = False
+
+    def _show_cursor():
+        """Hide terminal cursor and show a blinking white block instead."""
+        nonlocal cursor_shown
+        if not cursor_shown:
+            sys.stdout.write("\033[?25l")  # hide terminal cursor
+            sys.stdout.write("\033[5m\u2588\033[0m")  # blinking white block
+            sys.stdout.flush()
+            cursor_shown = True
+
+    def _clear_spinner():
+        nonlocal spinner_cleared
+        if not spinner_cleared:
+            stop_timer.set()
+            timer_thread.join()
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+            spinner_cleared = True
+
     try:
+        resp = requests.post(
+            url.rstrip("/"),
+            json=payload,
+            headers={"Accept": "text/event-stream"},
+            stream=True,
+            timeout=None,
+        )
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("content-type", "")
+
+        if "text/event-stream" in content_type:
+            # ── SSE streaming path ──────────────────────────────────
+            for line in resp.iter_lines(decode_unicode=True):
+                if line is None:
+                    continue
+                # SSE events look like:  data: {"jsonrpc":"2.0",...}
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if not raw:
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                result = event.get("result", {})
+                status = result.get("status", {})
+                state = status.get("state", "")
+
+                # Intermediate "working" event → print the new delta
+                if state == "working":
+                    msg = status.get("message", {})
+                    for part in msg.get("parts", []):
+                        if part.get("kind") == "text":
+                            full = part["text"]
+                            if len(full) > printed_len:
+                                _clear_spinner()
+                                _erase_cursor()
+                                sys.stdout.write(full[printed_len:])
+                                sys.stdout.flush()
+                                printed_len = len(full)
+                                _show_cursor()
+                            break
+
+                # Completed event → extract final answer
+                elif state == "completed":
+                    raw_result = result
+                    final_text = _extract_a2a_text(result)
+                    # Also check status.message for the final text
+                    if not final_text:
+                        msg = status.get("message", {})
+                        for part in msg.get("parts", []):
+                            if part.get("kind") == "text":
+                                final_text = part["text"]
+                                break
+
+                # Non-status event (direct Message) → might be final
+                elif "parts" in result:
+                    raw_result = result
+                    final_text = _extract_a2a_text(result)
+
+        else:
+            # ── Non-streaming JSON response (fallback) ──────────────
+            data = resp.json()
+            error = data.get("error")
+            if error:
+                _clear_spinner()
+                return f"Error: {error}"
+            raw_result = data.get("result", {})
+            final_text = _extract_a2a_text(raw_result)
+
+    except requests.RequestException:
+        # SSE failed — fall back to non-streaming message/send
+        _clear_spinner()
+        payload["method"] = "message/send"
         resp = requests.post(url.rstrip("/"), json=payload, timeout=None)
         resp.raise_for_status()
+        data = resp.json()
+        error = data.get("error")
+        if error:
+            return f"Error: {error}"
+        raw_result = data.get("result", {})
+        final_text = _extract_a2a_text(raw_result)
     finally:
-        stop_timer.set()
-        timer_thread.join()
-        # Clear the timer line
-        sys.stderr.write("\r\033[K")
-        sys.stderr.flush()
-    data = resp.json()
+        _erase_cursor()
+        _clear_spinner()
 
-    error = data.get("error")
-    if error:
-        return f"Error: {error}"
+    if final_text is None:
+        return json.dumps(raw_result, indent=2)
 
-    result = data.get("result", {})
-    text = None
-    # A2A Task response (has status + artifacts)
-    if "status" in result:
-        for artifact in result.get("artifacts", []):
-            for part in artifact.get("parts", []):
-                if part.get("kind") == "text":
-                    text = part["text"]
-                    break
-            if text:
-                break
-        # fallback: check result field
-        if not text:
-            task_result = result.get("result")
-            if task_result:
-                for part in task_result.get("parts", []):
-                    if part.get("kind") == "text":
-                        text = part["text"]
-                        break
-    # Direct Message response
-    if not text and "parts" in result:
-        for part in result.get("parts", []):
-            if part.get("kind") == "text":
-                text = part["text"]
-                break
-
-    if not text:
-        return json.dumps(result, indent=2)
+    # If we already streamed everything, just print the trailing
+    # newline; otherwise print any remaining text the stream missed.
+    if printed_len > 0:
+        remaining = final_text[printed_len:]
+        if remaining:
+            sys.stdout.write(remaining)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
     # Download any files referenced in the response
-    if "/uploads/" in text:
-        text = _download_files(text, url)
+    if "/uploads/" in final_text:
+        final_text = _download_files(final_text, url)
 
-    return text
+    # If we already printed via streaming, return empty to avoid
+    # double-printing in the caller.
+    if printed_len > 0:
+        return ""
+
+    return final_text
 
 
 def _find_default_config() -> str:

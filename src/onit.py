@@ -46,12 +46,112 @@ from .model.serving.chat import chat
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.types import FilePart, FileWithBytes
+from a2a.types import FilePart, FileWithBytes, TaskState, TaskStatus, TaskStatusUpdateEvent
 from a2a.utils import new_agent_text_message
 
 AGENT_CURSOR = "OnIt"
 USER_CURSOR = "You"
 STOP_TAG = "<stop></stop>"
+
+
+class StreamingAdapter:
+    """Minimal chat_ui adapter that forwards streaming tokens to a callback.
+
+    Implements the subset of the ChatUI interface used by ``chat()`` so that
+    ``process_task`` callers (web UI, A2A) can receive tokens incrementally
+    without a full terminal UI.
+    """
+
+    def __init__(self, on_token=None, on_complete=None, show_logs=False,
+                 throttle_tokens=0):
+        self.on_token = on_token
+        self.on_complete = on_complete
+        self.show_logs = show_logs
+        self._throttle_tokens = throttle_tokens
+        self._content = ""
+        self._tag_buf = ""
+        self._token_count = 0
+        self._pending: list[asyncio.Task] = []
+        self.messages = []
+
+    # ── streaming ────────────────────────────────────────────────
+    def stream_start(self):
+        self._content = ""
+        self._tag_buf = ""
+        self._token_count = 0
+
+    def stream_token(self, token):
+        # Strip <answer></answer> wrapper tags
+        buf = self._tag_buf + token
+        buf = buf.replace("<answer>", "").replace("</answer>", "")
+        if buf.endswith("<"):
+            self._tag_buf = "<"
+            token = buf[:-1]
+        else:
+            self._tag_buf = ""
+            token = buf
+        self._content += token
+        if not (self.on_token and token):
+            return
+        self._token_count += 1
+        # Throttle: skip intermediate tokens when configured
+        if self._throttle_tokens and (self._token_count % self._throttle_tokens != 0):
+            return
+        result = self.on_token(token, self._content)
+        # Support async callbacks (e.g. A2A event_queue) — track the
+        # futures so they can be flushed before the caller returns.
+        if asyncio.iscoroutine(result):
+            task = asyncio.ensure_future(result)
+            self._pending.append(task)
+
+    def stream_think_token(self, token):
+        pass  # skip think tokens for external clients
+
+    def stream_end(self, elapsed=""):
+        if self.on_complete:
+            self.on_complete(self._content)
+        self._content = ""
+        self._tag_buf = ""
+        self._token_count = 0
+
+    async def flush(self):
+        """Await all pending async callbacks so no events are lost."""
+        if self._pending:
+            await asyncio.gather(*self._pending, return_exceptions=True)
+            self._pending.clear()
+        # Send one final callback with the latest content so the client
+        # is guaranteed to see the full accumulated text before the final
+        # response message arrives.
+        if self.on_token and self._throttle_tokens and self._content:
+            result = self.on_token("", self._content)
+            if asyncio.iscoroutine(result):
+                await result
+
+    # ── tool display (no-ops for external clients) ───────────────
+    def add_tool_call(self, name, arguments):
+        pass
+
+    def show_tool_start(self, name, arguments):
+        if self.show_logs:
+            print(f"{name}({arguments})")
+
+    def start_tool_spinner(self, name, arguments):
+        pass
+
+    def stop_tool_spinner(self):
+        pass
+
+    def show_tool_done(self, name, result, success=True):
+        if self.show_logs:
+            truncated = result[:500] + "..." if len(result) > 500 else result
+            print(f"{name} returned: {truncated}")
+
+    def add_tool_result(self, name, result, truncate=300):
+        pass
+
+    def add_log(self, message, level="info"):
+        if self.show_logs:
+            print(f"[{level}] {message}")
 
 
 class OnItA2AExecutor(AgentExecutor):
@@ -124,6 +224,25 @@ class OnItA2AExecutor(AgentExecutor):
         current_task_id = id(asyncio.current_task())
         self._active_safety_queues[current_task_id] = session["safety_queue"]
 
+        # Stream partial progress back to the A2A client as "working" status events
+        _task_id = context.task_id or ""
+        _context_id = context.context_id or ""
+
+        async def _a2a_stream_callback(_token, full_content):
+            try:
+                event = TaskStatusUpdateEvent(
+                    taskId=_task_id,
+                    contextId=_context_id,
+                    final=False,
+                    status=TaskStatus(
+                        state=TaskState.working,
+                        message=new_agent_text_message(full_content),
+                    ),
+                )
+                await event_queue.enqueue_event(event)
+            except Exception:
+                pass  # best-effort streaming
+
         try:
             result = await self.onit.process_task(
                 task,
@@ -131,6 +250,8 @@ class OnItA2AExecutor(AgentExecutor):
                 session_path=session["session_path"],
                 data_path=session["data_path"],
                 safety_queue=session["safety_queue"],
+                stream_callback=_a2a_stream_callback,
+                stream_throttle=10,
             )
         except asyncio.CancelledError:
             session["safety_queue"].put_nowait(STOP_TAG)
@@ -475,7 +596,9 @@ class OnIt(BaseModel):
     async def process_task(self, task: str, images: list[str] | None = None,
                            session_path: str | None = None,
                            data_path: str | None = None,
-                           safety_queue: asyncio.Queue | None = None) -> str:
+                           safety_queue: asyncio.Queue | None = None,
+                           stream_callback=None,
+                           stream_throttle: int = 0) -> str:
         """Process a single task and return the response string.
 
         Args:
@@ -484,6 +607,11 @@ class OnIt(BaseModel):
             session_path: Optional override for session history file path.
             data_path: Optional override for data directory path.
             safety_queue: Optional per-session safety queue (e.g. per-tab in web UI).
+            stream_callback: Optional callback ``(token, full_content) -> None``
+                called for each streamed token so callers can deliver incremental
+                updates to their clients (web UI, A2A, etc.).
+            stream_throttle: When > 0, only invoke ``stream_callback`` every N
+                tokens to avoid flooding (useful for A2A SSE).
         """
         # Use per-chat overrides if provided, otherwise fall back to instance defaults
         effective_session_path = session_path or self.session_path
@@ -505,8 +633,19 @@ class OnIt(BaseModel):
             })
             instruction = instruction.messages[0].content.text
 
+        # When a stream_callback is provided and streaming is enabled,
+        # use a StreamingAdapter so chat() delivers tokens incrementally.
+        _adapter = None
+        if stream_callback and self.stream:
+            _adapter = StreamingAdapter(
+                on_token=stream_callback,
+                show_logs=self.show_logs,
+                throttle_tokens=stream_throttle,
+            )
+
         kwargs = {
-            'console': None, 'chat_ui': None,
+            'console': None,
+            'chat_ui': _adapter,
             'cursor': AGENT_CURSOR, 'memories': None,
             'verbose': self.verbose or self.show_logs,
             'data_path': effective_data_path,
@@ -528,6 +667,12 @@ class OnIt(BaseModel):
             timeout=self.timeout,
             **kwargs,
         )
+
+        # Flush any pending async streaming events (e.g. A2A) before
+        # returning, so the client sees all partial updates before the
+        # final completed message.
+        if _adapter:
+            await _adapter.flush()
 
         if last_response is None:
             logger.error("chat() returned None — likely a safety queue trigger or unhandled error. "
@@ -648,7 +793,7 @@ class OnIt(BaseModel):
             version="1.0.0",
             default_input_modes=["text"],
             default_output_modes=["text"],
-            capabilities=AgentCapabilities(streaming=False),
+            capabilities=AgentCapabilities(streaming=self.stream),
             skills=[AgentSkill(
                 id="general",
                 name="General Task",

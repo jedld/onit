@@ -137,6 +137,7 @@ class ChatUI:
         self._stream_think_started = False  # True while a think block is open
         self._tag_buf = ""  # buffer for partial tag detection across tokens
         self._trail_buf = ""  # buffer whitespace-only tokens to suppress trailing blank lines
+        self._stream_cursor_shown = False  # blinking block cursor during streaming
         self.initialize()
         
     def set_theme(self, theme: str) -> None:
@@ -570,6 +571,7 @@ class ChatUI:
 
     def show_tool_start(self, name: str, arguments: dict) -> None:
         """Print a bordered tool-call block inline (mirrors chat history style)."""
+        self._erase_stream_cursor()  # pause blinking cursor during tool execution
         ts = self.format_timestamp()
         args_str = json.dumps(arguments, ensure_ascii=False)
         t = Text()
@@ -596,6 +598,24 @@ class ChatUI:
         t.append(f"{display}\n", style="dim white")
         t.append("└" + "─" * 40, style="green" if success else "red")
         self.console.print(t)
+
+    # ── Blinking cursor helpers ────────────────────────────────────
+
+    def _show_stream_cursor(self) -> None:
+        """Hide terminal cursor and show a blinking white block."""
+        if not self._stream_cursor_shown:
+            sys.stdout.write("\033[?25l")          # hide terminal cursor
+            sys.stdout.write("\033[5m\u2588\033[0m")  # blinking white block
+            sys.stdout.flush()
+            self._stream_cursor_shown = True
+
+    def _erase_stream_cursor(self) -> None:
+        """Remove the blinking block and restore the terminal cursor."""
+        if self._stream_cursor_shown:
+            sys.stdout.write("\b \b")              # erase the block char
+            sys.stdout.write("\033[?25h")           # restore terminal cursor
+            sys.stdout.flush()
+            self._stream_cursor_shown = False
 
     # ── Token streaming ───────────────────────────────────────────
 
@@ -634,6 +654,7 @@ class ChatUI:
         display = self._filter_display_token(token)
         if not display:
             return
+        self._erase_stream_cursor()
         if not self._stream_header_printed:
             self._stream_pending += display
             if self._stream_pending.strip():
@@ -645,6 +666,7 @@ class ChatUI:
                 )
                 print(self._stream_pending.lstrip(), end="", flush=True)
                 self._stream_pending = ""
+                self._show_stream_cursor()
         else:
             if display.strip():
                 # Non-whitespace: flush any buffered trailing whitespace then print
@@ -652,9 +674,11 @@ class ChatUI:
                     print(self._trail_buf, end="", flush=True)
                     self._trail_buf = ""
                 print(display, end="", flush=True)
+                self._show_stream_cursor()
             else:
                 # Whitespace-only token: buffer it; discard if stream ends before real content
                 self._trail_buf += display
+                self._show_stream_cursor()
 
     def _filter_display_token(self, token: str) -> str:
         """Strip <answer>/<answer> wrapper tags, buffering a partial '<' across tokens."""
@@ -668,6 +692,7 @@ class ChatUI:
 
     def stream_end(self, elapsed: str = "") -> None:
         """Close the streamed block. Message saving is handled by onit.py (has correct elapsed)."""
+        self._erase_stream_cursor()
         self.stream_think_end()  # close think block if still open
         if not self._stream_header_printed:
             # Only whitespace or tool-call-only response — skip the empty block
