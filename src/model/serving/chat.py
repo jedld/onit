@@ -34,16 +34,24 @@ logger = logging.getLogger(__name__)
 def _resolve_api_key(host: str, host_key: str = "EMPTY") -> str:
     """Resolve the API key based on the host URL.
 
-    For OpenRouter hosts, use host_key param or OPENROUTER_API_KEY env var.
-    For vLLM and other local hosts, default to "EMPTY".
+    For OpenRouter hosts, use host_key param or OPENROUTER_API_KEY env var
+    or OS keychain. For vLLM and other local hosts, default to "EMPTY".
     """
     if "openrouter.ai" in host:
         if host_key and host_key != "EMPTY":
             return host_key
         key = os.environ.get("OPENROUTER_API_KEY", "")
         if not key:
+            # Try OS keychain via setup module
+            try:
+                from src.setup import get_secret
+                key = get_secret("host_key") or ""
+            except Exception:
+                pass
+        if not key:
             raise ValueError(
                 "OpenRouter requires an API key. Set it via:\n"
+                "  - onit setup (recommended)\n"
                 "  - serving.host_key in the config YAML\n"
                 "  - OPENROUTER_API_KEY environment variable"
             )

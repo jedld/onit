@@ -3,6 +3,8 @@ CLI entry point for the OnIt agent.
 
 Usage:
     onit                        # interactive terminal chat
+    onit setup                  # interactive setup wizard
+    onit setup --show           # show current configuration
     onit --web                  # Gradio web UI
     onit --gateway              # Telegram bot gateway
     onit --config my.yaml       # custom config
@@ -433,11 +435,49 @@ def _ensure_mcp_servers(config_data: dict, log_level='ERROR'):
               file=sys.stderr)
 
 
+def _merge_base(override: dict, base: dict):
+    """Recursively merge *override* into *base* (in-place).
+
+    Values from *override* take precedence.  For nested dicts the merge
+    is recursive so that e.g. ``serving.host`` from the override replaces
+    only that key, not the entire ``serving`` block.
+    """
+    for key, value in override.items():
+        if (key in base
+                and isinstance(base[key], dict)
+                and isinstance(value, dict)):
+            _merge_base(value, base[key])
+        else:
+            base[key] = value
+
+
+def _resolve_credential(cli_value: str | None,
+                        env_var: str | None,
+                        keyring_key: str) -> str | None:
+    """Resolve a credential: CLI arg > env var > keyring > None."""
+    if cli_value:
+        return cli_value
+    if env_var:
+        val = os.environ.get(env_var)
+        if val:
+            return val
+    from .setup import get_secret
+    return get_secret(keyring_key)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="onit",
         description="OnIt — an intelligent agent for task automation and assistance.",
     )
+
+    # Subcommands (setup)
+    subparsers = parser.add_subparsers(dest="command")
+    setup_parser = subparsers.add_parser("setup",
+                                         help="Interactive setup wizard.")
+    setup_parser.add_argument("--show", action="store_true",
+                              help="Display current configuration.")
+
     # General options
     parser.add_argument('--config', type=str, default=None,
                         help='Path to the configuration YAML file.')
@@ -513,6 +553,12 @@ def main():
                              'Example: --mcp-sse http://localhost:8080/sse')
     args = parser.parse_args()
 
+    # Setup wizard
+    if args.command == "setup":
+        from .setup import run_setup
+        run_setup(show_only=args.show)
+        return
+
     # Client mode: send task to remote A2A server and exit
     if args.a2a_client:
         if not args.a2a_task:
@@ -548,6 +594,19 @@ def main():
         if args.config:
             print(f"Warning: config file '{args.config}' not found, using defaults.",
                   file=sys.stderr)
+
+    # Merge ~/.onit/config.yaml (from 'onit setup') as a base layer.
+    # Setup values fill in gaps but never override the project/user config.
+    from .setup import CONFIG_PATH as _setup_config_path
+    _resolved_config = os.path.realpath(config_path) if os.path.isfile(config_path) else None
+    _setup_resolved = os.path.realpath(_setup_config_path)
+    if (_resolved_config != _setup_resolved
+            and os.path.isfile(_setup_config_path)):
+        with open(_setup_config_path, 'r') as f:
+            setup_data = yaml.safe_load(f) or {}
+        # Deep-merge: setup_data is the base, config_data overrides
+        _merge_base(config_data, setup_data)
+        config_data = setup_data
 
     # override config with CLI args (only if explicitly provided)
     arg_to_config = {
@@ -603,49 +662,55 @@ def main():
     host = serving.get('host') or os.environ.get('ONIT_HOST')
     host_key = serving.get('host_key', '')
 
+    # Resolve host_key from keyring if not set via config/env
+    if not host_key or host_key == 'EMPTY':
+        kr_key = _resolve_credential(None, 'OPENROUTER_API_KEY', 'host_key')
+        if kr_key:
+            host_key = kr_key
+            config_data.setdefault('serving', {})['host_key'] = host_key
+
     missing = []
     if not host:
-        missing.append('ONIT_HOST (or set serving.host in config)')
+        missing.append('ONIT_HOST (or set serving.host in config, or run: onit setup)')
     elif 'openrouter' in (host or '').lower():
-        if not host_key and not os.environ.get('OPENROUTER_API_KEY'):
-            missing.append('OPENROUTER_API_KEY (or set serving.host_key in config)')
+        if not host_key:
+            missing.append('OPENROUTER_API_KEY (or run: onit setup)')
 
     if missing:
         print("Error: missing required configuration:", file=sys.stderr)
         for var in missing:
             print(f"  - {var}", file=sys.stderr)
-        print("\nSet via environment variable, CLI option (--host), or in your config YAML.", file=sys.stderr)
+        print("\nSet via environment variable, CLI option (--host), config YAML, "
+              "or run: onit setup", file=sys.stderr)
         sys.exit(1)
 
     # Check OLLAMA_API_KEY for web search support
-    ollama_api_key = args.ollama_api_key or os.environ.get('OLLAMA_API_KEY')
+    ollama_api_key = _resolve_credential(
+        args.ollama_api_key, 'OLLAMA_API_KEY', 'ollama_api_key')
     if ollama_api_key:
         os.environ['OLLAMA_API_KEY'] = ollama_api_key
     else:
-        print("Warning: OLLAMA_API_KEY is not set. Web search tool will be disabled.",
-              file=sys.stderr)
-        print("Set via environment variable or --ollama-api-key CLI option.",
-              file=sys.stderr)
         os.environ['ONIT_DISABLE_WEB_SEARCH'] = '1'
 
     # Check OPENWEATHERMAP_API_KEY for weather tool support
-    weather_api_key = (args.openweathermap_api_key
-                       or os.environ.get('OPENWEATHERMAP_API_KEY')
-                       or os.environ.get('OPENWEATHER_API_KEY'))
+    weather_api_key = _resolve_credential(
+        args.openweathermap_api_key, 'OPENWEATHERMAP_API_KEY',
+        'openweathermap_api_key')
+    if not weather_api_key:
+        weather_api_key = _resolve_credential(
+            None, 'OPENWEATHER_API_KEY', 'openweathermap_api_key')
     if weather_api_key:
         os.environ['OPENWEATHERMAP_API_KEY'] = weather_api_key
     else:
-        print("Warning: OPENWEATHERMAP_API_KEY is not set. Weather tool will be disabled.",
-              file=sys.stderr)
-        print("Set via environment variable or --openweathermap-api-key CLI option.",
-              file=sys.stderr)
         os.environ['ONIT_DISABLE_WEATHER'] = '1'
 
     # Resolve gateway type and token
     gateway_type = config_data.get('gateway')
     if gateway_type:
-        telegram_token = os.environ.get('TELEGRAM_BOT_TOKEN')
-        viber_token = os.environ.get('VIBER_BOT_TOKEN')
+        telegram_token = _resolve_credential(
+            None, 'TELEGRAM_BOT_TOKEN', 'telegram_bot_token')
+        viber_token = _resolve_credential(
+            None, 'VIBER_BOT_TOKEN', 'viber_bot_token')
 
         if gateway_type == 'auto':
             # Auto-detect: prefer Telegram for backward compat, fall back to Viber
@@ -687,6 +752,20 @@ def main():
         config_data,
         log_level='DEBUG' if config_data.get('verbose') else 'ERROR',
     )
+
+    # Print tool availability warnings before launching any mode
+    if os.environ.get('ONIT_DISABLE_WEATHER'):
+        print("Warning: OPENWEATHERMAP_API_KEY is not set. Weather tool is unavailable.",
+              file=sys.stderr)
+        print("  Set via env var, --openweathermap-api-key, or run: onit setup\n",
+              file=sys.stderr)
+    if os.environ.get('ONIT_DISABLE_WEB_SEARCH'):
+        print("WARNING: OLLAMA_API_KEY is not set or invalid. "
+              "Internet search is DISABLED.", file=sys.stderr)
+        print("  OnIt will NOT be able to search the web in this session.",
+              file=sys.stderr)
+        print("  Set via env var, --ollama-api-key, or run: onit setup\n",
+              file=sys.stderr)
 
     onit = OnIt(config=config_data)
     if config_data.get('gateway'):

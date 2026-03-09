@@ -100,9 +100,7 @@ Search the web for additional information **if and only if** above documents are
 2. Otherwise, reason step by step, invoke tools as needed, and work toward a final answer.
 3. If critical information is missing and cannot be inferred, ask exactly one clarifying question before proceeding.
 4. If a file was generated, provide a download link to the file.
-5. Conclude with your final answer in this format:
-
-<your answer here>
+5. Conclude with your final answer.
 """
    return instruction
 

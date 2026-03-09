@@ -105,21 +105,25 @@ from src.mcp.servers.tasks.web.search.mcp_server import (
     extract_pdf_images as _extract_pdf_images,
 )
 
-@mcp.tool(
-    title="Search the Web",
-    description="""Search the web for news or general information using DuckDuckGo.
+# Conditionally register tools based on API key availability.
+# When the env var is set, the tool is not registered at all (not just disabled at runtime).
 
-Args:
-- query: Search terms (e.g., "AI regulations 2024", "how to bake bread")
-- type: "news" for recent news, "web" for general search (default: "web")
-- max_results: Number of results (default: 5, max: 10)
+if not os.environ.get('ONIT_DISABLE_WEB_SEARCH'):
+    @mcp.tool(
+        title="Search the Web",
+        description="""Search the web for news or general information using DuckDuckGo.
 
-Returns JSON: [{title, snippet, url, source, date}]"""
-)
-def search(query: Optional[str] = None, type: str = "web", max_results: int = 5) -> str:
-    if err := _validate_required(query=query):
-        return err
-    return _search(query=query, type=type, max_results=max_results)
+    Args:
+    - query: Search terms (e.g., "AI regulations 2024", "how to bake bread")
+    - type: "news" for recent news, "web" for general search (default: "web")
+    - max_results: Number of results (default: 5, max: 10)
+
+    Returns JSON: [{title, snippet, url, source, date}]"""
+    )
+    def search(query: Optional[str] = None, type: str = "web", max_results: int = 5) -> str:
+        if err := _validate_required(query=query):
+            return err
+        return _search(query=query, type=type, max_results=max_results)
 
 
 @mcp.tool(
@@ -153,20 +157,21 @@ def fetch_content(
     )
 
 
-@mcp.tool(
-    title="Get Weather",
-    description="""Get current weather and optional 5-day forecast. Auto-detects location if not specified.
+if not os.environ.get('ONIT_DISABLE_WEATHER'):
+    @mcp.tool(
+        title="Get Weather",
+        description="""Get current weather and optional 5-day forecast. Auto-detects location if not specified.
 
-Args:
-- place: City or location (e.g., "Tokyo, Japan"). Auto-detects from IP if omitted
-- forecast: Include 5-day forecast (default: False)
+    Args:
+    - place: City or location (e.g., "Tokyo, Japan"). Auto-detects from IP if omitted
+    - forecast: Include 5-day forecast (default: False)
 
-Returns JSON: {location, current: {description, temperature_c, humidity_percent, wind_speed_ms, sunrise, sunset}, forecast_5day}
+    Returns JSON: {location, current: {description, temperature_c, humidity_percent, wind_speed_ms, sunrise, sunset}, forecast_5day}
 
-Requires: OPENWEATHER_API_KEY environment variable."""
-)
-def get_weather(place: str = None, forecast: bool = False) -> str:
-    return _get_weather(place=place, forecast=forecast)
+    Requires: OPENWEATHER_API_KEY environment variable."""
+    )
+    def get_weather(place: str = None, forecast: bool = False) -> str:
+        return _get_weather(place=place, forecast=forecast)
 
 
 @mcp.tool(

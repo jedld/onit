@@ -319,26 +319,14 @@ def _download_file(url: str, output_dir: str, timeout: int = 30) -> dict:
 # TOOL 1: UNIFIED SEARCH
 # =============================================================================
 
-@mcp.tool(
-    title="Search the Web",
-    description="""Search the web for news or general information using DuckDuckGo.
-
-Args:
-- query: Search terms (e.g., "AI regulations 2024", "how to bake bread")
-- type: "news" for recent news, "web" for general search (default: "web")
-- max_results: Number of results (default: 5, max: 10)
-
-Returns JSON: [{title, snippet, url, source, date}]"""
-)
-def search(
+def _search_impl(
     query: str = None,
     type: str = "web",
     max_results: int = 5
 ) -> str:
+    """Core search implementation (always defined for import by other modules)."""
     if err := _validate_required(query=query):
         return err
-    if os.environ.get('ONIT_DISABLE_WEB_SEARCH'):
-        return json.dumps({"error": "Web search is disabled. Set OLLAMA_API_KEY or use --ollama-api-key to enable."})
 
     try:
         max_results = min(max_results, 10)
@@ -369,6 +357,26 @@ def search(
 
     except Exception as e:
         return json.dumps({"error": f"Search failed: {str(e)}"})
+
+
+# Register as MCP tool only when search is not disabled
+if not os.environ.get('ONIT_DISABLE_WEB_SEARCH'):
+    @mcp.tool(
+        title="Search the Web",
+        description="""Search the web for news or general information using DuckDuckGo.
+
+    Args:
+    - query: Search terms (e.g., "AI regulations 2024", "how to bake bread")
+    - type: "news" for recent news, "web" for general search (default: "web")
+    - max_results: Number of results (default: 5, max: 10)
+
+    Returns JSON: [{title, snippet, url, source, date}]"""
+    )
+    def search(query: str = None, type: str = "web", max_results: int = 5) -> str:
+        return _search_impl(query=query, type=type, max_results=max_results)
+else:
+    # Provide a plain function alias so imports (e.g. from tools/mcp_server.py) still work
+    search = _search_impl
 
 
 # =============================================================================
@@ -524,26 +532,12 @@ def fetch_content(
 # TOOL 3: WEATHER (WITH BUILT-IN LOCATION)
 # =============================================================================
 
-@mcp.tool(
-    title="Get Weather",
-    description="""Get current weather and optional 5-day forecast. Auto-detects location if not specified.
-
-Args:
-- place: City or location (e.g., "Tokyo, Japan"). Auto-detects from IP if omitted
-- forecast: Include 5-day forecast (default: False)
-
-Returns JSON: {location, current: {description, temperature_c, humidity_percent, wind_speed_ms, sunrise, sunset}, forecast_5day}
-
-Requires: OPENWEATHER_API_KEY environment variable."""
-)
-def get_weather(
+def _get_weather_impl(
     place: str = None,
     forecast: bool = False
 ) -> str:
+    """Core weather implementation (always defined for import by other modules)."""
     global openweather_api_key
-
-    if os.environ.get('ONIT_DISABLE_WEATHER'):
-        return json.dumps({"error": "Weather tool is disabled. Set OPENWEATHERMAP_API_KEY or use --openweathermap-api-key to enable."})
 
     # Re-check env in case it was set via CLI after module load
     if not openweather_api_key:
@@ -616,6 +610,27 @@ def get_weather(
 
     except Exception as e:
         return json.dumps({"error": f"Weather fetch failed: {str(e)}"})
+
+
+# Register as MCP tool only when weather is not disabled
+if not os.environ.get('ONIT_DISABLE_WEATHER'):
+    @mcp.tool(
+        title="Get Weather",
+        description="""Get current weather and optional 5-day forecast. Auto-detects location if not specified.
+
+    Args:
+    - place: City or location (e.g., "Tokyo, Japan"). Auto-detects from IP if omitted
+    - forecast: Include 5-day forecast (default: False)
+
+    Returns JSON: {location, current: {description, temperature_c, humidity_percent, wind_speed_ms, sunrise, sunset}, forecast_5day}
+
+    Requires: OPENWEATHER_API_KEY environment variable."""
+    )
+    def get_weather(place: str = None, forecast: bool = False) -> str:
+        return _get_weather_impl(place=place, forecast=forecast)
+else:
+    # Provide a plain function alias so imports still work
+    get_weather = _get_weather_impl
 
 
 # =============================================================================

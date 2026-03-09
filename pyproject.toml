@@ -40,6 +40,7 @@ dependencies = [
     "ollama",
     "urllib3",
     "PyMuPDF",
+    "keyring",
 ]
 
 [project.optional-dependencies]
