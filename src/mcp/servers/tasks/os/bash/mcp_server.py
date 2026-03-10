@@ -263,7 +263,7 @@ def _validate_bash_command(command: str) -> str | None:
 
 Args:
 - command: Shell command to run (e.g., "ls -la", "python script.py", "grep -r 'TODO' .")
-- cwd: FULL absolute path to working directory. Always use the complete working directory path from your system prompt (e.g., "/tmp/onit/data/<session_id>") — never use relative paths.
+- cwd: FULL absolute path to working directory. Always use the complete working directory path from your system prompt (e.g., "/tmp/onit/data/<session_id>") - never use relative paths.
 - timeout: Max seconds to wait (default: 300)
 
 Returns JSON: {stdout, stderr, returncode, cwd, command, status}"""
@@ -359,7 +359,7 @@ def bash(
     description="""Read file contents. Supports text files and PDFs. Binary files (images, audio, video) return metadata only.
 
 Args:
-- path: FULL absolute file path (e.g., "/tmp/onit/data/<session_id>/report.pdf"). Always use the complete working directory path from your system prompt — never use relative paths.
+- path: FULL absolute file path (e.g., "/tmp/onit/data/<session_id>/report.pdf"). Always use the complete working directory path from your system prompt - never use relative paths.
 - encoding: Text encoding (default: utf-8)
 - max_chars: Max characters to read (default: 100000)
 
