@@ -289,6 +289,96 @@ def _strip_old_images(messages: list) -> None:
                 msg["content"] = text + "\n[image omitted — already analyzed]"
 
 
+async def _execute_tool(function_name: str, function_arguments: dict,
+                        tool_call_id: str, tool_registry, timeout, data_path,
+                        chat_ui, verbose, messages: list,
+                        tool_call_history: list,
+                        max_repeated: int,
+                        is_structured: bool = False) -> Optional[str]:
+    """Execute a single tool call and append the result to messages.
+
+    Returns a bail-out message string if repeated-call limit is hit,
+    otherwise returns None (caller should continue).
+    """
+    if chat_ui:
+        chat_ui.add_tool_call(function_name, function_arguments)
+        chat_ui.show_tool_start(function_name, function_arguments)
+        chat_ui.start_tool_spinner(function_name, function_arguments)
+    elif verbose:
+        print(f"{function_name}({function_arguments})")
+
+    for tool_name in tool_registry.tools:
+        if tool_name == function_name:
+            try:
+                tool_handler = tool_registry[tool_name]
+                try:
+                    tool_response = await asyncio.wait_for(
+                        tool_handler(**function_arguments),
+                        timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    tool_response = (f"- tool call timed out after {timeout} seconds. "
+                                     "Tool might have succeeded but no response was received. "
+                                     "Check expected output.")
+                    if chat_ui:
+                        chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
+                    elif verbose:
+                        print(f"{function_name} timed out after {timeout}s")
+                if is_structured and chat_ui:
+                    chat_ui.stop_tool_spinner()
+                tool_response = "" if tool_response is None else str(tool_response)
+                _vision_b64, _vision_mime = None, None
+                if data_path and "file_data_base64" in tool_response:
+                    tool_response, _vision_b64, _vision_mime = _extract_base64_file(tool_response, data_path)
+                tool_response = _truncate_tool_response(tool_response)
+                if _vision_b64:
+                    tool_content = [
+                        {"type": "text", "text": tool_response},
+                        {"type": "image_url", "image_url": {"url": f"data:{_vision_mime};base64,{_vision_b64}"}},
+                    ]
+                else:
+                    tool_content = tool_response
+                tool_message = {'role': 'tool', 'content': tool_content, 'name': function_name,
+                                'parameters': function_arguments, "tool_call_id": tool_call_id}
+                messages.append(tool_message)
+                if chat_ui:
+                    chat_ui.add_tool_result(function_name, tool_response)
+                    if is_structured:
+                        chat_ui.show_tool_done(function_name, tool_response)
+                elif verbose:
+                    truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
+                    print(f"{function_name}({function_arguments}) returned: {truncated}")
+            except Exception as e:
+                if chat_ui:
+                    if is_structured:
+                        chat_ui.stop_tool_spinner()
+                        chat_ui.show_tool_done(function_name, str(e), success=False)
+                    chat_ui.add_log(f"{function_name} error: {e}", level="error")
+                elif verbose:
+                    print(f"{function_name}({function_arguments}) encountered an error: {e}")
+                tool_message = {'role': 'tool', 'content': f'Error: {e}', 'name': function_name,
+                                'parameters': function_arguments, "tool_call_id": tool_call_id}
+                messages.append(tool_message)
+            break
+    else:
+        tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found',
+                        'name': function_name, 'parameters': function_arguments,
+                        "tool_call_id": tool_call_id}
+        messages.append(tool_message)
+
+    # Check for repeated tool calls
+    call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
+    tool_call_history.append(call_key)
+    if tool_call_history.count(call_key) >= max_repeated:
+        msg = f"I am sorry 😊. Could you try to rephrase or provide additional details?"
+        if chat_ui:
+            chat_ui.add_log(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", level="warning")
+        elif verbose:
+            print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
+        return msg
+    return None
+
+
 async def chat(host: str = "http://127.0.0.1:8001/v1",
          host_key: str = "EMPTY",
          instruction: str = "Tell me more about yourself.",
@@ -574,69 +664,15 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 function_name = raw_tool["name"]
                 function_arguments = raw_tool["arguments"]
                 synthetic_id = f"call_{uuid.uuid4().hex[:24]}"
-                if chat_ui:
-                    chat_ui.add_tool_call(function_name, function_arguments)
-                    chat_ui.show_tool_start(function_name, function_arguments)
-                    chat_ui.start_tool_spinner(function_name, function_arguments)
-                elif verbose:
-                    print(f"{function_name}({function_arguments})")
                 messages.append({"role": "assistant", "content": last_response})
-                for tool_name in tool_registry.tools:
-                    if tool_name == function_name:
-                        try:
-                            tool_handler = tool_registry[tool_name]
-                            try:
-                                tool_response = await asyncio.wait_for(
-                                    tool_handler(**function_arguments),
-                                    timeout=timeout,
-                                )
-                            except asyncio.TimeoutError:
-                                tool_response = f"- tool call timed out after {timeout} seconds. Tool might have succeeded but no response was received. Check expected output."
-                                if chat_ui:
-                                    chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
-                                elif verbose:
-                                    print(f"{function_name} timed out after {timeout}s")
-                            tool_response = "" if tool_response is None else str(tool_response)
-                            _vision_b64, _vision_mime = None, None
-                            if data_path and "file_data_base64" in tool_response:
-                                tool_response, _vision_b64, _vision_mime = _extract_base64_file(tool_response, data_path)
-                            tool_response = _truncate_tool_response(tool_response)
-                            if _vision_b64:
-                                tool_content = [
-                                    {"type": "text", "text": tool_response},
-                                    {"type": "image_url", "image_url": {"url": f"data:{_vision_mime};base64,{_vision_b64}"}},
-                                ]
-                            else:
-                                tool_content = tool_response
-                            tool_message = {'role': 'tool', 'content': tool_content, 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
-                            messages.append(tool_message)
-                            if chat_ui:
-                                chat_ui.add_tool_result(function_name, tool_response)
-                            elif verbose:
-                                truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
-                                print(f"{function_name}({function_arguments}) returned: {truncated}")
-                        except Exception as e:
-                            if chat_ui:
-                                chat_ui.add_log(f"{function_name}({function_arguments}) error: {e}", level="error")
-                            elif verbose:
-                                print(f"{function_name}({function_arguments}) encountered an error: {e}")
-                            tool_message = {'role': 'tool', 'content': f'Error: {e}', 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
-                            messages.append(tool_message)
-                        break
-                else:
-                    # Tool not found in registry
-                    tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found', 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
-                    messages.append(tool_message)
-                # Check for repeated tool calls
-                call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
-                tool_call_history.append(call_key)
-                if tool_call_history.count(call_key) >= MAX_REPEATED_TOOL_CALLS:
-                    msg = f"I am sorry 😊. Could you try to rephrase or provide additional details?"
-                    if chat_ui:
-                        chat_ui.add_log(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", level="warning")
-                    elif verbose:
-                        print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
-                    return msg
+                bail = await _execute_tool(
+                    function_name, function_arguments, synthetic_id,
+                    tool_registry, timeout, data_path, chat_ui, verbose,
+                    messages, tool_call_history, MAX_REPEATED_TOOL_CALLS,
+                    is_structured=False,
+                )
+                if bail:
+                    return bail
                 continue  # loop back for the model to generate the final response
 
             # Guard against returning raw tool-call JSON to the user.
@@ -674,74 +710,11 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 return None
             function_name = tool.function.name
             function_arguments = json.loads(tool.function.arguments)
-            if chat_ui:
-                chat_ui.add_tool_call(function_name, function_arguments)
-                chat_ui.show_tool_start(function_name, function_arguments)
-                chat_ui.start_tool_spinner(function_name, function_arguments)
-            elif verbose:
-                print(f"{function_name}({function_arguments})")
-            # Ensure the function is available, and then call it
-            # FIXME: Possible that 2 or more tools have the same name?
-            for tool_name in tool_registry.tools:
-                if tool_name == function_name:
-                    try:
-                        tool_handler = tool_registry[tool_name]
-                        try:
-                            tool_response = await asyncio.wait_for(
-                                tool_handler(**function_arguments),
-                                timeout=timeout,
-                            )
-                        except asyncio.TimeoutError:
-                            tool_response = f"- tool call timed out after {timeout} seconds. Tool might have succeeded but no response was received. Check expected output."
-                            if chat_ui:
-                                chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
-                            elif verbose:
-                                print(f"{function_name} timed out after {timeout}s")
-                        if chat_ui:
-                            chat_ui.stop_tool_spinner()
-                        tool_response = "" if tool_response is None else str(tool_response)
-                        # Extract base64 file data from tool response and save to disk
-                        _vision_b64, _vision_mime = None, None
-                        if data_path and "file_data_base64" in tool_response:
-                            tool_response, _vision_b64, _vision_mime = _extract_base64_file(tool_response, data_path)
-                        tool_response = _truncate_tool_response(tool_response)
-                        if _vision_b64:
-                            tool_content = [
-                                {"type": "text", "text": tool_response},
-                                {"type": "image_url", "image_url": {"url": f"data:{_vision_mime};base64,{_vision_b64}"}},
-                            ]
-                        else:
-                            tool_content = tool_response
-                        tool_message = {'role': 'tool', 'content': tool_content, 'name': tool.function.name, 'parameters': function_arguments, "tool_call_id": tool.id,}
-                        messages.append(tool_message)
-
-                        if chat_ui:
-                            chat_ui.add_tool_result(function_name, tool_response)
-                            chat_ui.show_tool_done(function_name, tool_response)
-                        elif verbose:
-                            truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
-                            print(f"{function_name} returned: {truncated}")
-                    except Exception as e:
-                        if chat_ui:
-                            chat_ui.stop_tool_spinner()
-                            chat_ui.show_tool_done(function_name, str(e), success=False)
-                            chat_ui.add_log(f"{tool_name} error: {e}", level="error")
-                        elif verbose:
-                            print(f"{tool_name} encountered an error: {e}")
-                        tool_message = {'role': 'tool', 'content': f'Error: {e}', 'name': tool.function.name, 'parameters': function_arguments, "tool_call_id": tool.id}
-                        messages.append(tool_message)
-                    break
-            else:
-                # Tool not found in registry
-                tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found', 'name': function_name, 'parameters': function_arguments, "tool_call_id": tool.id}
-                messages.append(tool_message)
-            # Check for repeated tool calls
-            call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
-            tool_call_history.append(call_key)
-            if tool_call_history.count(call_key) >= MAX_REPEATED_TOOL_CALLS:
-                msg = f"I am sorry 😊. Could you try to rephrase or provide additional details?"
-                if chat_ui:
-                    chat_ui.add_log(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", level="warning")
-                elif verbose:
-                    print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
-                return msg
+            bail = await _execute_tool(
+                function_name, function_arguments, tool.id,
+                tool_registry, timeout, data_path, chat_ui, verbose,
+                messages, tool_call_history, MAX_REPEATED_TOOL_CALLS,
+                is_structured=True,
+            )
+            if bail:
+                return bail

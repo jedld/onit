@@ -187,9 +187,7 @@ class ToolRegistry:
         """Get a random URL for the tool"""
         if tool_name not in self.urls:
             return None
-        urls = self.urls[tool_name]
-        index = random.randint(0, len(urls) - 1)
-        return urls[index]    
+        return random.choice(self.urls[tool_name])
         
     def get_tool_items(self):
         """Get the tool items from the tool registry"""
@@ -201,7 +199,7 @@ class ToolRegistry:
     def get_handler_by(self, tool_name: str, url: str) -> ToolHandler:
         """Get a tool handler by tool name and URL"""
         if tool_name is None or url is None:
-            None
+            return None
         
         key = f"{tool_name}@{url}"
         if key in self.handlers:
@@ -212,10 +210,8 @@ class ToolRegistry:
     def __getitem__(self, tool_name: str):
         if tool_name not in self.tools:
             return None
-        urls = self.urls[tool_name]
-        index = random.randint(0, len(urls) - 1)
-        key = f"{tool_name}@{urls[index]}"
-        return self.handlers[key]
+        url = random.choice(self.urls[tool_name])
+        return self.handlers[f"{tool_name}@{url}"]
 
     def __len__(self):
         return len(self.tools)

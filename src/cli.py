@@ -451,20 +451,6 @@ def _merge_base(override: dict, base: dict):
             base[key] = value
 
 
-def _resolve_credential(cli_value: str | None,
-                        env_var: str | None,
-                        keyring_key: str) -> str | None:
-    """Resolve a credential: CLI arg > env var > keyring > None."""
-    if cli_value:
-        return cli_value
-    if env_var:
-        val = os.environ.get(env_var)
-        if val:
-            return val
-    from .setup import get_secret
-    return get_secret(keyring_key)
-
-
 def main():
     parser = argparse.ArgumentParser(
         prog="onit",
@@ -597,7 +583,7 @@ def main():
 
     # Merge ~/.onit/config.yaml (from 'onit setup') as a base layer.
     # Setup values fill in gaps but never override the project/user config.
-    from .setup import CONFIG_PATH as _setup_config_path
+    from .setup import CONFIG_PATH as _setup_config_path, resolve_credential
     _resolved_config = os.path.realpath(config_path) if os.path.isfile(config_path) else None
     _setup_resolved = os.path.realpath(_setup_config_path)
     if (_resolved_config != _setup_resolved
@@ -664,7 +650,7 @@ def main():
 
     # Resolve host_key from keyring if not set via config/env
     if not host_key or host_key == 'EMPTY':
-        kr_key = _resolve_credential(None, 'OPENROUTER_API_KEY', 'host_key')
+        kr_key = resolve_credential(None, 'OPENROUTER_API_KEY', 'host_key')
         if kr_key:
             host_key = kr_key
             config_data.setdefault('serving', {})['host_key'] = host_key
@@ -685,7 +671,7 @@ def main():
         sys.exit(1)
 
     # Check OLLAMA_API_KEY for web search support
-    ollama_api_key = _resolve_credential(
+    ollama_api_key = resolve_credential(
         args.ollama_api_key, 'OLLAMA_API_KEY', 'ollama_api_key')
     if ollama_api_key:
         os.environ['OLLAMA_API_KEY'] = ollama_api_key
@@ -693,11 +679,11 @@ def main():
         os.environ['ONIT_DISABLE_WEB_SEARCH'] = '1'
 
     # Check OPENWEATHERMAP_API_KEY for weather tool support
-    weather_api_key = _resolve_credential(
+    weather_api_key = resolve_credential(
         args.openweathermap_api_key, 'OPENWEATHERMAP_API_KEY',
         'openweathermap_api_key')
     if not weather_api_key:
-        weather_api_key = _resolve_credential(
+        weather_api_key = resolve_credential(
             None, 'OPENWEATHER_API_KEY', 'openweathermap_api_key')
     if weather_api_key:
         os.environ['OPENWEATHERMAP_API_KEY'] = weather_api_key
@@ -707,9 +693,9 @@ def main():
     # Resolve gateway type and token
     gateway_type = config_data.get('gateway')
     if gateway_type:
-        telegram_token = _resolve_credential(
+        telegram_token = resolve_credential(
             None, 'TELEGRAM_BOT_TOKEN', 'telegram_bot_token')
-        viber_token = _resolve_credential(
+        viber_token = resolve_credential(
             None, 'VIBER_BOT_TOKEN', 'viber_bot_token')
 
         if gateway_type == 'auto':

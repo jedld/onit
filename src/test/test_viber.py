@@ -12,7 +12,12 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from src.ui.viber import ViberGateway, _split_message
+from src.ui.viber import ViberGateway, MAX_MESSAGE_LENGTH
+from src.ui import split_message
+
+
+def _split_message(text, limit=MAX_MESSAGE_LENGTH):
+    return split_message(text, limit)
 
 
 # ── _split_message ─────────────────────────────────────────────────────────

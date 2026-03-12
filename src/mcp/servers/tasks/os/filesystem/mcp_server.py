@@ -44,7 +44,6 @@ from fastmcp import FastMCP
 
 import logging
 
-from requests import options
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 

@@ -8,6 +8,8 @@ endpoint. This gateway uses FastAPI + uvicorn to serve the webhook.
 """
 
 import asyncio
+
+from . import split_message
 import hashlib
 import hmac
 import json
@@ -28,21 +30,6 @@ VIBER_API_URL = "https://chatapi.viber.com/pa"
 MAX_MESSAGE_LENGTH = 7000
 
 
-def _split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
-    """Split a long message into chunks that fit within Viber's limit."""
-    if len(text) <= limit:
-        return [text]
-    chunks = []
-    while text:
-        if len(text) <= limit:
-            chunks.append(text)
-            break
-        split_at = text.rfind('\n', 0, limit)
-        if split_at == -1:
-            split_at = limit
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip('\n')
-    return chunks
 
 
 class ViberGateway:
@@ -148,7 +135,7 @@ class ViberGateway:
 
     async def _send_text(self, to: str, text: str) -> None:
         """Send a text message to a Viber user with retry logic."""
-        for chunk in _split_message(text):
+        for chunk in split_message(text, MAX_MESSAGE_LENGTH):
             await self._send_message_with_retry(to, {
                 "type": "text",
                 "text": chunk,
