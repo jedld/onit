@@ -446,6 +446,15 @@ class OnIt(BaseModel):
                 self.chat_ui = ChatUI(self.theme, show_logs=self.show_logs, banner_title=banner)
         
     def initialize(self):
+        self._setup_mcp_servers()
+        self._setup_tool_registry()
+        self._setup_model_serving()
+        self._setup_session()
+        self._setup_file_server_url()
+        self._setup_config_fields()
+
+    def _setup_mcp_servers(self) -> None:
+        """Parse MCP server list from config and resolve the prompts server URL."""
         self.mcp_servers = self.config_data['mcp']['servers'] if 'mcp' in self.config_data and 'servers' in self.config_data['mcp'] else []
         # Override MCP server URL hosts if mcp_host is configured
         mcp_host = self.config_data.get('mcp', {}).get('mcp_host')
@@ -466,12 +475,18 @@ class OnIt(BaseModel):
                 "PromptsMCPServer not found or disabled in MCP server config. "
                 "Ensure it is listed under mcp.servers with a valid URL."
             )
+
+    def _setup_tool_registry(self) -> None:
+        """Discover tools from MCP servers (excluding the prompts server)."""
         tool_servers = [s for s in self.mcp_servers if s.get('name') != 'PromptsMCPServer']
         self.tool_registry = asyncio.run(discover_tools(tool_servers))
         # List discovered tools
         for tool_name in self.tool_registry:
             print(f"  - {tool_name}")
         print(f"  Total: {len(self.tool_registry)} tools discovered")
+
+    def _setup_model_serving(self) -> None:
+        """Configure model serving host and related settings."""
         self.theme = self.config_data.get('theme', 'white')
         self.messages = self.config_data.get('messages', {})
         self.stop_commands = list(self.config_data.get('stop_command', self.stop_commands))
@@ -498,6 +513,9 @@ class OnIt(BaseModel):
             logging.getLogger("type.tools").setLevel(logging.WARNING)
             logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
             logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+    def _setup_session(self) -> None:
+        """Create session ID, session file, and data directory."""
         # append session id to sessions path
         self.session_id = str(uuid.uuid4())
         self.session_path = os.path.join(self.config_data.get('session_path', '~/.onit/sessions'), f"{self.session_id}.jsonl")
@@ -510,7 +528,9 @@ class OnIt(BaseModel):
                 f.write("")
         self.data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / self.session_id)
         os.makedirs(self.data_path, exist_ok=True)
-        # Compute file_server_url for file transfer via callback_url
+
+    def _setup_file_server_url(self) -> None:
+        """Compute file_server_url for file transfer via callback_url."""
         self.file_server_url = None
         mcp_host = self.config_data.get('mcp', {}).get('mcp_host')
         if mcp_host and self.config_data.get('web', False):
@@ -539,6 +559,9 @@ class OnIt(BaseModel):
             else:
                 local_ip = "127.0.0.1"
             self.file_server_url = f"http://{local_ip}:{a2a_port}"
+
+    def _setup_config_fields(self) -> None:
+        """Assign remaining configuration fields from config_data."""
         self.template_path = self.config_data.get('template_path', None)
         self.documents_path = self.config_data.get('documents_path', None)
         self.topic = self.config_data.get('topic', None)
@@ -958,19 +981,123 @@ class OnIt(BaseModel):
 
         gw.run_sync()
 
+    async def _get_user_task(self, loop: asyncio.AbstractEventLoop) -> str:
+        """Get user input from the appropriate UI (web or text)."""
+        if self.web:
+            return await self.chat_ui.get_user_input_async()
+        return await loop.run_in_executor(None, self.chat_ui.get_user_input)
+
+    async def _build_instruction(self, prompt_client: Client, task: str) -> str:
+        """Build the agent instruction via the MCP prompts server."""
+        async with prompt_client:
+            instruction = await prompt_client.get_prompt("assistant", {"task": task,
+                                                                        "data_path": self.data_path,
+                                                                        "template_path": self.template_path,
+                                                                        "file_server_url": self.file_server_url,
+                                                                        "documents_path": self.documents_path,
+                                                                        "topic": self.topic})
+            instruction = instruction.messages[0]
+            instruction = instruction.content.text
+        return instruction
+
+    def _setup_enter_key_listener(self, loop: asyncio.AbstractEventLoop):
+        """Set up Enter-key stop listener for text UI.
+
+        Returns the callback so callers can pass it to
+        ``_restore_enter_key_listener`` without storing it on the instance.
+        Returns ``None`` in web mode (no listener needed).
+        """
+        if self.web:
+            return None
+        import sys
+        safety_warning = self.messages.get('safety_warning', "Press 'Enter' key to stop all tasks.")
+        self.chat_ui.console.print(safety_warning, style="dim")
+        self.chat_ui.start_thinking()
+        def _on_enter():
+            sys.stdin.readline()
+            self.safety_queue.put_nowait(STOP_TAG)
+        try:
+            loop.add_reader(sys.stdin.fileno(), _on_enter)
+        except NotImplementedError:
+            pass  # Windows ProactorEventLoop does not support add_reader
+        return _on_enter
+
+    def _cleanup_enter_key_listener(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Clean up Enter-key listener for text UI."""
+        if self.web:
+            return
+        import sys
+        try:
+            loop.remove_reader(sys.stdin.fileno())
+        except Exception:
+            pass
+
+    def _restore_enter_key_listener(self, loop: asyncio.AbstractEventLoop,
+                                    callback) -> None:
+        """Re-attach Enter-key listener after removing it (e.g. for retry prompt)."""
+        if self.web or callback is None:
+            return
+        import sys
+        try:
+            loop.add_reader(sys.stdin.fileno(), callback)
+        except NotImplementedError:
+            pass  # Windows ProactorEventLoop does not support add_reader
+
+    def _handle_successful_response(self, response: str, task: str,
+                                    elapsed_time: str,
+                                    loop: asyncio.AbstractEventLoop) -> None:
+        """Process a successful agent response: display it and save to session."""
+        response = remove_tags(response).strip()
+        # Skip empty responses — model returned nothing useful.
+        if not response:
+            self.chat_ui.add_message(
+                "assistant",
+                "I wasn't able to generate a response. Please try again or rephrase your question.",
+                elapsed=elapsed_time,
+            )
+            return
+        # If streaming already persisted the message via stream_end(),
+        # just update the elapsed time instead of adding a duplicate.
+        _last = self.chat_ui.messages[-1] if self.chat_ui.messages else None
+        if _last and hasattr(_last, 'role') and _last.role == "assistant" and _last.content == response:
+            from src.ui.text import Message
+            self.chat_ui.messages[-1] = Message(
+                role=_last.role, content=_last.content,
+                timestamp=_last.timestamp, elapsed=elapsed_time,
+                name=getattr(_last, 'name', ''),
+            )
+        else:
+            self.chat_ui.add_message("assistant", response, elapsed=elapsed_time)
+        try:
+            with open(self.session_path, "a", encoding="utf-8") as f:
+                session_data = {
+                    "task": task,
+                    "response": response,
+                    "timestamp": loop.time()
+                }
+                f.write(json.dumps(session_data) + "\n")
+        except Exception:
+            pass
+
+    def _format_elapsed_time(self, elapsed_secs: float) -> str:
+        """Format elapsed time string, including tokens/sec if available."""
+        _tok_s = ""
+        if hasattr(self.chat_ui, '_stream_token_count') and hasattr(self.chat_ui, '_stream_start_time'):
+            _st = self.chat_ui._stream_start_time
+            _tc = self.chat_ui._stream_token_count
+            if _st > 0 and _tc > 0:
+                _tok_s = f" ({_tc / (time.monotonic() - _st):.1f} tok/s)"
+        return f"{elapsed_secs:.2f} secs{_tok_s}"
+
     async def client_to_agent(self) -> None:
         """Handle client to agent communication"""
 
         prompt_client = Client(self.prompt_url)
         agent_task = None
         loop = asyncio.get_event_loop()
-        safety_warning = self.messages.get('safety_warning', "Press 'Enter' key to stop all tasks.")
 
         while True:
-            if self.web:
-                task = await self.chat_ui.get_user_input_async()
-            else:
-                task = await loop.run_in_executor(None, self.chat_ui.get_user_input)
+            task = await self._get_user_task(loop)
 
             if task.lower().strip() in self.stop_commands:
                 if not self.web:
@@ -990,29 +1117,9 @@ class OnIt(BaseModel):
             while not self.safety_queue.empty():
                 self.safety_queue.get_nowait()
 
-            # prompt engineering
-            async with prompt_client:
-                instruction = await prompt_client.get_prompt("assistant", {"task": task,
-                                                                            "data_path": self.data_path,
-                                                                            "template_path": self.template_path,
-                                                                            "file_server_url": self.file_server_url,
-                                                                            "documents_path": self.documents_path,
-                                                                            "topic": self.topic})
-                instruction = instruction.messages[0]
-                instruction = instruction.content.text
-                
-            # Set up Enter-key stop listener for text UI
-            if not self.web:
-                import sys
-                self.chat_ui.console.print(safety_warning, style="dim")
-                self.chat_ui.start_thinking()
-                def _on_enter():
-                    sys.stdin.readline()
-                    self.safety_queue.put_nowait(STOP_TAG)
-                try:
-                    loop.add_reader(sys.stdin.fileno(), _on_enter)
-                except NotImplementedError:
-                    pass  # Windows ProactorEventLoop does not support add_reader
+            instruction = await self._build_instruction(prompt_client, task)
+
+            on_enter_cb = self._setup_enter_key_listener(loop)
 
             # submit instruction with retry on API error
             start_time = loop.time()
@@ -1045,76 +1152,20 @@ class OnIt(BaseModel):
 
                 if response is None:
                     # API error — ask user whether to retry
-                    if not self.web:
-                        try:
-                            loop.remove_reader(sys.stdin.fileno())
-                        except (NotImplementedError, Exception):
-                            pass
+                    self._cleanup_enter_key_listener(loop)
                     self.chat_ui.add_message("system", "Unable to get a response from the model. Would you like to retry? (yes/no)")
-                    if self.web:
-                        retry_input = await self.chat_ui.get_user_input_async()
-                    else:
-                        retry_input = await loop.run_in_executor(
-                            None, self.chat_ui.get_user_input)
+                    retry_input = await self._get_user_task(loop)
                     if retry_input.lower().strip() in ('yes', 'y'):
-                        if not self.web:
-                            try:
-                                loop.add_reader(sys.stdin.fileno(), _on_enter)
-                            except NotImplementedError:
-                                pass  # Windows ProactorEventLoop does not support add_reader
+                        self._restore_enter_key_listener(loop, on_enter_cb)
                         continue
                     break
 
                 # success
-                elapsed_time = loop.time() - start_time
-                # Compute tokens/sec from the text UI's stream counters
-                _tok_s = ""
-                if hasattr(self.chat_ui, '_stream_token_count') and hasattr(self.chat_ui, '_stream_start_time'):
-                    _st = self.chat_ui._stream_start_time
-                    _tc = self.chat_ui._stream_token_count
-                    if _st > 0 and _tc > 0:
-                        _tok_s = f" ({_tc / (time.monotonic() - _st):.1f} tok/s)"
-                elapsed_time = f"{elapsed_time:.2f} secs{_tok_s}"
-                response = remove_tags(response).strip()
-                # Skip empty responses — model returned nothing useful.
-                if not response:
-                    self.chat_ui.add_message(
-                        "assistant",
-                        "I wasn't able to generate a response. Please try again or rephrase your question.",
-                        elapsed=elapsed_time,
-                    )
-                    break
-                # If streaming already persisted the message via stream_end(),
-                # just update the elapsed time instead of adding a duplicate.
-                _last = self.chat_ui.messages[-1] if self.chat_ui.messages else None
-                if _last and hasattr(_last, 'role') and _last.role == "assistant" and _last.content == response:
-                    from src.ui.text import Message
-                    self.chat_ui.messages[-1] = Message(
-                        role=_last.role, content=_last.content,
-                        timestamp=_last.timestamp, elapsed=elapsed_time,
-                        name=getattr(_last, 'name', ''),
-                    )
-                else:
-                    self.chat_ui.add_message("assistant", response, elapsed=elapsed_time)
-                try:
-                    with open(self.session_path, "a", encoding="utf-8") as f:
-                        session_data = {
-                            "task": task,
-                            "response": response,
-                            "timestamp": loop.time()
-                        }
-                        f.write(json.dumps(session_data) + "\n")
-                except Exception:
-                    pass
+                elapsed_time = self._format_elapsed_time(loop.time() - start_time)
+                self._handle_successful_response(response, task, elapsed_time, loop)
                 break
 
-            # Clean up Enter-key listener for text UI
-            if not self.web:
-                import sys
-                try:
-                    loop.remove_reader(sys.stdin.fileno())
-                except Exception:
-                    pass
+            self._cleanup_enter_key_listener(loop)
             
     async def agent_session(self) -> None:
         """Start the agent session"""
