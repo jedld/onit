@@ -4,23 +4,82 @@ Tool related utility functions for On-it agent.
 
 '''
 
-from fastmcp import Client
-from rich.status import Status
-from typing import Tuple
-
+import asyncio
+import logging
 import os
 import sys
+from typing import Any, Optional
+
+from fastmcp import Client
+from rich.status import Status
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from type.tools import *
+from type.tools import ToolHandler, ToolRegistry
 
 # Configure logging
-import logging
 logging.basicConfig(
     level=logging.WARNING,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _build_parameters(tool_item: Any) -> dict:
+    """Extract parameter schema from a tool or resource item.
+
+    Args:
+        tool_item: An MCP tool or resource object.
+
+    Returns:
+        A JSON-schema-style dict describing the tool's parameters.
+    """
+    if hasattr(tool_item, 'inputSchema'):
+        return {
+            'type': 'object',
+            'properties': tool_item.inputSchema['properties'],
+        }
+
+    if hasattr(tool_item, 'arguments') and tool_item.arguments:
+        properties: dict[str, dict[str, str]] = {}
+        for arg in tool_item.arguments:
+            prop: dict[str, str] = {'type': 'string'}
+            if arg.description:
+                prop['description'] = arg.description
+            properties[arg.name] = prop
+        return {
+            'type': 'object',
+            'properties': properties,
+        }
+
+    # Fallback: serialize all attributes
+    parameters: dict[str, Any] = {}
+    for attr, value in tool_item.__dict__.items():
+        if hasattr(value, 'model_dump'):
+            parameters[attr] = value.model_dump()
+        elif isinstance(value, list):
+            parameters[attr] = [
+                v.model_dump() if hasattr(v, 'model_dump') else v
+                for v in value
+            ]
+        else:
+            parameters[attr] = value
+    return parameters
+
+
+def _build_returns(tool_item: Any) -> dict:
+    """Extract the output/return schema from a tool item.
+
+    Args:
+        tool_item: An MCP tool or resource object.
+
+    Returns:
+        A dict describing the tool's return schema properties.
+    """
+    output_schema = getattr(tool_item, 'outputSchema', {})
+    if output_schema and 'properties' in output_schema:
+        return output_schema['properties']
+    return {}
 
 
 async def _discover_server_tools(server: dict) -> list[ToolHandler]:
@@ -32,87 +91,57 @@ async def _discover_server_tools(server: dict) -> list[ToolHandler]:
     Returns:
         List of ToolHandler instances discovered from this server.
     """
+    name = server.get('name', 'Unknown')
     enabled = server.get('enabled', True)
     if not enabled:
-        logger.info(f"[discover_tools] Skipping disabled MCP server: {server.get('name', 'Unknown')}")
+        logger.info("[discover_tools] Skipping disabled MCP server: %s", name)
         return []
-    url = server.get('url', None)
+
+    url: Optional[str] = server.get('url', None)
     if not url:
-        logger.error(f"[discover_tools] MCP server URL is not provided.")
+        logger.error("[discover_tools] MCP server URL is not provided.")
         return []
-    logger.info(f"[discover_tools] Discovering tools from MCP server: {url}")
-    handlers = []
+
+    logger.info("[discover_tools] Discovering tools from MCP server: %s", url)
+    handlers: list[ToolHandler] = []
+
     async with Client(url) as client:
         tools_list = await client.list_tools()
         resources_list = await client.list_resources()
         tools_list.extend(resources_list)
 
         for tool_item in tools_list:
-            if hasattr(tool_item, 'inputSchema'):
-                parameters = {
-                    'type': 'object',
-                    'properties': tool_item.inputSchema['properties'],
-                }
-            else:
-                parameters = {}
-                if hasattr(tool_item, 'arguments') and tool_item.arguments:
-                    properties = {}
-                    for arg in tool_item.arguments:
-                        prop = {'type': 'string'}
-                        if arg.description:
-                            prop['description'] = arg.description
-                        properties[arg.name] = prop
-                    parameters = {
-                        'type': 'object',
-                        'properties': properties,
-                    }
-                else:
-                    for attr, value in tool_item.__dict__.items():
-                        if hasattr(value, 'model_dump'):
-                            parameters[attr] = value.model_dump()
-                        elif isinstance(value, list):
-                            parameters[attr] = [
-                                v.model_dump() if hasattr(v, 'model_dump') else v
-                                for v in value
-                            ]
-                        else:
-                            parameters[attr] = value
-            returns = None
-            if hasattr(tool_item, 'outputSchema'):
-                returns = tool_item.outputSchema
-            else:
-                returns = {}
-            if returns is not None:
-                returns = returns['properties'] if 'properties' in returns else {}
+            parameters = _build_parameters(tool_item)
+            returns = _build_returns(tool_item)
 
-            tool_entry = {
+            tool_entry: dict[str, Any] = {
                 'type': 'function',
                 'function': {
                     'name': tool_item.name,
                     'description': tool_item.description,
                     'parameters': parameters,
                     'returns': returns,
-                    }
+                }
             }
             handler = ToolHandler(url=url, tool_item=tool_entry)
             handlers.append(handler)
-            logger.info(f"[discover_tools] {tool_entry}")
+            logger.info("[discover_tools] %s", tool_entry)
 
-        logger.info(f"[discover_tools] {tools_list}")
+        logger.info("[discover_tools] %s", tools_list)
+
     return handlers
 
 
-async def discover_tools(mcp_servers: list) -> Tuple[ToolRegistry]:
+async def discover_tools(mcp_servers: list[dict]) -> ToolRegistry:
     """
     Automatically discover tools from all MCP servers in parallel.
 
     Args:
-        mcp_servers (list): a list of MCP server configurations.
+        mcp_servers: a list of MCP server configurations.
 
     Returns:
-        Tuple[ToolRegistry]: a registry of all discovered tools.
+        A registry of all discovered tools.
     """
-    import asyncio
     tool_registry = ToolRegistry()
 
     # Discover tools from all servers concurrently
@@ -124,37 +153,72 @@ async def discover_tools(mcp_servers: list) -> Tuple[ToolRegistry]:
     for i, result in enumerate(results):
         if isinstance(result, Exception):
             name = mcp_servers[i].get('name', 'Unknown')
-            logger.error(f"[discover_tools] Failed to discover tools from {name}: {result}")
+            logger.error("[discover_tools] Failed to discover tools from %s: %s", name, result)
             continue
         for handler in result:
             tool_registry.register(handler)
 
-    logger.info(f"[discover_tools] Registered {len(tool_registry.tools)} tools")
+    logger.info("[discover_tools] Registered %d tools", len(tool_registry.tools))
     return tool_registry
-    
 
-async def listen(tool_registry: ToolRegistry, 
-                 status: Status = None, 
-                 prompt_color: str = "bold dark_blue",
-                 is_safety_task : bool = False) -> str:
+
+async def listen(
+    tool_registry: ToolRegistry,
+    status: Optional[Status] = None,
+    prompt_color: str = "bold dark_blue",
+    is_safety_task: bool = False,
+) -> Optional[str]:
+    """Record audio from the microphone and transcribe it via ASR.
+
+    The microphone MCP tool returns a temporary wav file path, which is then
+    passed to the ASR tool for transcription.  The intermediate file is a
+    limitation of the current MCP audio pipeline — both tools communicate
+    via file paths rather than in-memory byte streams.  We clean up the temp
+    file after ASR to avoid leaking disk space.
+
+    Args:
+        tool_registry: Registry containing microphone, ASR, TTS, and speaker tools.
+        status: Optional Rich Status widget for progress feedback.
+        prompt_color: Rich markup colour string for the status message.
+        is_safety_task: When True, return an empty string immediately after recording.
+
+    Returns:
+        The transcribed text, an empty string for safety tasks, or None on failure.
+    """
     microphone = tool_registry['microphone'] if 'microphone' in tool_registry.tools else None
     tts = tool_registry['speech_synthesis'] if 'speech_synthesis' in tool_registry.tools else None
     speaker = tool_registry['speaker'] if 'speaker' in tool_registry.tools else None
     asr = tool_registry['speech_recognition'] if 'speech_recognition' in tool_registry.tools else None
+
     if not microphone or not asr or not tts or not speaker:
-        logger.error(f"[{listen.__name__}] Microphone, ASR, TTS or Speaker tool is not available.")
+        logger.error("[%s] Microphone, ASR, TTS or Speaker tool is not available.", listen.__name__)
         return None
-    # FIXME: Avoid using intermediate wav file
-    wav_file = await microphone()
+
+    # Record audio — the microphone tool writes a temporary wav file and
+    # returns its path.  This intermediate file is unavoidable given the
+    # current MCP tool interface which communicates via file paths.
+    wav_file: Optional[str] = await microphone()
+
     if is_safety_task:
         return ""
+
     if wav_file is None:
         wav_file = await tts(text="Sorry! I did not hear you. Please say it again.")
         await speaker(audios=[wav_file])
         return None
+
     if status is not None:
         status.update(f"[{prompt_color}] 🤔 Hold on...[/]")
-    logger.info(f"[{__name__}] wav file: {wav_file}")
-    
-    message = await asr(audios=[wav_file])
+
+    logger.info("[%s] wav file: %s", __name__, wav_file)
+
+    message: Optional[str] = await asr(audios=[wav_file])
+
+    # Clean up the intermediate wav file to avoid leaking temp disk space
+    if wav_file:
+        try:
+            os.unlink(wav_file)
+        except OSError:
+            logger.debug("Could not remove temporary wav file: %s", wav_file, exc_info=True)
+
     return message
