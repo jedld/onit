@@ -553,9 +553,9 @@ class WebChatUI:
             lines.append(f"{icon} [{log['timestamp']}] {log['message']}")
         return "\n".join(lines)
 
-    def build_app(self) -> gr.Blocks:
-        """Construct the Gradio Blocks interface."""
-        custom_css = """
+    def _get_custom_css(self) -> str:
+        """Return the custom CSS for the Gradio interface."""
+        return """
         .gradio-container {
             font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             font-size: 0.875rem;
@@ -580,13 +580,16 @@ class WebChatUI:
         .message-buttons-bot button:not([title="Copy"]):not([aria-label="Copy"]) { display: none !important; }
         .bot .actions button:not([title="Copy"]):not([aria-label="Copy"]) { display: none !important; }
         """
-        self._custom_css = custom_css
-        # JavaScript to prevent auto-scroll when user has scrolled up.
-        # Gradio re-renders the chatbot on every update, which can reset
-        # scroll position. This script observes DOM mutations on the chat
-        # scroll container and restores the previous scroll position when
-        # the user has scrolled away from the bottom.
-        scroll_js = """
+
+    def _get_scroll_js(self) -> str:
+        """Return JavaScript that prevents auto-scroll when user has scrolled up.
+
+        Gradio re-renders the chatbot on every update, which can reset
+        scroll position. This script observes DOM mutations on the chat
+        scroll container and restores the previous scroll position when
+        the user has scrolled away from the bottom.
+        """
+        return """
         () => {
             function attach() {
                 // The scrollable chat container has class bubble-wrap or
@@ -640,415 +643,499 @@ class WebChatUI:
             setTimeout(attach, 500);
         }
         """
-        with gr.Blocks(title=self.title, analytics_enabled=False, js=scroll_js) as app:
-            # Session state
-            session_state = gr.State(value=None)
-            authenticated_email = gr.State(value=None)
 
-            # Authentication UI (only shown if auth is enabled)
-            if self.auth_enabled:
-                with gr.Column(visible=True, elem_classes=["login-container"]) as login_view:
-                    gr.Markdown(f"# 🔐 {self.title}")
-                    gr.Markdown("### Sign in to continue")
-                    gr.Markdown(
-                        """
-                        <div style="margin: 40px 0;">
-                        <a href="/auth/login" style="display: inline-flex; align-items: center; gap: 16px; padding: 18px 36px; background: #4285f4; color: white; text-decoration: none; border-radius: 4px; font-weight: 500; font-size: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.2);">
-                        <svg style="width: 24px; height: 24px; flex-shrink: 0; overflow: visible;" viewBox="0 0 24 24"><path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="currentColor" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="currentColor" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="currentColor" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
-                        <span>Sign in with Google</span>
-                        </a>
-                        </div>
+    def _build_login_view(self) -> tuple[gr.Column, gr.Markdown]:
+        """Build the authentication/login UI. Only called when auth is enabled.
 
-                        <p style="color: #666; font-size: 14px; margin-top: 20px;">
-                        Click the button above to authenticate with your Google account.<br/>
-                        Your session will remain active for 24 hours.
-                        </p>
-                        """
-                    )
-                    login_status = gr.Markdown("")
+        Returns:
+            A tuple of (login_view column, login_status markdown).
+        """
+        with gr.Column(visible=True, elem_classes=["login-container"]) as login_view:
+            gr.Markdown(f"# 🔐 {self.title}")
+            gr.Markdown("### Sign in to continue")
+            gr.Markdown(
+                """
+                <div style="margin: 40px 0;">
+                <a href="/auth/login" style="display: inline-flex; align-items: center; gap: 16px; padding: 18px 36px; background: #4285f4; color: white; text-decoration: none; border-radius: 4px; font-weight: 500; font-size: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.2);">
+                <svg style="width: 24px; height: 24px; flex-shrink: 0; overflow: visible;" viewBox="0 0 24 24"><path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="currentColor" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="currentColor" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="currentColor" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+                <span>Sign in with Google</span>
+                </a>
+                </div>
 
-            # Chat UI
-            with gr.Column(visible=not self.auth_enabled) as chat_view:
-                with gr.Row():
-                    with gr.Column(scale=8):
-                        gr.Markdown(f"## {self.title}")
-                    if self.auth_enabled:
-                        with gr.Column(scale=2):
-                            user_info = gr.Markdown("")
+                <p style="color: #666; font-size: 14px; margin-top: 20px;">
+                Click the button above to authenticate with your Google account.<br/>
+                Your session will remain active for 24 hours.
+                </p>
+                """
+            )
+            login_status = gr.Markdown("")
+        return login_view, login_status
 
-                chatbot = gr.Chatbot(
-                    label="Chat",
-                    height="calc(100vh - 220px)",
-                    buttons=["copy", "clear"],
-                    autoscroll=True,
-                )
+    def _build_chat_view(self) -> dict:
+        """Build the main chat UI components.
 
-                with gr.Row(elem_classes=["input-row"]):
-                    msg_input = gr.Textbox(
-                        placeholder="Type a message...",
-                        show_label=False,
-                        scale=8,
-                        container=False,
-                    )
-                    upload_btn = gr.UploadButton(
-                        label="Upload",
-                        file_types=None,
-                        file_count="single",
-                        scale=1,
-                        min_width=60,
-                        elem_classes=["action-btn"],
-                    )
-                    stop_btn = gr.Button(
-                        "Stop",
-                        visible=False,
-                        scale=1,
-                        min_width=60,
-                        elem_classes=["action-btn"],
-                    )
-
-                upload_indicator = gr.Markdown("", visible=False)
-
-                with gr.Accordion(
-                    "Execution Logs", open=False, visible=self.verbose
-                ) as logs_accordion:
-                    logs_display = gr.Markdown(
-                        value="*No execution logs yet.*",
-                        elem_id="execution-logs",
-                    )
-
-                gr.Markdown(
-                    "<p style='text-align: center; color: #999; font-size: 0.95em; margin-top: 4px;'>"
-                    "<a href='https://github.com/sibyl-oracles/onit' target='_blank' style='color: #999; text-decoration: none;'>OnIt</a>"
-                    " may produce inaccurate information. Verify important details independently.</p>"
-                )
-
-            # state for uploaded file path
-            uploaded_file_state = gr.State(value=None)
-
-            # -- callbacks --
-            # Note: Authentication is handled via OAuth redirect flow in FastAPI routes
-            # No Gradio callbacks needed for login/logout
-            def handle_upload(file, sess_id):
-                if file is None:
-                    return None, gr.update(value="", visible=False), sess_id
-                # Gradio 6+ returns a filepath string; older versions return a file object
-                file_path = file if isinstance(file, (str, os.PathLike)) else file.name
-                file_path = str(file_path)
-                # Use per-session data path
-                _, session = self._get_or_create_session(sess_id)
-                os.makedirs(session.data_path, exist_ok=True)
-                fname = os.path.basename(file_path)
-                dest = os.path.join(session.data_path, fname)
-                shutil.copy2(file_path, dest)
-                indicator = f"<p style='color: #4caf50; font-size: 0.8em; margin: 2px 0;'>📎 {fname}</p>"
-                return dest, gr.update(value=indicator, visible=True), sess_id
-
-            def handle_send(user_msg, uploaded_path, history, sess_id, request: gr.Request = None):
-                hide_indicator = gr.update(value="", visible=False)
-                # Verify authentication if enabled
+        Returns:
+            A dict with keys: chat_view, chatbot, msg_input, upload_btn,
+            stop_btn, upload_indicator, logs_display, and optionally user_info.
+        """
+        components: dict = {}
+        with gr.Column(visible=not self.auth_enabled) as chat_view:
+            with gr.Row():
+                with gr.Column(scale=8):
+                    gr.Markdown(f"## {self.title}")
                 if self.auth_enabled:
-                    auth_cookie = request.cookies.get("onit_auth") if request else None
-                    if not auth_cookie or auth_cookie not in self._authenticated_cookies:
-                        error_msg = gr.ChatMessage(
-                            role="assistant",
-                            content="❌ Session expired or invalid. Please login again."
-                        )
-                        return history + [error_msg], user_msg, uploaded_path, hide_indicator, sess_id
+                    with gr.Column(scale=2):
+                        components["user_info"] = gr.Markdown("")
 
-                    cookie_data = self._authenticated_cookies[auth_cookie]
-                    if datetime.now() > cookie_data['expires']:
-                        del self._authenticated_cookies[auth_cookie]
-                        error_msg = gr.ChatMessage(
-                            role="assistant",
-                            content="❌ Session expired or invalid. Please login again."
-                        )
-                        return history + [error_msg], user_msg, uploaded_path, hide_indicator, sess_id
+            components["chatbot"] = gr.Chatbot(
+                label="Chat",
+                height="calc(100vh - 220px)",
+                buttons=["copy", "clear"],
+                autoscroll=True,
+            )
 
-                if not user_msg and not uploaded_path:
-                    return history, "", None, hide_indicator, sess_id
-
-                sess_id, session = self._get_or_create_session(sess_id)
-
-                display_msg = user_msg or ""
-                queue_msg = user_msg or ""
-                if uploaded_path:
-                    fname = os.path.basename(uploaded_path)
-                    file_url = f"/uploads/{sess_id}/{fname}"
-                    display_msg += f"\n📎 [{fname}]({file_url})"
-                    queue_msg += f"\nRelevant files: {uploaded_path}"
-
-                # Route user message through per-session pending_responses
-                session.pending_responses.append(
-                    gr.ChatMessage(role="user", content=display_msg)
+            with gr.Row(elem_classes=["input-row"]):
+                components["msg_input"] = gr.Textbox(
+                    placeholder="Type a message...",
+                    show_label=False,
+                    scale=8,
+                    container=False,
+                )
+                components["upload_btn"] = gr.UploadButton(
+                    label="Upload",
+                    file_types=None,
+                    file_count="single",
+                    scale=1,
+                    min_width=60,
+                    elem_classes=["action-btn"],
+                )
+                components["stop_btn"] = gr.Button(
+                    "Stop",
+                    visible=False,
+                    scale=1,
+                    min_width=60,
+                    elem_classes=["action-btn"],
                 )
 
-                # Fire-and-forget: call process_task() directly (like Telegram gateway)
-                session.processing = True
-                if self._loop and self._onit:
-                    async def _run_task(s=session, task=queue_msg):
-                        try:
-                            def _on_stream_token(_token, full_content):
-                                s.streaming_content = full_content
-                                s.streaming_active = True
+            components["upload_indicator"] = gr.Markdown("", visible=False)
 
-                            def _on_stream_complete(_content, _tok_s):
-                                s.streaming_active = False
+            with gr.Accordion(
+                "Execution Logs", open=False, visible=self.verbose
+            ):
+                components["logs_display"] = gr.Markdown(
+                    value="*No execution logs yet.*",
+                    elem_id="execution-logs",
+                )
 
-                            _stats = {}
-                            _task_start = time.monotonic()
-                            response = await self._onit.process_task(
-                                task,
-                                session_path=s.session_path,
-                                data_path=s.data_path,
-                                safety_queue=s.safety_queue,
-                                stream_callback=_on_stream_token,
-                                stream_complete_callback=_on_stream_complete,
-                                stats=_stats,
-                            )
-                            _task_elapsed = time.monotonic() - _task_start
-                            s.streaming_active = False
-                            s.streaming_content = ""
-                            tok_s = _stats.get("tokens_per_second", 0)
-                            if response:
-                                display, file_paths = self._extract_file_paths(
-                                    response, data_path=s.data_path, session_id=s.session_id
-                                )
-                                _footer_parts = []
-                                if _task_elapsed > 0:
-                                    _footer_parts.append(f"{_task_elapsed:.2f}s")
-                                if tok_s > 0:
-                                    _footer_parts.append(f"{tok_s:.1f} tok/s")
-                                if _footer_parts:
-                                    display += f"\n\n---\n*{' · '.join(_footer_parts)}*"
-                                s.pending_responses.append(
-                                    gr.ChatMessage(role="assistant", content=display)
-                                )
-                                for fpath in file_paths:
-                                    if os.path.isfile(fpath):
-                                        s.pending_responses.append(
-                                            gr.ChatMessage(
-                                                role="assistant",
-                                                content=gr.FileData(path=fpath, mime_type=None),
-                                            )
-                                        )
-                            else:
-                                s.pending_responses.append(
-                                    gr.ChatMessage(role="assistant", content="I'm sorry, I couldn't process your request. Please try again.")
-                                )
-                        except Exception as e:
-                            logger.error("Error processing task: %s", e)
-                            s.pending_responses.append(
-                                gr.ChatMessage(role="assistant", content=f"Error: {e}")
-                            )
-                        finally:
-                            s.streaming_active = False
-                            s.streaming_content = ""
-                            s.processing = False
+            gr.Markdown(
+                "<p style='text-align: center; color: #999; font-size: 0.95em; margin-top: 4px;'>"
+                "<a href='https://github.com/sibyl-oracles/onit' target='_blank' style='color: #999; text-decoration: none;'>OnIt</a>"
+                " may produce inaccurate information. Verify important details independently.</p>"
+            )
 
-                    asyncio.run_coroutine_threadsafe(_run_task(), self._loop)
+        components["chat_view"] = chat_view
+        return components
 
+    def _make_event_callbacks(self) -> dict:
+        """Create and return all Gradio event callback functions.
+
+        Returns:
+            A dict mapping callback name to the callable.
+        """
+
+        def handle_upload(file, sess_id):
+            if file is None:
+                return None, gr.update(value="", visible=False), sess_id
+            # Gradio 6+ returns a filepath string; older versions return a file object
+            file_path = file if isinstance(file, (str, os.PathLike)) else file.name
+            file_path = str(file_path)
+            # Use per-session data path
+            _, session = self._get_or_create_session(sess_id)
+            os.makedirs(session.data_path, exist_ok=True)
+            fname = os.path.basename(file_path)
+            dest = os.path.join(session.data_path, fname)
+            shutil.copy2(file_path, dest)
+            indicator = f"<p style='color: #4caf50; font-size: 0.8em; margin: 2px 0;'>📎 {fname}</p>"
+            return dest, gr.update(value=indicator, visible=True), sess_id
+
+        def handle_send(user_msg, uploaded_path, history, sess_id, request: gr.Request = None):
+            hide_indicator = gr.update(value="", visible=False)
+            # Verify authentication if enabled
+            if self.auth_enabled:
+                auth_cookie = request.cookies.get("onit_auth") if request else None
+                if not auth_cookie or auth_cookie not in self._authenticated_cookies:
+                    error_msg = gr.ChatMessage(
+                        role="assistant",
+                        content="❌ Session expired or invalid. Please login again."
+                    )
+                    return history + [error_msg], user_msg, uploaded_path, hide_indicator, sess_id
+
+                cookie_data = self._authenticated_cookies[auth_cookie]
+                if datetime.now() > cookie_data['expires']:
+                    del self._authenticated_cookies[auth_cookie]
+                    error_msg = gr.ChatMessage(
+                        role="assistant",
+                        content="❌ Session expired or invalid. Please login again."
+                    )
+                    return history + [error_msg], user_msg, uploaded_path, hide_indicator, sess_id
+
+            if not user_msg and not uploaded_path:
                 return history, "", None, hide_indicator, sess_id
 
-            def handle_stop(sess_id):
-                if sess_id and sess_id in self._web_sessions:
-                    session = self._web_sessions[sess_id]
-                    if self._loop:
-                        self._loop.call_soon_threadsafe(
-                            session.safety_queue.put_nowait, True
+            sess_id, session = self._get_or_create_session(sess_id)
+
+            display_msg = user_msg or ""
+            queue_msg = user_msg or ""
+            if uploaded_path:
+                fname = os.path.basename(uploaded_path)
+                file_url = f"/uploads/{sess_id}/{fname}"
+                display_msg += f"\n📎 [{fname}]({file_url})"
+                queue_msg += f"\nRelevant files: {uploaded_path}"
+
+            # Route user message through per-session pending_responses
+            session.pending_responses.append(
+                gr.ChatMessage(role="user", content=display_msg)
+            )
+
+            # Fire-and-forget: call process_task() directly (like Telegram gateway)
+            session.processing = True
+            if self._loop and self._onit:
+                async def _run_task(s=session, task=queue_msg):
+                    try:
+                        def _on_stream_token(_token, full_content):
+                            s.streaming_content = full_content
+                            s.streaming_active = True
+
+                        def _on_stream_complete(_content, _tok_s):
+                            s.streaming_active = False
+
+                        _stats = {}
+                        _task_start = time.monotonic()
+                        response = await self._onit.process_task(
+                            task,
+                            session_path=s.session_path,
+                            data_path=s.data_path,
+                            safety_queue=s.safety_queue,
+                            stream_callback=_on_stream_token,
+                            stream_complete_callback=_on_stream_complete,
+                            stats=_stats,
                         )
-                return gr.update(visible=False)
+                        _task_elapsed = time.monotonic() - _task_start
+                        s.streaming_active = False
+                        s.streaming_content = ""
+                        tok_s = _stats.get("tokens_per_second", 0)
+                        if response:
+                            display, file_paths = self._extract_file_paths(
+                                response, data_path=s.data_path, session_id=s.session_id
+                            )
+                            _footer_parts = []
+                            if _task_elapsed > 0:
+                                _footer_parts.append(f"{_task_elapsed:.2f}s")
+                            if tok_s > 0:
+                                _footer_parts.append(f"{tok_s:.1f} tok/s")
+                            if _footer_parts:
+                                display += f"\n\n---\n*{' · '.join(_footer_parts)}*"
+                            s.pending_responses.append(
+                                gr.ChatMessage(role="assistant", content=display)
+                            )
+                            for fpath in file_paths:
+                                if os.path.isfile(fpath):
+                                    s.pending_responses.append(
+                                        gr.ChatMessage(
+                                            role="assistant",
+                                            content=gr.FileData(path=fpath, mime_type=None),
+                                        )
+                                    )
+                        else:
+                            s.pending_responses.append(
+                                gr.ChatMessage(role="assistant", content="I'm sorry, I couldn't process your request. Please try again.")
+                            )
+                    except Exception as e:
+                        logger.error("Error processing task: %s", e)
+                        s.pending_responses.append(
+                            gr.ChatMessage(role="assistant", content=f"Error: {e}")
+                        )
+                    finally:
+                        s.streaming_active = False
+                        s.streaming_content = ""
+                        s.processing = False
 
-            def poll_response(history, sess_id):
-                if not sess_id or sess_id not in self._web_sessions:
-                    logs_md = self._format_logs() if self.execution_logs else "*No execution logs yet.*"
-                    return history, gr.update(visible=False), logs_md, sess_id
+                asyncio.run_coroutine_threadsafe(_run_task(), self._loop)
 
+            return history, "", None, hide_indicator, sess_id
+
+        def handle_stop(sess_id):
+            if sess_id and sess_id in self._web_sessions:
                 session = self._web_sessions[sess_id]
+                if self._loop:
+                    self._loop.call_soon_threadsafe(
+                        session.safety_queue.put_nowait, True
+                    )
+            return gr.update(visible=False)
 
-                has_new_responses = bool(session.pending_responses)
-                was_spinner_shown = session.spinner_shown
-                chatbot_changed = False
+        def poll_response(history, sess_id):
+            if not sess_id or sess_id not in self._web_sessions:
+                logs_md = self._format_logs() if self.execution_logs else "*No execution logs yet.*"
+                return history, gr.update(visible=False), logs_md, sess_id
 
-                # Remove spinner placeholder before appending real responses or when done
-                if session.spinner_shown and (session.pending_responses or not session.processing):
-                    if history:
-                        history = history[:-1]  # remove spinner
-                    session.spinner_shown = False
+            session = self._web_sessions[sess_id]
+
+            has_new_responses = bool(session.pending_responses)
+            was_spinner_shown = session.spinner_shown
+            chatbot_changed = False
+
+            # Remove spinner placeholder before appending real responses or when done
+            if session.spinner_shown and (session.pending_responses or not session.processing):
+                if history:
+                    history = history[:-1]  # remove spinner
+                session.spinner_shown = False
+                chatbot_changed = True
+                # Also remove the committed partial — the final response
+                # contains the complete text so the partial is redundant.
+                if session.streaming_committed and history:
+                    history = history[:-1]  # remove committed partial
+                    session.streaming_committed = False
+                if not session.processing:
+                    session.spinner_step = 0
+                    session.spinner_tick = 0
+                    session.streaming_committed = False
+
+            while session.pending_responses:
+                resp = session.pending_responses.pop(0)
+                history = history + [resp]
+                chatbot_changed = True
+
+            # Show streaming content or spinner while processing
+            if session.processing:
+                if session.streaming_active and session.streaming_content:
+                    # Show live streaming content (replaces spinner)
+                    session.streaming_committed = False
+                    stream_msg = gr.ChatMessage(
+                        role="assistant",
+                        content=session.streaming_content,
+                    )
+                    if session.spinner_shown:
+                        history = history[:-1] + [stream_msg]
+                    else:
+                        history = history + [stream_msg]
+                        session.spinner_shown = True
                     chatbot_changed = True
-                    # Also remove the committed partial — the final response
-                    # contains the complete text so the partial is redundant.
-                    if session.streaming_committed and history:
-                        history = history[:-1]  # remove committed partial
-                        session.streaming_committed = False
-                    if not session.processing:
-                        session.spinner_step = 0
-                        session.spinner_tick = 0
-                        session.streaming_committed = False
-
-                while session.pending_responses:
-                    resp = session.pending_responses.pop(0)
-                    history = history + [resp]
-                    chatbot_changed = True
-
-                # Show streaming content or spinner while processing
-                if session.processing:
-                    if session.streaming_active and session.streaming_content:
-                        # Show live streaming content (replaces spinner)
-                        session.streaming_committed = False
-                        stream_msg = gr.ChatMessage(
+                else:
+                    # Streaming stopped but still processing (tool call phase).
+                    # Commit the streamed partial as a permanent message so it
+                    # stays visible, then show the spinner *below* it.
+                    if not session.streaming_committed and session.streaming_content:
+                        # Replace the live-stream placeholder with a permanent message
+                        if session.spinner_shown and history:
+                            history = history[:-1]
+                            session.spinner_shown = False
+                        committed_msg = gr.ChatMessage(
                             role="assistant",
                             content=session.streaming_content,
                         )
+                        history = history + [committed_msg]
+                        session.streaming_committed = True
+                        session.streaming_content = ""
+                        chatbot_changed = True
+
+                    # Show spinner (below the committed message if any)
+                    session.spinner_tick += 1
+                    spinner_text_changed = session.spinner_tick >= self._spinner_ticks_per_message
+                    if spinner_text_changed:
+                        session.spinner_tick = 0
+                        session.spinner_step += 1
+                    status_msg = self._spinner_messages[
+                        session.spinner_step % len(self._spinner_messages)
+                    ]
+                    if not session.spinner_shown or spinner_text_changed:
+                        spinner_msg = gr.ChatMessage(
+                            role="assistant",
+                            content=f"### {status_msg}",
+                            metadata={"title": "_On it_"},
+                        )
                         if session.spinner_shown:
-                            history = history[:-1] + [stream_msg]
+                            history = history[:-1] + [spinner_msg]
                         else:
-                            history = history + [stream_msg]
+                            history = history + [spinner_msg]
                             session.spinner_shown = True
                         chatbot_changed = True
-                    else:
-                        # Streaming stopped but still processing (tool call phase).
-                        # Commit the streamed partial as a permanent message so it
-                        # stays visible, then show the spinner *below* it.
-                        if not session.streaming_committed and session.streaming_content:
-                            # Replace the live-stream placeholder with a permanent message
-                            if session.spinner_shown and history:
-                                history = history[:-1]
-                                session.spinner_shown = False
-                            committed_msg = gr.ChatMessage(
-                                role="assistant",
-                                content=session.streaming_content,
-                            )
-                            history = history + [committed_msg]
-                            session.streaming_committed = True
-                            session.streaming_content = ""
-                            chatbot_changed = True
 
-                        # Show spinner (below the committed message if any)
-                        session.spinner_tick += 1
-                        spinner_text_changed = session.spinner_tick >= self._spinner_ticks_per_message
-                        if spinner_text_changed:
-                            session.spinner_tick = 0
-                            session.spinner_step += 1
-                        status_msg = self._spinner_messages[
-                            session.spinner_step % len(self._spinner_messages)
-                        ]
-                        if not session.spinner_shown or spinner_text_changed:
-                            spinner_msg = gr.ChatMessage(
-                                role="assistant",
-                                content=f"### {status_msg}",
-                                metadata={"title": "_On it_"},
-                            )
-                            if session.spinner_shown:
-                                history = history[:-1] + [spinner_msg]
-                            else:
-                                history = history + [spinner_msg]
-                                session.spinner_shown = True
-                            chatbot_changed = True
+            logs_md = self._format_logs() if self.execution_logs else "*No execution logs yet.*"
 
-                logs_md = self._format_logs() if self.execution_logs else "*No execution logs yet.*"
+            # Only update the chatbot when there are actual changes
+            # to avoid unnecessary re-renders that fight user scrolling.
+            if not chatbot_changed:
+                return gr.skip(), gr.skip(), logs_md, sess_id
+            return history, gr.update(visible=session.processing), logs_md, sess_id
 
-                # Only update the chatbot when there are actual changes
-                # to avoid unnecessary re-renders that fight user scrolling.
-                if not chatbot_changed:
-                    return gr.skip(), gr.skip(), logs_md, sess_id
-                return history, gr.update(visible=session.processing), logs_md, sess_id
-
-            # wire events
-            upload_btn.upload(handle_upload, [upload_btn, session_state], [uploaded_file_state, upload_indicator, session_state])
-
-            # Note: gr.Request is automatically injected by Gradio, no need to pass it in inputs
-            send_inputs = [msg_input, uploaded_file_state, chatbot, session_state]
-            send_outputs = [chatbot, msg_input, uploaded_file_state, upload_indicator, session_state]
-
-            msg_input.submit(
-                handle_send,
-                send_inputs,
-                send_outputs,
-            )
-
-            stop_btn.click(handle_stop, [session_state], [stop_btn])
-
-            def handle_clear(sess_id):
-                """Delete all files in the session working directory when chat is cleared."""
-                if not sess_id or sess_id not in self._web_sessions:
-                    return sess_id
-                session = self._web_sessions[sess_id]
-                if session.data_path and os.path.isdir(session.data_path):
-                    shutil.rmtree(session.data_path, ignore_errors=True)
-                    os.makedirs(session.data_path, exist_ok=True)
-                # Clear the session JSONL file
-                if session.session_path and os.path.exists(session.session_path):
-                    with open(session.session_path, "w", encoding="utf-8") as f:
-                        f.write("")
+        def handle_clear(sess_id):
+            """Delete all files in the session working directory when chat is cleared."""
+            if not sess_id or sess_id not in self._web_sessions:
                 return sess_id
+            session = self._web_sessions[sess_id]
+            if session.data_path and os.path.isdir(session.data_path):
+                shutil.rmtree(session.data_path, ignore_errors=True)
+                os.makedirs(session.data_path, exist_ok=True)
+            # Clear the session JSONL file
+            if session.session_path and os.path.exists(session.session_path):
+                with open(session.session_path, "w", encoding="utf-8") as f:
+                    f.write("")
+            return sess_id
 
-            chatbot.clear(handle_clear, [session_state], [session_state])
+        def init_session(request: gr.Request):
+            """Restore an existing session (via cookie) or create a new one."""
+            cookie_sess_id = None
+            if request:
+                cookie_sess_id = request.cookies.get("onit_session")
+            sess_id, session = self._get_or_create_session(cookie_sess_id)
+            history = self._load_chat_from_session(
+                session_path=session.session_path,
+                data_path=session.data_path,
+                session_id=sess_id,
+            )
+            return history, sess_id
 
-            # poll for assistant responses every 0.5s
-            timer = gr.Timer(value=0.5)
-            timer.tick(poll_response, [chatbot, session_state], [chatbot, stop_btn, logs_display, session_state])
+        def check_auth_and_restore(request: gr.Request):
+            """Check auth via cookie and restore chat history."""
+            cookie_sess_id = None
+            if request:
+                cookie_sess_id = request.cookies.get("onit_session")
+            sess_id, session = self._get_or_create_session(cookie_sess_id)
+            history = self._load_chat_from_session(
+                session_path=session.session_path,
+                data_path=session.data_path,
+                session_id=sess_id,
+            )
+            not_auth = (gr.update(visible=True), gr.update(visible=False), history, "", sess_id)
+            if not request:
+                return not_auth
 
-            # Initialize session and restore chat history on page load
-            def init_session(request: gr.Request):
-                """Restore an existing session (via cookie) or create a new one."""
-                cookie_sess_id = None
-                if request:
-                    cookie_sess_id = request.cookies.get("onit_session")
-                sess_id, session = self._get_or_create_session(cookie_sess_id)
-                history = self._load_chat_from_session(
-                    session_path=session.session_path,
-                    data_path=session.data_path,
-                    session_id=sess_id,
-                )
-                return history, sess_id
+            auth_cookie = request.cookies.get("onit_auth")
+            if not auth_cookie or auth_cookie not in self._authenticated_cookies:
+                return not_auth
 
-            if self.auth_enabled:
-                def check_auth_and_restore(request: gr.Request):
-                    """Check auth via cookie and restore chat history."""
-                    cookie_sess_id = None
-                    if request:
-                        cookie_sess_id = request.cookies.get("onit_session")
-                    sess_id, session = self._get_or_create_session(cookie_sess_id)
-                    history = self._load_chat_from_session(
-                        session_path=session.session_path,
-                        data_path=session.data_path,
-                        session_id=sess_id,
-                    )
-                    not_auth = (gr.update(visible=True), gr.update(visible=False), history, "", sess_id)
-                    if not request:
-                        return not_auth
+            cookie_data = self._authenticated_cookies[auth_cookie]
+            if datetime.now() > cookie_data['expires']:
+                del self._authenticated_cookies[auth_cookie]
+                return not_auth
 
-                    auth_cookie = request.cookies.get("onit_auth")
-                    if not auth_cookie or auth_cookie not in self._authenticated_cookies:
-                        return not_auth
-
-                    cookie_data = self._authenticated_cookies[auth_cookie]
-                    if datetime.now() > cookie_data['expires']:
-                        del self._authenticated_cookies[auth_cookie]
-                        return not_auth
-
-                    # For authenticated users, use a stable session keyed by email
-                    email = cookie_data.get('email', '')
-                    auth_sess_id = cookie_data.get('session_id')
-                    if auth_sess_id and auth_sess_id in self._web_sessions:
-                        sess_id = auth_sess_id
-                        session = self._web_sessions[sess_id]
-                    else:
-                        # Store session_id in cookie data for future lookups
-                        cookie_data['session_id'] = sess_id
-
-                    history = self._load_chat_from_session(
-                        session_path=session.session_path,
-                        data_path=session.data_path,
-                        session_id=sess_id,
-                    )
-                    email_safe = email.replace("@", "&#64;")
-                    email_display = f'<span style="unicode-bidi: embed; direction: ltr; pointer-events: none;">{email_safe}</span> | <a href="/auth/logout" style="color: inherit; text-decoration: none;">Logout</a>'
-                    return gr.update(visible=False), gr.update(visible=True), history, email_display, sess_id
-
-                app.load(check_auth_and_restore, None, [login_view, chat_view, chatbot, user_info, session_state])
+            # For authenticated users, use a stable session keyed by email
+            email = cookie_data.get('email', '')
+            auth_sess_id = cookie_data.get('session_id')
+            if auth_sess_id and auth_sess_id in self._web_sessions:
+                sess_id = auth_sess_id
+                session = self._web_sessions[sess_id]
             else:
-                app.load(init_session, None, [chatbot, session_state])
+                # Store session_id in cookie data for future lookups
+                cookie_data['session_id'] = sess_id
+
+            history = self._load_chat_from_session(
+                session_path=session.session_path,
+                data_path=session.data_path,
+                session_id=sess_id,
+            )
+            email_safe = email.replace("@", "&#64;")
+            email_display = f'<span style="unicode-bidi: embed; direction: ltr; pointer-events: none;">{email_safe}</span> | <a href="/auth/logout" style="color: inherit; text-decoration: none;">Logout</a>'
+            return gr.update(visible=False), gr.update(visible=True), history, email_display, sess_id
+
+        return {
+            "handle_upload": handle_upload,
+            "handle_send": handle_send,
+            "handle_stop": handle_stop,
+            "poll_response": poll_response,
+            "handle_clear": handle_clear,
+            "init_session": init_session,
+            "check_auth_and_restore": check_auth_and_restore,
+        }
+
+    def _setup_event_handlers(
+        self,
+        app: gr.Blocks,
+        components: dict,
+        session_state: gr.State,
+        uploaded_file_state: gr.State,
+        callbacks: dict,
+        login_view: gr.Column | None = None,
+    ) -> None:
+        """Wire up Gradio event handlers to UI components.
+
+        Args:
+            app: The Gradio Blocks instance.
+            components: Dict of UI components from ``_build_chat_view``.
+            session_state: Gradio state holding the session ID.
+            uploaded_file_state: Gradio state holding the uploaded file path.
+            callbacks: Dict of callback functions from ``_make_event_callbacks``.
+            login_view: The login column (only when auth is enabled).
+        """
+        chatbot = components["chatbot"]
+        msg_input = components["msg_input"]
+        upload_btn = components["upload_btn"]
+        stop_btn = components["stop_btn"]
+        upload_indicator = components["upload_indicator"]
+        logs_display = components["logs_display"]
+
+        upload_btn.upload(
+            callbacks["handle_upload"],
+            [upload_btn, session_state],
+            [uploaded_file_state, upload_indicator, session_state],
+        )
+
+        # Note: gr.Request is automatically injected by Gradio, no need to pass it in inputs
+        send_inputs = [msg_input, uploaded_file_state, chatbot, session_state]
+        send_outputs = [chatbot, msg_input, uploaded_file_state, upload_indicator, session_state]
+
+        msg_input.submit(
+            callbacks["handle_send"],
+            send_inputs,
+            send_outputs,
+        )
+
+        stop_btn.click(callbacks["handle_stop"], [session_state], [stop_btn])
+
+        chatbot.clear(callbacks["handle_clear"], [session_state], [session_state])
+
+        # poll for assistant responses every 0.5s
+        timer = gr.Timer(value=0.5)
+        timer.tick(
+            callbacks["poll_response"],
+            [chatbot, session_state],
+            [chatbot, stop_btn, logs_display, session_state],
+        )
+
+        # Initialize session and restore chat history on page load
+        if self.auth_enabled:
+            chat_view = components["chat_view"]
+            user_info = components["user_info"]
+            app.load(
+                callbacks["check_auth_and_restore"],
+                None,
+                [login_view, chat_view, chatbot, user_info, session_state],
+            )
+        else:
+            app.load(callbacks["init_session"], None, [chatbot, session_state])
+
+    def build_app(self) -> gr.Blocks:
+        """Construct the Gradio Blocks interface."""
+        self._custom_css = self._get_custom_css()
+        scroll_js = self._get_scroll_js()
+        callbacks = self._make_event_callbacks()
+
+        with gr.Blocks(title=self.title, analytics_enabled=False, js=scroll_js) as app:
+            session_state = gr.State(value=None)
+            authenticated_email = gr.State(value=None)
+
+            login_view = None
+            if self.auth_enabled:
+                login_view, _login_status = self._build_login_view()
+
+            components = self._build_chat_view()
+
+            uploaded_file_state = gr.State(value=None)
+
+            self._setup_event_handlers(
+                app, components, session_state, uploaded_file_state,
+                callbacks, login_view=login_view,
+            )
 
         self.app = app
         return app
