@@ -378,6 +378,7 @@ Args:
 - size_filter: Size filter (e.g., "+1M", "-100k", "50k")
 - modified_days: Modified within N days (e.g., 7 for last week)
 - max_results: Maximum results (default: 100)
+- include_hidden: Include hidden files/directories (names starting with ".") (default: False)
 
 Returns JSON: {files, total_files, directory, status}"""
 )
@@ -389,11 +390,12 @@ def find_files(
     size_filter: Optional[str] = None,
     modified_days: Optional[int] = None,
     max_results: int = 100,
+    include_hidden: bool = False,
 ) -> str:
     return _find_files(
         directory=directory, name_pattern=name_pattern, file_type=file_type,
         max_depth=max_depth, size_filter=size_filter, modified_days=modified_days,
-        max_results=max_results,
+        max_results=max_results, include_hidden=include_hidden,
     )
 
 

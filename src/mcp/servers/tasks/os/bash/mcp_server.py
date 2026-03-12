@@ -1142,6 +1142,7 @@ Args:
 - size_filter: Size filter (e.g., "+1M", "-100k", "50k")
 - modified_days: Modified within N days (e.g., 7 for last week)
 - max_results: Maximum results (default: 100)
+- include_hidden: Include hidden files/directories (names starting with ".") (default: False)
 
 Returns JSON: {files, total_files, directory, status}"""
 )
@@ -1152,7 +1153,8 @@ def find_files(
     max_depth: Optional[int] = None,
     size_filter: Optional[str] = None,
     modified_days: Optional[int] = None,
-    max_results: int = 100
+    max_results: int = 100,
+    include_hidden: bool = False
 ) -> str:
     try:
         dir_path = os.path.abspath(os.path.expanduser(directory))
@@ -1213,6 +1215,9 @@ def find_files(
 
         if modified_days is not None:
             cmd_parts.append(f"-mtime -{modified_days}")
+
+        if not include_hidden:
+            cmd_parts.append("-not -name '.*'")
 
         cmd = " ".join(cmd_parts) + f" 2>/dev/null | head -n {max_results}"
 

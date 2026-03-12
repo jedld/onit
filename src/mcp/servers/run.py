@@ -174,7 +174,9 @@ def run_servers(config_path=None, log_level='INFO'):
         # (which get fresh logging configs) can suppress uvicorn access logs.
         if log_level == 'DEBUG':
             for server in config.get('servers', []):
-                server.setdefault('options', {})['verbose'] = True
+                if not server.get('options'):
+                    server['options'] = {}
+                server['options']['verbose'] = True
         server_args = prepare_server_args(config)
 
         if not server_args:

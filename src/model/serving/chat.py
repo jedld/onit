@@ -412,6 +412,21 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             return None
         except OpenAIError as e:
             error_str = str(e)
+            # Auto-recover: context length exceeded — reduce max_tokens to fit
+            if "400" in error_str and "context length" in error_str and "maximum input length" in error_str:
+                import re as _re
+                m = _re.search(r"context length is only (\d+).*?maximum input length of (\d+)", error_str)
+                if m:
+                    ctx_len = int(m.group(1))
+                    max_input = int(m.group(2))
+                    new_max = max(256, max_input - 256)
+                    warn = f"Context length exceeded ({ctx_len} total, {max_input} input). Reducing max_tokens from {max_tokens} to {new_max} and retrying."
+                    max_tokens = new_max
+                    if chat_ui:
+                        chat_ui.add_log(warn, level="warning")
+                    elif verbose:
+                        print(warn)
+                    continue
             # Auto-recover: model rejected image content because it is text-only
             if "not a multimodal model" in error_str or ("400" in error_str and "multimodal" in error_str):
                 non_vlm_mode = True

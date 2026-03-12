@@ -116,10 +116,12 @@ You are an autonomous agent with access to tools and a file system.
 
    datetime_block = "## Current Date & Time\n" + _datetime_context() + "\n\n"
 
+   session_id = Path(data_path).name
    instruction = datetime_block + template.format(
       task=task,
       current_date=current_date,
-      data_path=data_path
+      data_path=data_path,
+      session_id=session_id,
    )
 
    if topic and topic != "null":

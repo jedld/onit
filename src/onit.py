@@ -39,10 +39,12 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+from openai import AsyncOpenAI
+
 from .lib.tools import discover_tools
 from .lib.text import remove_tags
 from .ui import ChatUI
-from .model.serving.chat import chat
+from .model.serving.chat import chat, _resolve_api_key
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -249,6 +251,9 @@ class OnIt(BaseModel):
     prompt_url: str | None = Field(default=None, exclude=True)
     file_server_url: str | None = Field(default=None, exclude=True)
     chat_ui: Any | None = Field(default=None, exclude=True)
+    auto_summarize: bool = Field(default=True)
+    auto_summarize_threshold: int = Field(default=52000)
+    auto_summarize_keep_recent: int = Field(default=6)
 
     def __init__(self, config: Union[str, os.PathLike[str], dict[str, Any], None] = None) -> None :
         super().__init__()
@@ -313,7 +318,19 @@ class OnIt(BaseModel):
                 "Ensure it is listed under mcp.servers with a valid URL."
             )
         tool_servers = [s for s in self.mcp_servers if s.get('name') != 'PromptsMCPServer']
-        self.tool_registry = asyncio.run(discover_tools(tool_servers))
+        a2a_agents = self.config_data.get('a2a_agents', [])
+        # If the main model supports vision, skip A2A agents that are pure VLM
+        # delegates with no other value (marked with vision_only: true in the config).
+        # Agents with vision_only: false (or unset) are kept even when the main model
+        # supports vision because they may have additional strengths (e.g. robotics,
+        # domain expertise).
+        main_model_vision = self.config_data.get('serving', {}).get('vision', False)
+        if main_model_vision:
+            skipped = [a.get('name', '?') for a in a2a_agents if a.get('vision_only', False)]
+            if skipped:
+                print(f"  [vision] Main model supports vision — skipping vision-only agent(s): {', '.join(skipped)}")
+            a2a_agents = [a for a in a2a_agents if not a.get('vision_only', False)]
+        self.tool_registry = asyncio.run(discover_tools(tool_servers, a2a_agents=a2a_agents))
         # List discovered tools
         for tool_name in self.tool_registry:
             print(f"  - {tool_name}")
@@ -415,6 +432,117 @@ class OnIt(BaseModel):
         self.gateway_token = self.config_data.get('gateway_token', None)
         self.viber_webhook_url = self.config_data.get('viber_webhook_url', None)
         self.viber_port = self.config_data.get('viber_port', 8443)
+        self.auto_summarize = self.config_data.get('auto_summarize', True)
+        self.auto_summarize_threshold = int(self.config_data.get('auto_summarize_threshold', 52000))
+        self.auto_summarize_keep_recent = int(self.config_data.get('auto_summarize_keep_recent', 6))
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimate: 1 token ≈ 4 characters."""
+        return max(1, len(text) // 4)
+
+    async def _auto_summarize_history(self, session_path: str) -> None:
+        """If session history exceeds the token threshold, summarize old turns via the LLM
+        and rewrite the session file with a compact summary entry + the most recent turns."""
+        # Load all raw entries
+        all_entries = []
+        try:
+            if not os.path.exists(session_path):
+                return
+            with open(session_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entry = json.loads(line)
+                            all_entries.append(entry)
+                        except json.JSONDecodeError:
+                            continue
+        except Exception:
+            return
+
+        if not all_entries:
+            return
+
+        # Separate an existing leading summary from normal turns
+        existing_summary = None
+        normal_entries = []
+        for entry in all_entries:
+            if entry.get("type") == "summary":
+                existing_summary = entry  # keep the last summary seen as the base
+            else:
+                normal_entries.append(entry)
+
+        # Estimate total tokens in history
+        total_tokens = 0
+        if existing_summary:
+            total_tokens += self._estimate_tokens(existing_summary.get("content", ""))
+        for e in normal_entries:
+            total_tokens += self._estimate_tokens(e.get("task", "") + e.get("response", ""))
+
+        if total_tokens < self.auto_summarize_threshold:
+            return  # Nothing to do
+
+        keep = self.auto_summarize_keep_recent
+        turns_to_summarize = normal_entries[:-keep] if len(normal_entries) > keep else []
+        recent_turns = normal_entries[-keep:] if len(normal_entries) >= keep else normal_entries
+
+        if not turns_to_summarize and not existing_summary:
+            return  # Not enough old turns to summarize
+
+        # Build the text to summarize
+        lines = []
+        if existing_summary:
+            lines.append(f"[Prior summary]: {existing_summary['content']}")
+        for e in turns_to_summarize:
+            lines.append(f"User: {e['task']}")
+            lines.append(f"Assistant: {e['response']}")
+        history_text = "\n".join(lines)
+
+        summary_prompt = (
+            "Summarize the following conversation history concisely, preserving key facts, "
+            "decisions, file paths, and any important context the assistant may need later. "
+            "Be brief but complete.\n\n" + history_text
+        )
+
+        try:
+            host = self.model_serving["host"]
+            model = self.model_serving["model"]
+            host_key = self.model_serving.get("host_key", "EMPTY")
+            api_key = _resolve_api_key(host, host_key)
+            aclient = AsyncOpenAI(base_url=host, api_key=api_key)
+            completion = await aclient.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a concise summarization assistant."},
+                    {"role": "user", "content": summary_prompt},
+                ],
+                max_tokens=1024,
+                temperature=0.3,
+            )
+            summary_text = completion.choices[0].message.content.strip()
+            if "</think>" in summary_text:
+                summary_text = summary_text.split("</think>")[-1].strip()
+        except Exception as e:
+            logger.warning("Auto-summarize LLM call failed: %s", e)
+            return
+
+        # Rewrite session file: [summary entry, ...recent turns]
+        new_summary_entry = {
+            "type": "summary",
+            "content": summary_text,
+            "turns_covered": (len(turns_to_summarize) + (1 if existing_summary else 0)),
+            "timestamp": asyncio.get_event_loop().time(),
+        }
+        try:
+            with open(session_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(new_summary_entry) + "\n")
+                for e in recent_turns:
+                    f.write(json.dumps(e) + "\n")
+            logger.info("Auto-summarized session: compressed %d turns into summary, kept %d recent.",
+                        len(turns_to_summarize), len(recent_turns))
+        except Exception as e:
+            logger.warning("Failed to write summarized session file: %s", e)
+
     def load_session_history(self, max_turns: int = 20, session_path: str | None = None) -> list[dict]:
         """Load recent session history from the JSONL session file.
 
@@ -435,7 +563,13 @@ class OnIt(BaseModel):
                         if line:
                             try:
                                 entry = json.loads(line)
-                                if "task" in entry and "response" in entry:
+                                if entry.get("type") == "summary":
+                                    # Convert summary to a pseudo-turn so chat.py sees it as context
+                                    history.append({
+                                        "task": "[Previous conversation summary]",
+                                        "response": entry["content"],
+                                    })
+                                elif "task" in entry and "response" in entry:
                                     history.append(entry)
                             except json.JSONDecodeError:
                                 continue
@@ -443,6 +577,13 @@ class OnIt(BaseModel):
             pass
         # return only the most recent turns
         return history[-max_turns:]
+
+    def _history_token_estimate(self, history: list[dict]) -> int:
+        """Estimate total tokens in a loaded session history list."""
+        total = 0
+        for e in history:
+            total += self._estimate_tokens(e.get("task", "") + e.get("response", ""))
+        return total
 
     async def run(self) -> None:
         """Run the OnIt agent session"""
@@ -542,6 +683,14 @@ class OnIt(BaseModel):
                 f.write(json.dumps(session_data) + "\n")
         except Exception:
             pass
+
+        # Auto-summarize if history has grown too large
+        if self.auto_summarize:
+            try:
+                await self._auto_summarize_history(effective_session_path)
+            except Exception as e:
+                logger.warning("Auto-summarize failed: %s", e)
+
         return response
 
     async def run_loop(self) -> None:

@@ -18,6 +18,7 @@ RequestHandler - abstract base class for all tools.
 ToolHandler - concrete implementation of RequestHandler that calls a tool via FastMCP client.
 '''
 
+import json
 import tempfile
 import os
 import uuid
@@ -155,6 +156,64 @@ class ToolHandler(RequestHandler):
             return f"{default_audio}"
 
         return "Undefined content type returned from the tool."
+
+class A2AToolHandler(RequestHandler):
+    """Calls a remote OnIt A2A server as if it were a local tool."""
+
+    async def __call__(self, **kwargs) -> str:
+        import httpx
+        task = kwargs.get('task', '')
+        if not task:
+            return json.dumps({"error": "'task' argument is required"})
+        parts = [{"kind": "text", "text": task}]
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": {
+                "message": {
+                    "role": "user",
+                    "parts": parts,
+                    "messageId": str(uuid.uuid4()),
+                }
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                resp = await client.post(self.url.rstrip('/'), json=payload)
+                resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            return json.dumps({"error": f"A2A call failed: {e}"})
+
+        error = data.get("error")
+        if error:
+            return json.dumps({"error": error})
+
+        result = data.get("result", {})
+        text = None
+        if "status" in result:
+            for artifact in result.get("artifacts", []):
+                for part in artifact.get("parts", []):
+                    if part.get("kind") == "text":
+                        text = part["text"]
+                        break
+                if text:
+                    break
+            if not text:
+                task_result = result.get("result")
+                if task_result:
+                    for part in task_result.get("parts", []):
+                        if part.get("kind") == "text":
+                            text = part["text"]
+                            break
+        if not text and "parts" in result:
+            for part in result.get("parts", []):
+                if part.get("kind") == "text":
+                    text = part["text"]
+                    break
+        return text if text else json.dumps(result)
+
 
 # create a tool registry
 class ToolRegistry:

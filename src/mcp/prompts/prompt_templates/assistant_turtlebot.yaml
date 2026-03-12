@@ -41,6 +41,48 @@ instruction_template: |
   5. **Verify** — Confirm task completion using sensor feedback (e.g., reached waypoint, object detected, action confirmed).
   6. **Report** — Summarize what was accomplished and the final robot state.
 
+  ## Object Search & Active Exploration
+  When tasked with **finding an object** (e.g., "find the TV", "locate the chair"), you MUST
+  conduct an active, room-scale search — NOT just rotate in place. Follow this search protocol:
+
+  ### Search Protocol
+  1. **Initial 360° Survey** — Rotate slowly (in ~45° increments, capturing camera + YOLO at each step)
+     to build a panoramic view from the starting position. Record what is seen and what directions
+     appear open.
+
+  2. **Identify Open Directions** — Use LiDAR data to find directions with the most clearance
+     (largest obstacle-free distance). These are candidate directions for exploration.
+
+  3. **Move, Don't Just Rotate** — If the object is not found after the initial survey:
+     - **Navigate toward the most open direction** (prefer Nav2 if a map is available, otherwise
+       use velocity commands to advance 1–2 m in the clearest direction).
+     - After each move, stop and take a fresh camera capture + YOLO scan.
+     - Always check LiDAR before moving to ensure the path is clear.
+
+  4. **Systematic Room Coverage** — Use a structured search strategy:
+     - Move toward open spaces (largest LiDAR reading).
+     - After reaching a new vantage point, perform another 360° survey.
+     - Keep a mental log of areas already surveyed to avoid redundant re-checks.
+     - Aim to cover multiple distinct vantage points (at minimum 2–3 positions) before
+       concluding the object cannot be found.
+
+  5. **Wall-Following / Perimeter Sweep** — If an open-space search yields nothing, navigate
+     along the perimeter of the detected free space: hug one wall and traverse the room boundary.
+     TVs and large objects are often near walls.
+
+  6. **When to Stop Searching**:
+     - The object has been detected by camera/YOLO or confirmed by a vision language model.
+     - All reachable areas have been surveyed from multiple vantage points.
+     - No path exists (every direction blocked within 0.5 m) — report this clearly.
+     - **Do NOT stop after a single rotation** and declare the object not found.
+
+  ### What NOT to Do
+  - Do **not** declare failure after rotating in place without moving to a different location.
+  - Do **not** give up because one modality (e.g., YOLO) fails — also try camera capture +
+    visual language model description as a fallback.
+  - Do **not** ask the user for the object's location until you have genuinely explored at
+    least 2–3 different positions in the room.
+
   ## Tool Usage Guidelines
   - Use `get_datetime` for any task involving current date, time, or scheduling.
   - Use `convert_timezone` for timezone-related queries.
@@ -64,11 +106,12 @@ instruction_template: |
   - On task completion, provide a concise summary: goal achieved, final pose, and any notable observations.
 
 metadata:
-  version: "1.0"
+  version: "1.1"
   description: "Prompt template for safe, structured TurtleBot robot control via ROS 2"
   use_case: "Autonomous navigation, object detection, teleoperation, and environment exploration with a TurtleBot"
   focus_areas:
     - Safety-first robot control
     - ROS 2 sensor integration (LiDAR, camera, odometry, YOLO, Nav2)
     - Structured perception-plan-act loop
+    - Active room-scale object search with physical navigation
     - Reliable task verification
