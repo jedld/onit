@@ -47,7 +47,11 @@ def _make_config(tmp_path, overrides=None):
 def _mock_discover():
     """Patch discover_tools to return an empty registry."""
     from type.tools import ToolRegistry
-    return patch("src.onit.discover_tools", return_value=ToolRegistry())
+    return patch.multiple(
+        "src.onit",
+        discover_tools=MagicMock(return_value=ToolRegistry()),
+        ensure_mcp_servers=MagicMock(),
+    )
 
 
 # ── OnIt.__init__ ───────────────────────────────────────────────────────────
@@ -93,6 +97,16 @@ class TestOnItInit:
         with _mock_discover():
             with pytest.raises(ValueError, match="No serving host"):
                 OnIt(config=cfg)
+
+    def test_init_auto_starts_mcp_servers(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        from type.tools import ToolRegistry
+
+        with patch("src.onit.discover_tools", return_value=ToolRegistry()), \
+             patch("src.onit.ensure_mcp_servers") as mock_ensure:
+            OnIt(config=cfg)
+
+        mock_ensure.assert_called_once()
 
 
 # ── OnIt.initialize ────────────────────────────────────────────────────────
@@ -146,6 +160,24 @@ class TestOnItInitialize:
             onit = OnIt(config=cfg)
         assert onit.web_google_client_id is None
         assert onit.web_google_client_secret is None
+
+    def test_observability_config_applied(self, tmp_path):
+        cfg = _make_config(tmp_path)
+        cfg["observability"] = {
+            "tracing": True,
+            "trace_dir": str(tmp_path / "trace"),
+            "max_events": 123,
+            "introspection": True,
+            "host": "127.0.0.1",
+            "port": 9910,
+        }
+        with _mock_discover():
+            onit = OnIt(config=cfg)
+        assert onit.trace_enabled is True
+        assert onit.trace_dir == str(tmp_path / "trace")
+        assert onit.trace_max_events == 123
+        assert onit.introspection_port == 9910
+        assert onit.trace_recorder is not None
 
 
 # ── OnIt.load_session_history ───────────────────────────────────────────────
@@ -212,6 +244,7 @@ def _make_onit_for_async(tmp_path, overrides=None):
     empty_registry = ToolRegistry()
 
     with patch("src.onit.discover_tools", return_value=empty_registry), \
+         patch("src.onit.ensure_mcp_servers"), \
          patch("src.onit.asyncio.run", return_value=empty_registry):
         onit = OnIt(config=cfg)
     return onit
@@ -237,6 +270,27 @@ class TestProcessTask:
         with patch("src.onit.Client", return_value=mock_client), \
              patch("src.onit.chat", new_callable=AsyncMock, return_value="The answer"):
             result = await onit.process_task("What is 2+2?")
+
+        assert result == "The answer"
+
+    @pytest.mark.asyncio
+    async def test_process_task_without_safety_queue(self, tmp_path):
+        onit = _make_onit_for_async(tmp_path)
+        onit.safety_queue = None
+
+        mock_prompt_msg = MagicMock()
+        mock_prompt_msg.content.text = "Instruction text"
+        mock_prompt_result = MagicMock()
+        mock_prompt_result.messages = [mock_prompt_msg]
+
+        mock_client = AsyncMock()
+        mock_client.get_prompt = AsyncMock(return_value=mock_prompt_result)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("src.onit.Client", return_value=mock_client), \
+             patch("src.onit.chat", new_callable=AsyncMock, return_value="The answer"):
+            result = await onit.process_task("Move the robot 30 centimeters forward")
 
         assert result == "The answer"
 
@@ -283,6 +337,54 @@ class TestProcessTask:
 
         call_kwargs = mock_chat.call_args.kwargs
         assert call_kwargs.get("prompt_intro") == "I am a custom bot."
+        assert call_kwargs.get("trace_recorder") is onit.trace_recorder
+        assert call_kwargs.get("session_id") == Path(onit.session_path).stem
+
+    @pytest.mark.asyncio
+    async def test_process_task_records_prompt_and_task_events(self, tmp_path):
+        onit = _make_onit_for_async(tmp_path)
+        onit.safety_queue = asyncio.Queue()
+
+        mock_prompt_msg = MagicMock()
+        mock_prompt_msg.content.text = "Instruction text"
+        mock_prompt_result = MagicMock()
+        mock_prompt_result.messages = [mock_prompt_msg]
+
+        mock_client = AsyncMock()
+        mock_client.get_prompt = AsyncMock(return_value=mock_prompt_result)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("src.onit.Client", return_value=mock_client), \
+             patch("src.onit.chat", new_callable=AsyncMock, return_value="The answer"):
+            await onit.process_task("Move the robot to the docking station")
+
+        event_types = [event["event_type"] for event in onit.trace_recorder.recent_events(limit=20)]
+        assert "agent.task_received" in event_types
+        assert "mcp.request" in event_types
+        assert "mcp.response" in event_types
+        assert "agent.task_completed" in event_types
+
+    @pytest.mark.asyncio
+    async def test_process_task_falls_back_when_prompt_server_unavailable(self, tmp_path):
+        onit = _make_onit_for_async(tmp_path)
+        onit.safety_queue = asyncio.Queue()
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(side_effect=RuntimeError("Client failed to connect"))
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        mock_chat = AsyncMock(return_value="The answer")
+        with patch("src.onit.Client", return_value=mock_client), \
+             patch("src.onit.chat", mock_chat):
+            result = await onit.process_task("Move the robot 30 centimeters forward")
+
+        assert result == "The answer"
+        instruction = mock_chat.call_args.kwargs["instruction"]
+        assert "Move the robot 30 centimeters forward" in instruction
+        event_types = [event["event_type"] for event in onit.trace_recorder.recent_events(limit=20)]
+        assert "mcp.error" in event_types
+        assert "mcp.response" in event_types
 
 
 # ── OnItA2AExecutor ─────────────────────────────────────────────────────────

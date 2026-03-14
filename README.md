@@ -92,6 +92,14 @@ mcp:
     - name: ToolsMCPServer
       url: http://127.0.0.1:18201/sse
       enabled: true
+
+observability:
+  tracing: true
+  trace_dir: ~/.onit/introspection
+  max_events: 2000
+  introspection: true
+  host: 127.0.0.1
+  port: 9100
 ```
 
 The LLM provider is auto-detected from the host URL. If it contains `openrouter.ai`, the API key is read from `host_key` or `OPENROUTER_API_KEY`. All other hosts default to vLLM with no key required.
@@ -157,6 +165,17 @@ The LLM provider is auto-detected from the host URL. If it contains `openrouter.
 | `--mcp-host` | Override the host/IP in all MCP server URLs (e.g. `192.168.1.100`) | — |
 | `--mcp-sse` | URL of an external MCP tools server using SSE transport (can be repeated) | — |
 
+**Observability:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--probe` | Run a one-shot connectivity and discovery probe, print JSON, and exit | `false` |
+| `--introspection` | Enable the external introspection HTTP server | config-driven |
+| `--introspection-host` | Host for the introspection HTTP server | `127.0.0.1` |
+| `--introspection-port` | Port for the introspection HTTP server | `9100` |
+| `--trace-dir` | Directory for JSONL trace files and persisted observability data | `~/.onit/introspection` |
+| `--trace-max-events` | Max in-memory events retained for introspection queries | `2000` |
+
 ## Features
 
 ### Interactive Chat
@@ -187,6 +206,36 @@ Connect to additional external MCP servers:
 ```bash
 onit --mcp-sse http://localhost:8080/sse --mcp-sse http://192.168.1.50:9090/sse
 ```
+
+### Tracing and Probes
+
+OnIt can now expose model-to-MCP activity for external monitoring while you run robot tasks. With the default config, traces are written to `~/.onit/introspection/events.jsonl` and a local HTTP introspection server is started on `127.0.0.1:9100`.
+
+Probe the current runtime before a robot run:
+
+```bash
+onit --probe
+```
+
+Inspect live runtime state from another process or dashboard:
+
+```bash
+curl http://127.0.0.1:9100/healthz
+curl http://127.0.0.1:9100/probe
+curl 'http://127.0.0.1:9100/trace/events?limit=100'
+curl http://127.0.0.1:9100/trace/stats
+```
+
+Dashboard URL: http://127.0.0.1:9100/dashboard
+
+The trace stream covers:
+
+- LLM request and response cycles
+- Agent tool decisions
+- Prompt-server MCP traffic
+- MCP tool request/response/error events, including remote robot-control servers such as ROS bridges
+
+The live dashboard shows inflight tasks, completed tasks, inflight operations, completed operations, and a ROS-focused activity view updated once per second from the same introspection server.
 
 ### Messaging Gateways (Telegram & Viber)
 

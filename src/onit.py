@@ -18,6 +18,7 @@ OnIt: An intelligent agent framework for task automation and assistance.
 """
 
 import asyncio
+from datetime import datetime
 import os
 import tempfile
 import yaml
@@ -41,8 +42,10 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 from openai import AsyncOpenAI
 
+from .lib.mcp_bootstrap import ensure_mcp_servers
 from .lib.tools import discover_tools
 from .lib.text import remove_tags
+from .lib.observability import IntrospectionServer, TraceRecorder
 from .ui import ChatUI
 from .model.serving.chat import chat, _resolve_api_key
 
@@ -54,6 +57,19 @@ from a2a.utils import new_agent_text_message
 AGENT_CURSOR = "OnIt"
 USER_CURSOR = "You"
 STOP_TAG = "<stop></stop>"
+
+
+def _local_datetime_context() -> str:
+    """Return a best-effort local date/time block for prompt fallback."""
+    now = datetime.now().astimezone()
+    tz_name = now.tzname() or "local"
+    utc_offset = now.strftime("%z")
+    utc_display = f"UTC{utc_offset[:3]}:{utc_offset[3:]}" if utc_offset else "UTC"
+    return (
+        f"Current date: {now.strftime('%B %d, %Y')} ({now.strftime('%A')})\n"
+        f"Current time: {now.strftime('%I:%M %p')} ({tz_name}, {utc_display})\n"
+        f"Timezone: {tz_name}"
+    )
 
 
 class OnItA2AExecutor(AgentExecutor):
@@ -254,6 +270,14 @@ class OnIt(BaseModel):
     auto_summarize: bool = Field(default=True)
     auto_summarize_threshold: int = Field(default=52000)
     auto_summarize_keep_recent: int = Field(default=6)
+    trace_recorder: Any | None = Field(default=None, exclude=True)
+    introspection_server: Any | None = Field(default=None, exclude=True)
+    trace_enabled: bool = Field(default=True)
+    trace_dir: str = Field(default="~/.onit/introspection")
+    trace_max_events: int = Field(default=2000)
+    introspection_enabled: bool = Field(default=True)
+    introspection_host: str = Field(default="127.0.0.1")
+    introspection_port: int = Field(default=9100)
 
     def __init__(self, config: Union[str, os.PathLike[str], dict[str, Any], None] = None) -> None :
         super().__init__()
@@ -297,6 +321,18 @@ class OnIt(BaseModel):
                 self.chat_ui = ChatUI(self.theme, show_logs=self.show_logs, banner_title=banner)
         
     def initialize(self):
+        observability = self.config_data.get('observability', {})
+        self.trace_enabled = observability.get('tracing', True)
+        self.trace_dir = os.path.expanduser(observability.get('trace_dir', '~/.onit/introspection'))
+        self.trace_max_events = int(observability.get('max_events', 2000))
+        self.introspection_enabled = observability.get('introspection', True)
+        self.introspection_host = observability.get('host', '127.0.0.1')
+        self.introspection_port = int(observability.get('port', 9100))
+        self.trace_recorder = TraceRecorder(
+            base_dir=self.trace_dir,
+            enabled=self.trace_enabled,
+            max_events=self.trace_max_events,
+        )
         self.mcp_servers = self.config_data['mcp']['servers'] if 'mcp' in self.config_data and 'servers' in self.config_data['mcp'] else []
         # Override MCP server URL hosts if mcp_host is configured
         mcp_host = self.config_data.get('mcp', {}).get('mcp_host')
@@ -307,6 +343,10 @@ class OnIt(BaseModel):
                 if url:
                     parsed = urlparse(url)
                     server['url'] = urlunparse(parsed._replace(netloc=f"{mcp_host}:{parsed.port}" if parsed.port else mcp_host))
+        ensure_mcp_servers(
+            self.config_data,
+            log_level='DEBUG' if self.config_data.get('verbose') else 'ERROR',
+        )
         # Find the prompts server URL from the MCP servers list
         for server in self.mcp_servers:
             if server.get('name') == 'PromptsMCPServer' and server.get('enabled', True):
@@ -331,6 +371,7 @@ class OnIt(BaseModel):
                 print(f"  [vision] Main model supports vision — skipping vision-only agent(s): {', '.join(skipped)}")
             a2a_agents = [a for a in a2a_agents if not a.get('vision_only', False)]
         self.tool_registry = asyncio.run(discover_tools(tool_servers, a2a_agents=a2a_agents))
+        self.tool_registry.set_observer(self.trace_recorder)
         # List discovered tools
         for tool_name in self.tool_registry:
             print(f"  - {tool_name}")
@@ -435,6 +476,41 @@ class OnIt(BaseModel):
         self.auto_summarize = self.config_data.get('auto_summarize', True)
         self.auto_summarize_threshold = int(self.config_data.get('auto_summarize_threshold', 52000))
         self.auto_summarize_keep_recent = int(self.config_data.get('auto_summarize_keep_recent', 6))
+
+    def _ensure_introspection_server(self) -> None:
+        if not self.introspection_enabled or not self.trace_recorder:
+            return
+        if self.introspection_server is not None:
+            return
+        self.introspection_server = IntrospectionServer(
+            trace_recorder=self.trace_recorder,
+            onit_ref=self,
+            host=self.introspection_host,
+            port=self.introspection_port,
+        )
+        self.introspection_server.start()
+
+    def get_probe_report(self) -> dict[str, Any]:
+        report = self.trace_recorder.build_probe_report(
+            model_host=self.model_serving.get('host'),
+            mcp_servers=self.mcp_servers,
+            tool_registry=self.tool_registry,
+        )
+        data = report.to_dict()
+        data['trace'] = self.trace_recorder.stats_snapshot()
+        data['session_path'] = self.session_path
+        data['introspection'] = {
+            'enabled': self.introspection_enabled,
+            'host': self.introspection_host,
+            'port': self.introspection_port,
+        }
+        return data
+
+    @staticmethod
+    def _derive_session_id(session_path: str | None, fallback: str | None = None) -> str | None:
+        if session_path:
+            return Path(session_path).stem
+        return fallback
     @staticmethod
     def _estimate_tokens(text: str) -> int:
         """Rough token estimate: 1 token ≈ 4 characters."""
@@ -578,6 +654,160 @@ class OnIt(BaseModel):
         # return only the most recent turns
         return history[-max_turns:]
 
+    async def _build_instruction(self,
+                                 task: str,
+                                 data_path: str,
+                                 session_id: str | None,
+                                 task_id: str | None = None) -> str:
+        start_time = asyncio.get_event_loop().time()
+        operation_id = f"mcp_{uuid.uuid4().hex[:12]}"
+        prompt_args = {
+            "task": task,
+            "data_path": data_path,
+            "template_path": self.template_path,
+            "file_server_url": self.file_server_url,
+            "documents_path": self.documents_path,
+            "topic": self.topic,
+        }
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                'mcp.request',
+                session_id=session_id,
+                task_id=task_id,
+                operation_id=operation_id,
+                tool_name='assistant_prompt',
+                url=self.prompt_url,
+                arguments=prompt_args,
+                kind='prompt',
+            )
+
+        prompt_client = Client(self.prompt_url)
+        try:
+            async with prompt_client:
+                instruction = await prompt_client.get_prompt("assistant", prompt_args)
+                text = instruction.messages[0].content.text
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    'mcp.response',
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=operation_id,
+                    tool_name='assistant_prompt',
+                    url=self.prompt_url,
+                    latency_ms=round((asyncio.get_event_loop().time() - start_time) * 1000, 2),
+                    result_type='prompt',
+                    result_preview=text,
+                    kind='prompt',
+                )
+            return text
+        except Exception as exc:
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    'mcp.error',
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=operation_id,
+                    tool_name='assistant_prompt',
+                    url=self.prompt_url,
+                    latency_ms=round((asyncio.get_event_loop().time() - start_time) * 1000, 2),
+                    error=str(exc),
+                    kind='prompt',
+                )
+            logger.warning(
+                "Prompts MCP unavailable at %s; falling back to local instruction builder: %s",
+                self.prompt_url,
+                exc,
+            )
+            text = self._build_local_instruction(task=task, data_path=data_path)
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    'mcp.response',
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=operation_id,
+                    tool_name='assistant_prompt',
+                    url=self.prompt_url,
+                    latency_ms=round((asyncio.get_event_loop().time() - start_time) * 1000, 2),
+                    result_type='prompt_fallback',
+                    result_preview=text,
+                    kind='prompt',
+                    fallback=True,
+                    fallback_reason=str(exc),
+                )
+            return text
+
+    def _build_local_instruction(self, task: str, data_path: str) -> str:
+        """Build a local prompt when the prompt MCP server is unavailable."""
+        Path(data_path).mkdir(parents=True, exist_ok=True)
+        current_date = datetime.now().strftime("%B %d, %Y")
+        default_template = (
+            "You are an autonomous agent with access to tools and a file system.\n\n"
+            "## Context\n"
+            f"- **Today's date**: {current_date}\n"
+            f"- **Working directory**: {data_path} — sandbox folder for reading and writing files.\n\n"
+            "## Constraints\n"
+            f"- NEVER create or modify files outside of `{data_path}`.\n\n"
+            "## Task\n"
+            f"{task}\n"
+        )
+        template = default_template
+
+        if self.template_path:
+            template_file = Path(self.template_path)
+            if template_file.exists() and template_file.suffix in ('.yaml', '.yml'):
+                with open(template_file, 'r', encoding='utf-8') as f:
+                    config = yaml.safe_load(f) or {}
+                template = config.get('instruction_template', default_template)
+
+        instruction = (
+            "## Current Date & Time\n"
+            f"{_local_datetime_context()}\n\n"
+            + template.format(
+                task=task,
+                current_date=current_date,
+                data_path=data_path,
+                session_id=Path(data_path).name,
+            )
+        )
+
+        if self.topic and self.topic != "null":
+            instruction += (
+                "\n## Topic\n"
+                f"Unless specified, assume that the topic is about `{self.topic}`.\n"
+            )
+
+        if self.file_server_url and self.file_server_url != "null":
+            upload_id = Path(data_path).name
+            upload_prefix = f"{self.file_server_url}/uploads/{upload_id}"
+            instruction += (
+                f"\nFiles are served by a remote file server at {upload_prefix}/.\n"
+                "Before reading any file referenced in the task, first download it:\n"
+                f"  curl -s {upload_prefix}/<filename> -o {data_path}/<filename>\n"
+                "After creating or saving any output file, upload it back to the file server:\n"
+                f"  curl -s -X POST -F 'file=@{data_path}/<filename>' {upload_prefix}/\n"
+                "Always download before reading and upload after writing.\n"
+                "When using create_presentation, create_excel, or create_document tools, always pass "
+                f"callback_url=\"{upload_prefix}\" so files are automatically uploaded.\n"
+            )
+
+        if self.documents_path and self.documents_path != "null":
+            instruction += (
+                "\n## Relevant Information\n"
+                f"Search and read related documents (PDF, TXT, DOCX, XLSX, PPTX, and Markdown (MD)) in `{self.documents_path}`.\n"
+                "Search the web for additional information if and only if above documents are insufficient to complete the task.\n"
+            )
+
+        instruction += (
+            "\n## Instructions\n"
+            "1. If the answer is straightforward, respond directly without tool use.\n"
+            "2. Otherwise, reason step by step, invoke tools as needed, and work toward a final answer.\n"
+            "3. If critical information is missing and cannot be inferred, ask exactly one clarifying question before proceeding.\n"
+            "4. If a file was generated, provide a download link to the file.\n"
+            "5. Conclude with your final answer in this format:\n\n"
+            "<your answer here>\n"
+        )
+        return instruction
+
     def _history_token_estimate(self, history: list[dict]) -> int:
         """Estimate total tokens in a loaded session history list."""
         total = 0
@@ -588,6 +818,7 @@ class OnIt(BaseModel):
     async def run(self) -> None:
         """Run the OnIt agent session"""
         try:
+            self._ensure_introspection_server()
             self.input_queue = asyncio.Queue(maxsize=10)
             self.output_queue = asyncio.Queue(maxsize=10)
             self.safety_queue = asyncio.Queue(maxsize=10)
@@ -614,7 +845,8 @@ class OnIt(BaseModel):
     async def process_task(self, task: str, images: list[str] | None = None,
                            session_path: str | None = None,
                            data_path: str | None = None,
-                           safety_queue: asyncio.Queue | None = None) -> str:
+                           safety_queue: asyncio.Queue | None = None,
+                           task_id: str | None = None) -> str:
         """Process a single task and return the response string.
 
         Args:
@@ -628,21 +860,31 @@ class OnIt(BaseModel):
         effective_session_path = session_path or self.session_path
         effective_data_path = data_path or self.data_path
         effective_safety_queue = safety_queue or self.safety_queue
+        if effective_safety_queue is None:
+            effective_safety_queue = asyncio.Queue(maxsize=10)
+        effective_session_id = self._derive_session_id(effective_session_path, self.session_id)
+        effective_task_id = task_id or f"task_{uuid.uuid4().hex[:12]}"
+
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                'agent.task_received',
+                session_id=effective_session_id,
+            task_id=effective_task_id,
+                task_preview=task,
+                image_count=len(images or []),
+                session_path=effective_session_path,
+                data_path=effective_data_path,
+            )
 
         while not effective_safety_queue.empty():
             effective_safety_queue.get_nowait()
 
-        prompt_client = Client(self.prompt_url)
-        async with prompt_client:
-            instruction = await prompt_client.get_prompt("assistant", {
-                "task": task,
-                "data_path": effective_data_path,
-                "template_path": self.template_path,
-                "file_server_url": self.file_server_url,
-                "documents_path": self.documents_path,
-                "topic": self.topic,
-            })
-            instruction = instruction.messages[0].content.text
+        instruction = await self._build_instruction(
+            task=task,
+            data_path=effective_data_path,
+            session_id=effective_session_id,
+            task_id=effective_task_id,
+        )
 
         kwargs = {
             'console': None, 'chat_ui': None,
@@ -651,6 +893,9 @@ class OnIt(BaseModel):
             'data_path': effective_data_path,
             'max_tokens': self.model_serving.get('max_tokens', 262144),
             'session_history': self.load_session_history(session_path=effective_session_path),
+            'trace_recorder': self.trace_recorder,
+            'session_id': effective_session_id,
+            'task_id': effective_task_id,
         }
         if self.prompt_intro:
             kwargs['prompt_intro'] = self.prompt_intro
@@ -670,9 +915,26 @@ class OnIt(BaseModel):
         if last_response is None:
             logger.error("chat() returned None — likely a safety queue trigger or unhandled error. "
                          "Host: %s, Model: %s", self.model_serving["host"], self.model_serving["model"])
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    'agent.task_failed',
+                    session_id=effective_session_id,
+                    task_id=effective_task_id,
+                    task_preview=task,
+                    reason='chat returned none',
+                )
             return "I am sorry \U0001f614. Could you please rephrase your question?"
 
         response = remove_tags(last_response)
+        if self.trace_recorder:
+            self.trace_recorder.record(
+                'agent.task_completed',
+                session_id=effective_session_id,
+                task_id=effective_task_id,
+                task_preview=task,
+                response_preview=response,
+                response_length=len(response),
+            )
         try:
             with open(effective_session_path, "a", encoding="utf-8") as f:
                 session_data = {
@@ -699,29 +961,37 @@ class OnIt(BaseModel):
             raise ValueError("Loop mode requires a 'task' to be set in the config.")
 
         print(f"Loop mode: task='{self.task}', period={self.period}s (Ctrl+C to stop)")
-        prompt_client = Client(self.prompt_url)
         iteration = 0
 
         while True:
             try:
                 iteration += 1
                 start_time = asyncio.get_event_loop().time()
+                task_id = f"task_{uuid.uuid4().hex[:12]}"
 
                 # clear safety queue
                 while not self.safety_queue.empty():
                     self.safety_queue.get_nowait()
 
+                if self.trace_recorder:
+                    self.trace_recorder.record(
+                        'agent.task_received',
+                        session_id=self.session_id,
+                        task_id=task_id,
+                        task_preview=self.task,
+                        image_count=0,
+                        session_path=self.session_path,
+                        data_path=self.data_path,
+                    )
+
                 # build instruction via MCP prompt
                 print(f"--- Iteration {iteration} ---")
-                async with prompt_client:
-                    instruction = await prompt_client.get_prompt("assistant", {"task": self.task,
-                                                                                "data_path": self.data_path,
-                                                                                "template_path": self.template_path,
-                                                                                "file_server_url": self.file_server_url,
-                                                                                "documents_path": self.documents_path,
-                                                                                "topic": self.topic})
-                    instruction = instruction.messages[0]
-                    instruction = instruction.content.text
+                instruction = await self._build_instruction(
+                    task=self.task,
+                    data_path=self.data_path,
+                    session_id=self.session_id,
+                    task_id=task_id,
+                )
 
                 # call chat directly (no queues needed)
                 kwargs = {'console': None,
@@ -731,7 +1001,10 @@ class OnIt(BaseModel):
                           'verbose': self.verbose,
                           'data_path': self.data_path,
                           'max_tokens': self.model_serving.get('max_tokens', 262144),
-                          'session_history': self.load_session_history()}
+                          'session_history': self.load_session_history(),
+                          'trace_recorder': self.trace_recorder,
+                          'session_id': self.session_id,
+                          'task_id': task_id}
                 last_response = await chat(host=self.model_serving["host"],
                                             host_key=self.model_serving.get("host_key", "EMPTY"),
                                             model=self.model_serving["model"],
@@ -745,6 +1018,15 @@ class OnIt(BaseModel):
                 if last_response is not None:
                     elapsed_time = asyncio.get_event_loop().time() - start_time
                     response = remove_tags(last_response)
+                    if self.trace_recorder:
+                        self.trace_recorder.record(
+                            'agent.task_completed',
+                            session_id=self.session_id,
+                            task_id=task_id,
+                            task_preview=self.task,
+                            response_preview=response,
+                            response_length=len(response),
+                        )
                     print(f"\n[{AGENT_CURSOR}] ({elapsed_time:.2f}s)\n{response}\n")
 
                     # save to session JSONL
@@ -772,10 +1054,34 @@ class OnIt(BaseModel):
                 print("\r" + " " * 40 + "\r", end="", flush=True)
 
             except asyncio.CancelledError:
+                if self.trace_recorder:
+                    self.trace_recorder.record(
+                        'agent.task_cancelled',
+                        session_id=self.session_id,
+                        task_id=task_id if 'task_id' in locals() else None,
+                        task_preview=self.task,
+                        reason='loop cancelled',
+                    )
                 return
             except KeyboardInterrupt:
+                if self.trace_recorder:
+                    self.trace_recorder.record(
+                        'agent.task_cancelled',
+                        session_id=self.session_id,
+                        task_id=task_id if 'task_id' in locals() else None,
+                        task_preview=self.task,
+                        reason='keyboard interrupt',
+                    )
                 return
             except Exception:
+                if self.trace_recorder:
+                    self.trace_recorder.record(
+                        'agent.task_failed',
+                        session_id=self.session_id,
+                        task_id=task_id if 'task_id' in locals() else None,
+                        task_preview=self.task,
+                        reason='loop iteration failed',
+                    )
                 await asyncio.sleep(self.period)
 
     async def run_a2a(self) -> None:
@@ -884,6 +1190,7 @@ class OnIt(BaseModel):
         self.output_queue = asyncio.Queue(maxsize=10)
         self.safety_queue = asyncio.Queue(maxsize=10)
         self.status = "running"
+        self._ensure_introspection_server()
 
         if self.gateway == "viber":
             from .ui.viber import ViberGateway
@@ -919,7 +1226,6 @@ class OnIt(BaseModel):
     async def client_to_agent(self) -> None:
         """Handle client to agent communication"""
 
-        prompt_client = Client(self.prompt_url)
         agent_task = None
         loop = asyncio.get_event_loop()
         safety_warning = self.messages.get('safety_warning', "Press 'Enter' key to stop all tasks.")
@@ -940,6 +1246,18 @@ class OnIt(BaseModel):
                 task = None
                 continue
 
+            task_id = f"task_{uuid.uuid4().hex[:12]}"
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    'agent.task_received',
+                    session_id=self.session_id,
+                    task_id=task_id,
+                    task_preview=task,
+                    image_count=0,
+                    session_path=self.session_path,
+                    data_path=self.data_path,
+                )
+
             # clear all queues
             while not self.input_queue.empty():
                 self.input_queue.get_nowait()
@@ -949,15 +1267,12 @@ class OnIt(BaseModel):
                 self.safety_queue.get_nowait()
 
             # prompt engineering
-            async with prompt_client:
-                instruction = await prompt_client.get_prompt("assistant", {"task": task,
-                                                                            "data_path": self.data_path,
-                                                                            "template_path": self.template_path,
-                                                                            "file_server_url": self.file_server_url,
-                                                                            "documents_path": self.documents_path,
-                                                                            "topic": self.topic})
-                instruction = instruction.messages[0]
-                instruction = instruction.content.text
+            instruction = await self._build_instruction(
+                task=task,
+                data_path=self.data_path,
+                session_id=self.session_id,
+                task_id=task_id,
+            )
                 
             # Set up Enter-key stop listener for text UI
             if not self.web:
@@ -975,7 +1290,12 @@ class OnIt(BaseModel):
                     self.safety_queue.get_nowait()
 
                 agent_task = asyncio.create_task(self.agent_session())
-                await self.input_queue.put(instruction)
+                await self.input_queue.put({
+                    'instruction': instruction,
+                    'task': task,
+                    'task_id': task_id,
+                    'session_id': self.session_id,
+                })
 
                 final_answer_task = asyncio.create_task(self.output_queue.get())
 
@@ -1006,6 +1326,14 @@ class OnIt(BaseModel):
                         await agent_task
                     except asyncio.CancelledError:
                         pass
+                    if self.trace_recorder:
+                        self.trace_recorder.record(
+                            'agent.task_cancelled',
+                            session_id=self.session_id,
+                            task_id=task_id,
+                            task_preview=task,
+                            reason='stopped by user',
+                        )
                     self.chat_ui.add_message("system", "Task stopped by user.")
                     break
 
@@ -1019,6 +1347,14 @@ class OnIt(BaseModel):
 
                 # User-initiated stop
                 if response == STOP_TAG:
+                    if self.trace_recorder:
+                        self.trace_recorder.record(
+                            'agent.task_cancelled',
+                            session_id=self.session_id,
+                            task_id=task_id,
+                            task_preview=task,
+                            reason='stopped by user',
+                        )
                     self.chat_ui.add_message("system", "Task stopped by user.")
                     break
 
@@ -1029,6 +1365,14 @@ class OnIt(BaseModel):
                     error_reason = None
 
                 if response is None:
+                    if self.trace_recorder:
+                        self.trace_recorder.record(
+                            'agent.task_failed',
+                            session_id=self.session_id,
+                            task_id=task_id,
+                            task_preview=task,
+                            reason=error_reason or 'agent returned no response',
+                        )
                     # API error — ask user whether to retry
                     if not self.web:
                         loop.remove_reader(sys.stdin.fileno())
@@ -1049,6 +1393,15 @@ class OnIt(BaseModel):
                 elapsed_time = loop.time() - start_time
                 elapsed_time = f"{elapsed_time:.2f} secs"
                 response = remove_tags(response)
+                if self.trace_recorder:
+                    self.trace_recorder.record(
+                        'agent.task_completed',
+                        session_id=self.session_id,
+                        task_id=task_id,
+                        task_preview=task,
+                        response_preview=response,
+                        response_length=len(response),
+                    )
                 self.chat_ui.add_message("assistant", response, elapsed=elapsed_time)
                 try:
                     with open(self.session_path, "a", encoding="utf-8") as f:
@@ -1074,7 +1427,15 @@ class OnIt(BaseModel):
         """Start the agent session"""
         while True:
             try:
-                instruction = await self.input_queue.get()
+                request = await self.input_queue.get()
+                if isinstance(request, dict):
+                    instruction = request.get('instruction')
+                    task_id = request.get('task_id')
+                    session_id = request.get('session_id', self.session_id)
+                else:
+                    instruction = request
+                    task_id = None
+                    session_id = self.session_id
                 if not self.safety_queue.empty():
                     await self.output_queue.put(STOP_TAG)
                     break
@@ -1086,7 +1447,10 @@ class OnIt(BaseModel):
                           'verbose': self.verbose,
                           'data_path': self.data_path,
                           'max_tokens': self.model_serving.get('max_tokens', 262144),
-                          'session_history': self.load_session_history()}
+                          'session_history': self.load_session_history(),
+                          'trace_recorder': self.trace_recorder,
+                          'session_id': session_id,
+                          'task_id': task_id}
                 if self.prompt_intro:
                     kwargs['prompt_intro'] = self.prompt_intro
                 last_response = await chat(host=self.model_serving["host"],

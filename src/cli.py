@@ -23,6 +23,7 @@ import threading
 import requests
 import yaml
 
+from .lib.mcp_bootstrap import ensure_mcp_servers, is_port_open, mcp_servers_ready
 from .onit import OnIt
 
 
@@ -210,12 +211,7 @@ def _find_default_config() -> str:
 
 def _is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
     """Check if a TCP port is accepting connections."""
-    try:
-        sock = socket.create_connection((host, port), timeout=timeout)
-        sock.close()
-        return True
-    except (ConnectionRefusedError, OSError):
-        return False
+    return is_port_open(host, port, timeout=timeout)
 
 
 def _mcp_servers_ready(config_data: dict, timeout: float = 15.0) -> bool:
@@ -224,78 +220,24 @@ def _mcp_servers_ready(config_data: dict, timeout: float = 15.0) -> bool:
     Parses the agent config's mcp.servers list and checks each URL's port.
     Returns True if all servers respond within timeout, False otherwise.
     """
-    from urllib.parse import urlparse
-
-    servers = config_data.get('mcp', {}).get('servers', [])
-    endpoints = []
-    for s in servers:
-        if s.get('enabled', True) and s.get('url'):
-            parsed = urlparse(s['url'])
-            host = parsed.hostname or '127.0.0.1'
-            port = parsed.port or 80
-            endpoints.append((host, port, s.get('name', 'Unknown')))
-
-    if not endpoints:
-        return True
-
-    start = time.monotonic()
-    while time.monotonic() - start < timeout:
-        all_up = True
-        for host, port, _ in endpoints:
-            if not _is_port_open(host, port):
-                all_up = False
-                break
-        if all_up:
-            return True
-        time.sleep(0.5)
-    return False
+    return mcp_servers_ready(config_data, timeout=timeout)
 
 
 def _start_mcp_servers_background(log_level='ERROR'):
     """Start MCP servers in a daemon thread. Blocks forever (runs in background)."""
-    from .mcp.servers.run import run_servers
-    try:
-        run_servers(log_level=log_level)
-    except Exception:
-        pass
+    from .lib.mcp_bootstrap import _start_mcp_servers_background as _shared_start
+
+    _shared_start(log_level=log_level)
 
 
 def _ensure_mcp_servers(config_data: dict, log_level='ERROR'):
     """Start MCP servers if they are not already running, then wait for readiness."""
-    from urllib.parse import urlparse
+    ensure_mcp_servers(config_data, log_level=log_level)
 
-    # Propagate documents_path to MCP servers via environment variable
-    docs_path = config_data.get('documents_path', '')
-    if docs_path:
-        os.environ['ONIT_DOCUMENTS_PATH'] = docs_path
 
-    # Check if servers are already running by probing the first enabled server port
-    servers = config_data.get('mcp', {}).get('servers', [])
-    already_running = True
-    for s in servers:
-        if s.get('enabled', True) and s.get('url'):
-            parsed = urlparse(s['url'])
-            host = parsed.hostname or '127.0.0.1'
-            port = parsed.port or 80
-            if not _is_port_open(host, port, timeout=0.3):
-                already_running = False
-                break
-
-    if already_running and servers:
-        return
-
-    # Start MCP servers in a daemon thread
-    mcp_thread = threading.Thread(
-        target=_start_mcp_servers_background,
-        args=(log_level,),
-        daemon=True,
-    )
-    mcp_thread.start()
-
-    # Wait for all servers to be reachable
-    if not _mcp_servers_ready(config_data, timeout=15.0):
-        print("Warning: some MCP servers may not have started in time.",
-              file=sys.stderr)
+def _print_probe_report(report: dict) -> None:
+    """Print a human- and machine-readable probe summary."""
+    print(json.dumps(report, indent=2))
 
 
 def main():
@@ -375,6 +317,18 @@ def main():
     parser.add_argument('--mcp-sse', type=str, action='append', default=None,
                         help='URL of an external MCP tools server using SSE transport (can be repeated). '
                              'Example: --mcp-sse http://localhost:8080/sse')
+    parser.add_argument('--probe', action='store_true', default=False,
+                        help='Run a one-shot connectivity and tool discovery probe, print JSON, and exit.')
+    parser.add_argument('--introspection', action='store_true', default=None,
+                        help='Enable the external introspection HTTP server.')
+    parser.add_argument('--introspection-host', type=str, default=None,
+                        help='Host for the introspection HTTP server (default: 127.0.0.1).')
+    parser.add_argument('--introspection-port', type=int, default=None,
+                        help='Port for the introspection HTTP server (default: 9100).')
+    parser.add_argument('--trace-dir', type=str, default=None,
+                        help='Directory where observability trace JSONL files are stored.')
+    parser.add_argument('--trace-max-events', type=int, default=None,
+                        help='Maximum number of in-memory trace events retained for introspection.')
     args = parser.parse_args()
 
     # Client mode: send task to remote A2A server and exit
@@ -461,6 +415,18 @@ def main():
                 'url': url,
                 'enabled': True,
             })
+
+    observability = config_data.setdefault('observability', {})
+    if args.introspection is not None:
+        observability['introspection'] = args.introspection
+    if args.introspection_host:
+        observability['host'] = args.introspection_host
+    if args.introspection_port is not None:
+        observability['port'] = args.introspection_port
+    if args.trace_dir:
+        observability['trace_dir'] = args.trace_dir
+    if args.trace_max_events is not None:
+        observability['max_events'] = args.trace_max_events
 
     # Check that essential environment variables are set
     serving = config_data.get('serving', {})
@@ -553,6 +519,9 @@ def main():
     )
 
     onit = OnIt(config=config_data)
+    if args.probe:
+        _print_probe_report(onit.get_probe_report())
+        return
     if config_data.get('gateway'):
         onit.run_gateway_sync()
     else:

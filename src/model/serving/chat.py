@@ -24,11 +24,52 @@ import os
 import json
 import re
 import tempfile
+import time
 import uuid
 from openai import AsyncOpenAI, OpenAIError, APITimeoutError
 from typing import List, Optional, Any
 
+from ...lib.spatial_memory import MOTION_TOOL_NAMES, SpatialMemory
+
 logger = logging.getLogger(__name__)
+
+
+def _tool_call_succeeded(tool_response: str) -> bool:
+    if not tool_response:
+        return False
+    if tool_response.startswith("Error:") or "timed out" in tool_response.lower():
+        return False
+    payload = None
+    try:
+        payload = json.loads(tool_response)
+    except Exception:
+        return True
+    if isinstance(payload, dict) and payload.get("error"):
+        return False
+    status = str(payload.get("status", "")).lower() if isinstance(payload, dict) else ""
+    return status not in {"failed", "error", "cancelled", "canceled", "aborted"}
+
+
+async def _refresh_pose_after_motion(tool_registry,
+                                     timeout: int | None,
+                                     session_id: str | None,
+                                     task_id: str | None,
+                                     spatial_memory: SpatialMemory | None) -> None:
+    if spatial_memory is None or tool_registry is None or "get_robot_pose" not in getattr(tool_registry, "tools", set()):
+        return
+    pose_handler = tool_registry["get_robot_pose"]
+    pose_timeout = min(timeout or 10, 10)
+    pose_kwargs = {
+        "_session_id": session_id,
+        "_task_id": task_id,
+        "_operation_id": f"mcp_{uuid.uuid4().hex[:12]}",
+    }
+    try:
+        pose_response = await asyncio.wait_for(pose_handler(**pose_kwargs), timeout=pose_timeout)
+    except Exception:
+        return
+    pose_text = "" if pose_response is None else str(pose_response)
+    spatial_memory.observe("get_robot_pose", {}, pose_text)
 
 
 def _resolve_api_key(host: str, host_key: str = "EMPTY") -> str:
@@ -263,6 +304,106 @@ def _extract_base64_file(tool_response: str, data_path: str) -> str:
     return json.dumps(data)
 
 
+async def _execute_tool_call(function_name: str,
+                             function_arguments: dict,
+                             tool_call_id: str,
+                             tool_registry,
+                             timeout: int | None,
+                             data_path: str,
+                             chat_ui,
+                             verbose: bool,
+                             trace_recorder,
+                             session_id: str | None,
+                             task_id: str | None,
+                             spatial_memory: SpatialMemory | None = None) -> dict:
+    if trace_recorder:
+        trace_recorder.record(
+            "agent.tool_decision",
+            session_id=session_id,
+            task_id=task_id,
+            tool_name=function_name,
+            arguments=function_arguments,
+            timeout_seconds=timeout,
+        )
+
+    if chat_ui:
+        chat_ui.add_log(f"Calling: {function_name}({function_arguments})", level="info")
+        chat_ui.render()
+    elif verbose:
+        print(f"{function_name}({function_arguments})")
+
+    if not tool_registry or function_name not in tool_registry.tools:
+        return {
+            'role': 'tool',
+            'content': f'Error: tool {function_name} not found',
+            'name': function_name,
+            'parameters': function_arguments,
+            'tool_call_id': tool_call_id,
+        }
+
+    try:
+        tool_handler = tool_registry[function_name]
+        call_kwargs = dict(function_arguments)
+        call_kwargs['_session_id'] = session_id
+        call_kwargs['_task_id'] = task_id
+        call_kwargs['_operation_id'] = f"mcp_{uuid.uuid4().hex[:12]}"
+        try:
+            tool_response = await asyncio.wait_for(
+                tool_handler(**call_kwargs),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            tool_response = (
+                f"- tool call timed out after {timeout} seconds. Tool might have succeeded "
+                "but no response was received. Check expected output."
+            )
+            if chat_ui:
+                chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
+            elif verbose:
+                print(f"{function_name} timed out after {timeout}s")
+        tool_response = "" if tool_response is None else str(tool_response)
+        if data_path and "file_data_base64" in tool_response:
+            tool_response = _extract_base64_file(tool_response, data_path)
+        if spatial_memory:
+            spatial_update = spatial_memory.observe(function_name, function_arguments, tool_response)
+            if spatial_update:
+                tool_response = f"{tool_response}\n\n{spatial_update}"
+        if function_name in MOTION_TOOL_NAMES and _tool_call_succeeded(tool_response):
+            await _refresh_pose_after_motion(
+                tool_registry=tool_registry,
+                timeout=timeout,
+                session_id=session_id,
+                task_id=task_id,
+                spatial_memory=spatial_memory,
+            )
+
+        truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
+        if chat_ui:
+            chat_ui.add_log(f"{function_name}({function_arguments}) returned: {truncated}", level="debug")
+        elif verbose:
+            print(f"{function_name}({function_arguments}) returned: {truncated}")
+
+        return {
+            'role': 'tool',
+            'content': tool_response,
+            'name': function_name,
+            'parameters': function_arguments,
+            'tool_call_id': tool_call_id,
+        }
+    except Exception as e:
+        if chat_ui:
+            chat_ui.add_log(f"{function_name}({function_arguments}) error: {e}", level="error")
+        elif verbose:
+            print(f"{function_name}({function_arguments}) encountered an error: {e}")
+        return {
+            'role': 'tool',
+            'content': f'Error: {e}',
+            'name': function_name,
+            'parameters': function_arguments,
+            'tool_call_id': tool_call_id,
+        }
+
+
 async def chat(host: str = "http://127.0.0.1:8001/v1",
          host_key: str = "EMPTY",
          model: str = "Qwen/Qwen3-8B",
@@ -283,6 +424,15 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     max_tokens = kwargs.get('max_tokens', 8192)
     memories = kwargs.get('memories', None)
     prompt_intro = kwargs.get('prompt_intro', "I am a helpful AI assistant. My name is OnIt.")
+    trace_recorder = kwargs.get('trace_recorder')
+    session_id = kwargs.get('session_id')
+    task_id = kwargs.get('task_id')
+    spatial_memory = SpatialMemory(
+        data_path=data_path,
+        trace_recorder=trace_recorder,
+        session_id=session_id,
+        task_id=task_id,
+    ) if data_path else None
 
     images_bytes = []
     if isinstance(images, list):
@@ -373,6 +523,8 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 logger.warning("Safety queue triggered before API call, exiting chat loop.")
                 return None
 
+            llm_started = time.monotonic()
+
             completion_kwargs = dict(
                 model=model,
                 messages=messages,
@@ -394,7 +546,38 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             if non_vlm_mode:
                 _strip_image_content(messages)
 
+            llm_operation_id = f"llm_{uuid.uuid4().hex[:12]}"
+            if trace_recorder:
+                trace_recorder.summarize_llm_request(
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=llm_operation_id,
+                    model=model,
+                    host=host,
+                    iteration=iteration_count,
+                    messages=messages,
+                    tool_count=len(tools),
+                )
+
             chat_completion = await client.chat.completions.create(**completion_kwargs)
+            llm_latency_ms = (time.monotonic() - llm_started) * 1000
+
+            response_message = chat_completion.choices[0].message
+            response_preview = response_message.content if isinstance(response_message.content, str) else None
+            finish_reason = getattr(chat_completion.choices[0], 'finish_reason', None)
+            response_tool_calls = response_message.tool_calls or []
+            if trace_recorder:
+                trace_recorder.summarize_llm_response(
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=llm_operation_id,
+                    model=model,
+                    iteration=iteration_count,
+                    latency_ms=llm_latency_ms,
+                    finish_reason=finish_reason,
+                    content_preview=response_preview,
+                    tool_call_count=len(response_tool_calls),
+                )
 
             await asyncio.sleep(0.1)
             if not safety_queue.empty():
@@ -403,6 +586,16 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
         except APITimeoutError as e:
             error_message = f"Request to {host} timed out after {timeout} seconds."
             logger.error(error_message)
+            if trace_recorder:
+                trace_recorder.summarize_llm_error(
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=llm_operation_id if 'llm_operation_id' in locals() else None,
+                    model=model,
+                    iteration=iteration_count,
+                    latency_ms=(time.monotonic() - llm_started) * 1000 if 'llm_started' in locals() else None,
+                    error=error_message,
+                )
             if chat_ui:
                 chat_ui.add_log(error_message, level="error")
             elif verbose:
@@ -463,6 +656,16 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 continue  # retry without images
             error_message = f"Error communicating with {host}: {e}."
             logger.error(error_message)
+            if trace_recorder:
+                trace_recorder.summarize_llm_error(
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=llm_operation_id if 'llm_operation_id' in locals() else None,
+                    model=model,
+                    iteration=iteration_count,
+                    latency_ms=(time.monotonic() - llm_started) * 1000 if 'llm_started' in locals() else None,
+                    error=error_message,
+                )
             if chat_ui:
                 chat_ui.add_log(error_message, level="warning")
             elif verbose:
@@ -473,6 +676,16 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
         except Exception as e:
             error_message = f"Unexpected error: {e}"
             logger.error(error_message)
+            if trace_recorder:
+                trace_recorder.summarize_llm_error(
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=llm_operation_id if 'llm_operation_id' in locals() else None,
+                    model=model,
+                    iteration=iteration_count,
+                    latency_ms=(time.monotonic() - llm_started) * 1000 if 'llm_started' in locals() else None,
+                    error=error_message,
+                )
             if chat_ui:
                 chat_ui.add_log(error_message, level="error")
             elif verbose:
@@ -490,49 +703,22 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 function_name = raw_tool["name"]
                 function_arguments = raw_tool["arguments"]
                 synthetic_id = f"call_{uuid.uuid4().hex[:24]}"
-                if chat_ui:
-                    chat_ui.add_log(f"Calling: {function_name}({function_arguments})", level="info")
-                    chat_ui.render()
-                elif verbose:
-                    print(f"{function_name}({function_arguments})")
                 messages.append({"role": "assistant", "content": last_response})
-                for tool_name in tool_registry.tools:
-                    if tool_name == function_name:
-                        try:
-                            tool_handler = tool_registry[tool_name]
-                            try:
-                                tool_response = await asyncio.wait_for(
-                                    tool_handler(**function_arguments),
-                                    timeout=timeout,
-                                )
-                            except asyncio.TimeoutError:
-                                tool_response = f"- tool call timed out after {timeout} seconds. Tool might have succeeded but no response was received. Check expected output."
-                                if chat_ui:
-                                    chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
-                                elif verbose:
-                                    print(f"{function_name} timed out after {timeout}s")
-                            tool_response = "" if tool_response is None else str(tool_response)
-                            if data_path and "file_data_base64" in tool_response:
-                                tool_response = _extract_base64_file(tool_response, data_path)
-                            tool_message = {'role': 'tool', 'content': tool_response, 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
-                            messages.append(tool_message)
-                            truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
-                            if chat_ui:
-                                chat_ui.add_log(f"{function_name}({function_arguments}) returned: {truncated}", level="debug")
-                            elif verbose:
-                                print(f"{function_name}({function_arguments}) returned: {truncated}")
-                        except Exception as e:
-                            if chat_ui:
-                                chat_ui.add_log(f"{function_name}({function_arguments}) error: {e}", level="error")
-                            elif verbose:
-                                print(f"{function_name}({function_arguments}) encountered an error: {e}")
-                            tool_message = {'role': 'tool', 'content': f'Error: {e}', 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
-                            messages.append(tool_message)
-                        break
-                else:
-                    # Tool not found in registry
-                    tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found', 'name': function_name, 'parameters': function_arguments, "tool_call_id": synthetic_id}
-                    messages.append(tool_message)
+                tool_message = await _execute_tool_call(
+                    function_name=function_name,
+                    function_arguments=function_arguments,
+                    tool_call_id=synthetic_id,
+                    tool_registry=tool_registry,
+                    timeout=timeout,
+                    data_path=data_path,
+                    chat_ui=chat_ui,
+                    verbose=verbose,
+                    trace_recorder=trace_recorder,
+                    session_id=session_id,
+                    task_id=task_id,
+                    spatial_memory=spatial_memory,
+                )
+                messages.append(tool_message)
                 # Check for repeated tool calls
                 call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
                 tool_call_history.append(call_key)
@@ -570,49 +756,21 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 return None
             function_name = tool.function.name
             function_arguments = json.loads(tool.function.arguments)
-            if chat_ui:
-                chat_ui.add_log(f"Calling: {function_name}({function_arguments})", level="info")
-                chat_ui.render()
-            elif verbose:
-                print(f"{function_name}({function_arguments})")
-            # Ensure the function is available, and then call it
-            # FIXME: Possible that 2 or more tools have the same name?
-            for tool_name in tool_registry.tools:
-                if tool_name == function_name:
-                    try:
-                        tool_handler = tool_registry[tool_name]
-                        try:
-                            tool_response = await asyncio.wait_for(
-                                tool_handler(**function_arguments),
-                                timeout=timeout,
-                            )
-                        except asyncio.TimeoutError:
-                            tool_response = f"- tool call timed out after {timeout} seconds. Tool might have succeeded but no response was received. Check expected output."
-                            if chat_ui:
-                                chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
-                        tool_response = "" if tool_response is None else str(tool_response)
-                        # Extract base64 file data from tool response and save to disk
-                        if data_path and "file_data_base64" in tool_response:
-                            tool_response = _extract_base64_file(tool_response, data_path)
-                        tool_message = {'role': 'tool', 'content': tool_response, 'name': tool.function.name, 'parameters': function_arguments, "tool_call_id": tool.id,}
-                        messages.append(tool_message)
-
-                        # Log tool response (truncated for display)
-                        truncated_response = tool_response[:200] + "..." if len(tool_response) > 200 else tool_response
-                        if chat_ui:
-                            chat_ui.add_log(f"{function_name}({function_arguments}) returned: {truncated_response}", level="debug")
-                    except Exception as e:
-                        if chat_ui:
-                            chat_ui.add_log(f"{tool_name} error: {e}", level="error")
-                        elif verbose:
-                            print(f"{tool_name} encountered an error: {e}")
-                        tool_message = {'role': 'tool', 'content': f'Error: {e}', 'name': tool.function.name, 'parameters': function_arguments, "tool_call_id": tool.id}
-                        messages.append(tool_message)
-                    break
-            else:
-                # Tool not found in registry
-                tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found', 'name': function_name, 'parameters': function_arguments, "tool_call_id": tool.id}
-                messages.append(tool_message)
+            tool_message = await _execute_tool_call(
+                function_name=function_name,
+                function_arguments=function_arguments,
+                tool_call_id=tool.id,
+                tool_registry=tool_registry,
+                timeout=timeout,
+                data_path=data_path,
+                chat_ui=chat_ui,
+                verbose=verbose,
+                trace_recorder=trace_recorder,
+                session_id=session_id,
+                task_id=task_id,
+                spatial_memory=spatial_memory,
+            )
+            messages.append(tool_message)
             # Check for repeated tool calls
             call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
             tool_call_history.append(call_key)

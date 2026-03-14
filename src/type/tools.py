@@ -25,6 +25,7 @@ import uuid
 import base64
 import wave
 import random
+import time
 from fastmcp import Client
 from abc import ABC, abstractmethod
 from mcp.types import ImageContent, TextContent, AudioContent
@@ -50,6 +51,7 @@ class RequestHandler(ABC):
         self.url = url
         self.tool_item = tool_item
         self.kwargs = kwargs
+        self.observer = kwargs.get('observer')
 
     @abstractmethod
     async def __call__(self, **kwargs: dict) -> str:
@@ -57,6 +59,9 @@ class RequestHandler(ABC):
 
     def get_tool(self) -> dict:
         return self.tool_item
+
+    def set_observer(self, observer) -> None:
+        self.observer = observer
     
     
 class ToolHandler(RequestHandler):
@@ -67,6 +72,21 @@ class ToolHandler(RequestHandler):
         super().__init__(url=url, tool_item=tool_item, **kwargs)
 
     async def __call__(self, **kwargs: dict) -> str:
+        start_time = time.monotonic()
+        tool_name = self.tool_item['function']['name'] if self.tool_item else 'unknown'
+        session_id = kwargs.pop('_session_id', None)
+        task_id = kwargs.pop('_task_id', None)
+        operation_id = kwargs.pop('_operation_id', f"mcp_{uuid.uuid4().hex[:12]}")
+        if self.observer:
+            self.observer.record(
+                'mcp.request',
+                session_id=session_id,
+                task_id=task_id,
+                operation_id=operation_id,
+                tool_name=tool_name,
+                url=self.url,
+                arguments=kwargs,
+            )
         # if there is an image in the kwargs, convert it to base64
         media_types = ['images', 'audios']
         for media_type in media_types:
@@ -109,9 +129,36 @@ class ToolHandler(RequestHandler):
         async with Client(self.url) as client:
             keys_kwargs = list(kwargs.keys())
             logger.info(f"Calling tool: {self.tool_item['function']['name']} with arguments: {keys_kwargs}")
-            tool_response = await client.call_tool(self.tool_item['function']['name'], kwargs)
+            try:
+                tool_response = await client.call_tool(self.tool_item['function']['name'], kwargs)
+            except Exception as exc:
+                if self.observer:
+                    self.observer.record(
+                        'mcp.error',
+                        session_id=session_id,
+                        task_id=task_id,
+                        operation_id=operation_id,
+                        tool_name=tool_name,
+                        url=self.url,
+                        arguments=kwargs,
+                        latency_ms=round((time.monotonic() - start_time) * 1000, 2),
+                        error=str(exc),
+                    )
+                raise
         
         if isinstance(tool_response, str):
+            if self.observer:
+                self.observer.record(
+                    'mcp.response',
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=operation_id,
+                    tool_name=tool_name,
+                    url=self.url,
+                    latency_ms=round((time.monotonic() - start_time) * 1000, 2),
+                    result_type='string',
+                    result_preview=tool_response,
+                )
             return tool_response
 
         content = tool_response.content
@@ -124,9 +171,34 @@ class ToolHandler(RequestHandler):
             # content.data is already a base64 string; content.mimeType carries
             # the correct type (e.g. "image/jpeg") set by the MCP server.
             mime = content.mimeType or "image/jpeg"
-            return f"data:{mime};base64,{content.data}"
+            response = f"data:{mime};base64,{content.data}"
+            if self.observer:
+                self.observer.record(
+                    'mcp.response',
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=operation_id,
+                    tool_name=tool_name,
+                    url=self.url,
+                    latency_ms=round((time.monotonic() - start_time) * 1000, 2),
+                    result_type='image',
+                    result_preview=response[:200],
+                )
+            return response
         elif isinstance(content, TextContent):
             # if content is TextContent, return the text
+            if self.observer:
+                self.observer.record(
+                    'mcp.response',
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=operation_id,
+                    tool_name=tool_name,
+                    url=self.url,
+                    latency_ms=round((time.monotonic() - start_time) * 1000, 2),
+                    result_type='text',
+                    result_preview=content.text,
+                )
             return content.text
         elif isinstance(content, AudioContent):
             # if content is AudioContent, return the audio data
@@ -153,18 +225,60 @@ class ToolHandler(RequestHandler):
                 wf.setsampwidth(2)
                 wf.setframerate(16000)
                 wf.writeframes(audio_data)
-            return f"{default_audio}"
+            response = f"{default_audio}"
+            if self.observer:
+                self.observer.record(
+                    'mcp.response',
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=operation_id,
+                    tool_name=tool_name,
+                    url=self.url,
+                    latency_ms=round((time.monotonic() - start_time) * 1000, 2),
+                    result_type='audio',
+                    result_preview=response,
+                )
+            return response
 
-        return "Undefined content type returned from the tool."
+        response = "Undefined content type returned from the tool."
+        if self.observer:
+            self.observer.record(
+                'mcp.response',
+                session_id=session_id,
+                task_id=task_id,
+                operation_id=operation_id,
+                tool_name=tool_name,
+                url=self.url,
+                latency_ms=round((time.monotonic() - start_time) * 1000, 2),
+                result_type='unknown',
+                result_preview=response,
+            )
+        return response
 
 class A2AToolHandler(RequestHandler):
     """Calls a remote OnIt A2A server as if it were a local tool."""
 
     async def __call__(self, **kwargs) -> str:
         import httpx
+        start_time = time.monotonic()
         task = kwargs.get('task', '')
+        session_id = kwargs.pop('_session_id', None)
+        task_id = kwargs.pop('_task_id', None)
+        operation_id = kwargs.pop('_operation_id', f"mcp_{uuid.uuid4().hex[:12]}")
+        tool_name = self.tool_item['function']['name'] if self.tool_item else 'unknown'
         if not task:
             return json.dumps({"error": "'task' argument is required"})
+        if self.observer:
+            self.observer.record(
+                'mcp.request',
+                session_id=session_id,
+                task_id=task_id,
+                operation_id=operation_id,
+                tool_name=tool_name,
+                url=self.url,
+                arguments={'task': task},
+                transport='a2a',
+            )
         parts = [{"kind": "text", "text": task}]
         payload = {
             "jsonrpc": "2.0",
@@ -184,6 +298,18 @@ class A2AToolHandler(RequestHandler):
                 resp.raise_for_status()
             data = resp.json()
         except Exception as e:
+            if self.observer:
+                self.observer.record(
+                    'mcp.error',
+                    session_id=session_id,
+                    task_id=task_id,
+                    operation_id=operation_id,
+                    tool_name=tool_name,
+                    url=self.url,
+                    latency_ms=round((time.monotonic() - start_time) * 1000, 2),
+                    error=str(e),
+                    transport='a2a',
+                )
             return json.dumps({"error": f"A2A call failed: {e}"})
 
         error = data.get("error")
@@ -212,7 +338,21 @@ class A2AToolHandler(RequestHandler):
                 if part.get("kind") == "text":
                     text = part["text"]
                     break
-        return text if text else json.dumps(result)
+        response = text if text else json.dumps(result)
+        if self.observer:
+            self.observer.record(
+                'mcp.response',
+                session_id=session_id,
+                task_id=task_id,
+                operation_id=operation_id,
+                tool_name=tool_name,
+                url=self.url,
+                latency_ms=round((time.monotonic() - start_time) * 1000, 2),
+                result_type='a2a',
+                result_preview=response,
+                transport='a2a',
+            )
+        return response
 
 
 # create a tool registry
@@ -221,6 +361,7 @@ class ToolRegistry:
         self.tools = set()
         self.urls = {}
         self.handlers = {}
+        self.observer = None
 
     def register(self, tool: ToolHandler):
         # many need to modify to support one to many tools
@@ -236,6 +377,13 @@ class ToolRegistry:
         
         key = f"{tool_name}@{tool_url}"
         self.handlers[key] = tool
+        if self.observer:
+            tool.set_observer(self.observer)
+
+    def set_observer(self, observer) -> None:
+        self.observer = observer
+        for handler in self.handlers.values():
+            handler.set_observer(observer)
         
     def get_url(self, tool_name: str):
         """Get a random URL for the tool"""
