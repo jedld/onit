@@ -506,9 +506,24 @@ class OnIt(BaseModel):
         self._setup_file_server_url()
         self._setup_config_fields()
 
+    _DEFAULT_MCP_SERVERS = [
+        {
+            'name': 'PromptsMCPServer',
+            'description': 'Provides prompt templates for instruction generation',
+            'url': 'http://127.0.0.1:18200/sse',
+            'enabled': True,
+        },
+        {
+            'name': 'ToolsMCPServer',
+            'description': 'Web search, bash commands, file operations, and document tools',
+            'url': 'http://127.0.0.1:18201/sse',
+            'enabled': True,
+        },
+    ]
+
     def _setup_mcp_servers(self) -> None:
         """Parse MCP server list from config and resolve the prompts server URL."""
-        self.mcp_servers = self.config_data['mcp']['servers'] if 'mcp' in self.config_data and 'servers' in self.config_data['mcp'] else []
+        self.mcp_servers = self.config_data['mcp']['servers'] if 'mcp' in self.config_data and 'servers' in self.config_data['mcp'] else list(self._DEFAULT_MCP_SERVERS)
         # Override MCP server URL hosts if mcp_host is configured
         mcp_host = self.config_data.get('mcp', {}).get('mcp_host')
         if mcp_host:
