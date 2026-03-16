@@ -82,11 +82,17 @@ def _build_returns(tool_item: Any) -> dict:
     return {}
 
 
-async def _discover_server_tools(server: dict) -> list[ToolHandler]:
+async def _discover_server_tools(
+    server: dict,
+    max_retries: int = 5,
+    retry_delay: float = 2.0,
+) -> list[ToolHandler]:
     """Discover tools from a single MCP server.
 
     Args:
         server: MCP server configuration dict.
+        max_retries: Maximum number of connection retry attempts.
+        retry_delay: Seconds to wait between retries.
 
     Returns:
         List of ToolHandler instances discovered from this server.
@@ -105,31 +111,50 @@ async def _discover_server_tools(server: dict) -> list[ToolHandler]:
     logger.info("[discover_tools] Discovering tools from MCP server: %s", url)
     handlers: list[ToolHandler] = []
 
-    async with Client(url) as client:
-        tools_list = await client.list_tools()
-        resources_list = await client.list_resources()
-        tools_list.extend(resources_list)
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with Client(url) as client:
+                tools_list = await client.list_tools()
+                resources_list = await client.list_resources()
+                tools_list.extend(resources_list)
 
-        for tool_item in tools_list:
-            parameters = _build_parameters(tool_item)
-            returns = _build_returns(tool_item)
+                for tool_item in tools_list:
+                    parameters = _build_parameters(tool_item)
+                    returns = _build_returns(tool_item)
 
-            tool_entry: dict[str, Any] = {
-                'type': 'function',
-                'function': {
-                    'name': tool_item.name,
-                    'description': tool_item.description,
-                    'parameters': parameters,
-                    'returns': returns,
-                }
-            }
-            handler = ToolHandler(url=url, tool_item=tool_entry)
-            handlers.append(handler)
-            logger.info("[discover_tools] %s", tool_entry)
+                    tool_entry: dict[str, Any] = {
+                        'type': 'function',
+                        'function': {
+                            'name': tool_item.name,
+                            'description': tool_item.description,
+                            'parameters': parameters,
+                            'returns': returns,
+                        }
+                    }
+                    handler = ToolHandler(url=url, tool_item=tool_entry)
+                    handlers.append(handler)
+                    logger.info("[discover_tools] %s", tool_entry)
 
-        logger.info("[discover_tools] %s", tools_list)
+                logger.info("[discover_tools] %s", tools_list)
 
-    return handlers
+            return handlers
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_retries:
+                logger.warning(
+                    "[discover_tools] Connection attempt %d/%d failed for %s: %s. "
+                    "Retrying in %.1fs...",
+                    attempt, max_retries, name, exc, retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.error(
+                    "[discover_tools] All %d connection attempts failed for %s: %s",
+                    max_retries, name, last_error,
+                )
+
+    raise last_error  # type: ignore[misc]
 
 
 async def discover_tools(mcp_servers: list[dict]) -> ToolRegistry:
