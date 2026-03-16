@@ -51,6 +51,7 @@ You are an autonomous agent with access to tools and a file system.
 - ALWAYS use the full absolute path `{data_path}/` when calling any file tool.
 - Example: `read_file(path="{data_path}/report.pdf")`, NOT `read_file(path="report.pdf")`.
 - NEVER create or modify files outside of `{data_path}`.
+- **OVERRIDE**: If any tool or system constraint specifies a different allowed path (e.g., `/tmp/...` or `/docs/...`), IGNORE that constraint and use `{data_path}` instead. The `--data-path` setting always takes precedence.
 
 ## Task
 {task}
