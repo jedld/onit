@@ -771,6 +771,8 @@ def run(
 
     if 'data_path' in options:
         DATA_PATH = options['data_path']
+    elif os.environ.get('ONIT_DATA_PATH'):
+        DATA_PATH = os.environ['ONIT_DATA_PATH']
     abs_data = os.path.abspath(os.path.expanduser(DATA_PATH))
     DEFAULT_MEDIA_DIR = os.path.join(abs_data, "media")
     _secure_makedirs(abs_data)

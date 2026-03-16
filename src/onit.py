@@ -202,7 +202,11 @@ class OnItA2AExecutor(AgentExecutor):
             if not os.path.exists(session_path):
                 with open(session_path, "w", encoding="utf-8") as f:
                     f.write("")
-            data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / session_id)
+            configured_data_path = self.onit.config_data.get('data_path')
+            if configured_data_path:
+                data_path = str(Path(configured_data_path).expanduser().resolve())
+            else:
+                data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / session_id)
             os.makedirs(data_path, exist_ok=True)
             self._sessions[key] = {
                 "session_id": session_id,
@@ -551,7 +555,11 @@ class OnIt(BaseModel):
         if not os.path.exists(self.session_path):
             with open(self.session_path, "w", encoding="utf-8") as f:
                 f.write("")
-        self.data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / self.session_id)
+        configured_data_path = self.config_data.get('data_path')
+        if configured_data_path:
+            self.data_path = str(Path(configured_data_path).expanduser().resolve())
+        else:
+            self.data_path = str(Path(tempfile.gettempdir()) / "onit" / "data" / self.session_id)
         os.makedirs(self.data_path, exist_ok=True)
 
     def _setup_file_server_url(self) -> None:

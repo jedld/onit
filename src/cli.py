@@ -21,6 +21,7 @@ import socket
 import sys
 import time
 import threading
+from pathlib import Path
 
 import requests
 import yaml
@@ -414,7 +415,10 @@ def _ensure_mcp_servers(config_data: dict, log_level='ERROR'):
     """Start MCP servers if they are not already running, then wait for readiness."""
     from urllib.parse import urlparse
 
-    # Propagate documents_path to MCP servers via environment variable
+    # Propagate data_path and documents_path to MCP servers via environment variables
+    data_path = config_data.get('data_path', '')
+    if data_path:
+        os.environ['ONIT_DATA_PATH'] = str(Path(data_path).expanduser().resolve())
     docs_path = config_data.get('documents_path', '')
     if docs_path:
         os.environ['ONIT_DOCUMENTS_PATH'] = docs_path
@@ -489,6 +493,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help='Request timeout in seconds (-1 for no timeout).')
     parser.add_argument('--template-path', type=str, default=None,
                         help='Path to custom prompt template YAML file.')
+    parser.add_argument('--data-path', type=str, default=None,
+                        help='Override the working data directory path for file operations (default: system temp dir).')
     parser.add_argument('--documents-path', type=str, default=None,
                         help='Path to local documents directory. The model will search here before the web.')
     parser.add_argument('--topic', type=str, default=None,
@@ -595,6 +601,7 @@ def _parse_and_resolve_config(args: argparse.Namespace) -> dict:
         'show_logs': 'show_logs',
         'web': 'web',
         'web_port': 'web_port',
+        'data_path': 'data_path',
         'template_path': 'template_path',
         'documents_path': 'documents_path',
         'topic': 'topic',

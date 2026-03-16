@@ -355,6 +355,8 @@ def run(
 
     if 'data_path' in options:
         DATA_PATH = options['data_path']
+    elif os.environ.get('ONIT_DATA_PATH'):
+        DATA_PATH = os.environ['ONIT_DATA_PATH']
     _secure_makedirs(os.path.abspath(os.path.expanduser(DATA_PATH)))
 
     logger.info(f"Starting Document Search MCP Server at {host}:{port}{path}")

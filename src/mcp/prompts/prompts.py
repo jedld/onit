@@ -100,20 +100,27 @@ Search the web for additional information **if and only if** above documents are
    # Add sandbox routing instructions when sandbox tools are available
    if sandbox_available and str(sandbox_available).lower() not in ("false", "null", "none", "0", ""):
       instruction += f"""
-## Code Execution (IMPORTANT)
+## Code Execution (IMPORTANT — Sandbox First)
 Sandbox tools (`install_packages` and `run_code`) are available for running code and installing packages.
 When the task requires writing and running code (scripts, simulations, data analysis, software projects):
-1. Write code files using `write_file` to `{data_path}/`.
-2. Install any needed Python packages using `install_packages(packages="numpy matplotlib")`.
-3. Run code using `run_code(command="python main.py")`.
-4. Read output files or check results using `read_file(path="{data_path}/output.txt")`.
-5. **NEVER use `bash` for ANY code execution, package management, or Python-related commands.** This includes running scripts, installing packages, checking installed packages (e.g. `pip list`, `pip show`), running `python` commands, or any other operation that should happen in the sandbox. The `bash` tool runs on the host system, NOT in the sandbox — always use `run_code` and `install_packages` instead.
+
+**CRITICAL — Always develop and test in the sandbox FIRST, then transfer to local:**
+1. Install any needed Python packages using `install_packages(packages="numpy matplotlib")`.
+2. Write and create code files **inside the sandbox** using `run_code`. Use heredoc or echo to create files:
+   `run_code(command="cat > main.py << 'PYEOF'\\nimport numpy as np\\nprint('hello')\\nPYEOF")`.
+3. Run and test code in the sandbox: `run_code(command="python main.py")`.
+4. Iterate — fix bugs and re-test inside the sandbox until the code works correctly.
+5. **Only after the code is working**, transfer final files to the local filesystem using `write_file(path="{data_path}/main.py")`.
+6. Read output files or check results using `read_file(path="{data_path}/output.txt")`.
+
+**DO NOT use `write_file` as your first step for code development.** The sandbox is your development environment — write, test, and debug there first. Use `write_file` only to save the final, tested version to the local filesystem.
+
+7. **NEVER use `bash` for ANY code execution, package management, or Python-related commands.** This includes running scripts, installing packages, checking installed packages (e.g. `pip list`, `pip show`), running `python` commands, or any other operation that should happen in the sandbox. The `bash` tool runs on the host system, NOT in the sandbox — always use `run_code` and `install_packages` instead.
 
 **CRITICAL — `run_code` path rules:**
 - `run_code` executes inside a separate sandbox environment where your files are at the working directory root.
 - Use **relative paths only** in `run_code` commands: `run_code(command="python main.py")`, NOT `run_code(command="python {data_path}/main.py")`.
 - NEVER pass `{data_path}/...` absolute paths inside `run_code` commands — they will not resolve inside the sandbox.
-- Files created by `write_file(path="{data_path}/main.py")` are automatically available as `main.py` inside `run_code`.
 - Output files from `run_code` (e.g., `results.csv`) are available at `{data_path}/results.csv` via `read_file`.
 """
 
