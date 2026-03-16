@@ -369,10 +369,18 @@ def _is_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
         return False
 
 
+def _is_external_server(server: dict) -> bool:
+    """Return True if the server was added via --mcp-sse or --mcp-server."""
+    name = server.get('name', '')
+    return name.startswith('ExternalSSE_') or name.startswith('ExternalMCP_')
+
+
 def _mcp_servers_ready(config_data: dict, timeout: float = 15.0) -> bool:
-    """Wait for all enabled MCP servers to be reachable.
+    """Wait for all locally-managed MCP servers to be reachable.
 
     Parses the agent config's mcp.servers list and checks each URL's port.
+    External servers (added via --mcp-sse/--mcp-server) are excluded since
+    they are not managed by this process.
     Returns True if all servers respond within timeout, False otherwise.
     """
     from urllib.parse import urlparse
@@ -380,6 +388,8 @@ def _mcp_servers_ready(config_data: dict, timeout: float = 15.0) -> bool:
     servers = config_data.get('mcp', {}).get('servers', [])
     endpoints = []
     for s in servers:
+        if _is_external_server(s):
+            continue
         if s.get('enabled', True) and s.get('url'):
             parsed = urlparse(s['url'])
             host = parsed.hostname or '127.0.0.1'
@@ -423,10 +433,11 @@ def _ensure_mcp_servers(config_data: dict, log_level='ERROR'):
     if docs_path:
         os.environ['ONIT_DOCUMENTS_PATH'] = docs_path
 
-    # Check if servers are already running by probing the first enabled server port
+    # Check if locally-managed servers are already running (skip external ones)
     servers = config_data.get('mcp', {}).get('servers', [])
+    local_servers = [s for s in servers if not _is_external_server(s)]
     already_running = True
-    for s in servers:
+    for s in local_servers:
         if s.get('enabled', True) and s.get('url'):
             parsed = urlparse(s['url'])
             host = parsed.hostname or '127.0.0.1'
@@ -435,7 +446,7 @@ def _ensure_mcp_servers(config_data: dict, log_level='ERROR'):
                 already_running = False
                 break
 
-    if already_running and servers:
+    if already_running and local_servers:
         return
 
     # Start MCP servers in a daemon thread
