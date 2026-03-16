@@ -523,7 +523,12 @@ class OnIt(BaseModel):
 
     def _setup_mcp_servers(self) -> None:
         """Parse MCP server list from config and resolve the prompts server URL."""
-        self.mcp_servers = self.config_data['mcp']['servers'] if 'mcp' in self.config_data and 'servers' in self.config_data['mcp'] else list(self._DEFAULT_MCP_SERVERS)
+        self.mcp_servers = self.config_data['mcp']['servers'] if 'mcp' in self.config_data and 'servers' in self.config_data['mcp'] else []
+        # Ensure default servers are present if missing from config
+        existing_names = {s.get('name') for s in self.mcp_servers}
+        for default_server in self._DEFAULT_MCP_SERVERS:
+            if default_server['name'] not in existing_names:
+                self.mcp_servers.insert(0, dict(default_server))
         # Override MCP server URL hosts if mcp_host is configured
         mcp_host = self.config_data.get('mcp', {}).get('mcp_host')
         if mcp_host:
