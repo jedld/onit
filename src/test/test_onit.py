@@ -78,9 +78,11 @@ class TestOnItInit:
             with _mock_discover():
                 OnIt(config=12345)
 
-    def test_init_no_prompts_server_raises(self, tmp_path):
+    def test_init_prompts_server_disabled_raises(self, tmp_path):
         cfg = _make_config(tmp_path)
-        cfg["mcp"]["servers"] = [{"name": "Other", "url": "http://x", "enabled": True}]
+        cfg["mcp"]["servers"] = [
+            {"name": "PromptsMCPServer", "url": "http://x", "enabled": False},
+        ]
         with _mock_discover():
             with pytest.raises(ValueError, match="PromptsMCPServer"):
                 OnIt(config=cfg)
