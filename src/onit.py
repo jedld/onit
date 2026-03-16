@@ -807,7 +807,7 @@ class OnIt(BaseModel):
             images=images,
             tool_registry=self.tool_registry,
             safety_queue=effective_safety_queue,
-            think=self.model_serving["think"],
+            think=self.model_serving.get("think", False),
             timeout=self.timeout,
             **kwargs,
         )
@@ -885,7 +885,7 @@ class OnIt(BaseModel):
                                             instruction=instruction,
                                             tool_registry=self.tool_registry,
                                             safety_queue=self.safety_queue,
-                                            think=self.model_serving["think"],
+                                            think=self.model_serving.get("think", False),
                                             timeout=self.timeout,
                                             **kwargs)
 
@@ -1286,7 +1286,7 @@ class OnIt(BaseModel):
                                             instruction=instruction,
                                             tool_registry=self.tool_registry,
                                             safety_queue=self.safety_queue,
-                                            think=self.model_serving["think"],
+                                            think=self.model_serving.get("think", False),
                                             timeout=self.timeout,
                                             **kwargs)
                 if last_response is None and self.safety_queue.empty():
