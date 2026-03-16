@@ -793,7 +793,7 @@ class OnIt(BaseModel):
             'verbose': self.verbose or self.show_logs,
             'data_path': effective_data_path,
             'session_id': effective_session_id,
-            'max_tokens': self.model_serving.get('max_tokens', 262144),
+            'max_tokens': self.model_serving.get('max_tokens', 8192),
             'session_history': self.load_session_history(session_path=effective_session_path),
             'stream': self.stream,
         }
@@ -877,7 +877,7 @@ class OnIt(BaseModel):
                           'verbose': self.verbose,
                           'data_path': self.data_path,
                           'session_id': self.session_id,
-                          'max_tokens': self.model_serving.get('max_tokens', 262144),
+                          'max_tokens': self.model_serving.get('max_tokens', 8192),
                           'session_history': self.load_session_history()}
                 last_response = await chat(host=self.model_serving["host"],
                                             host_key=self.model_serving.get("host_key", "EMPTY"),
@@ -1275,7 +1275,7 @@ class OnIt(BaseModel):
                           'verbose': self.verbose,
                           'data_path': self.data_path,
                           'session_id': self.session_id,
-                          'max_tokens': self.model_serving.get('max_tokens', 262144),
+                          'max_tokens': self.model_serving.get('max_tokens', 8192),
                           'session_history': self.load_session_history(),
                           'stream': self.stream}
                 if self.prompt_intro:
