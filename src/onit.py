@@ -1303,5 +1303,7 @@ class OnIt(BaseModel):
                 return
             except Exception as e:
                 logger.error("Error in agent session: %s", e)
+                if self.chat_ui and hasattr(self.chat_ui, 'add_log'):
+                    self.chat_ui.add_log(f"Agent error: {e}", level="error")
                 await self.output_queue.put(None)
                 return

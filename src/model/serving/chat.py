@@ -726,7 +726,24 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     api_key = _resolve_api_key(host, host_key)
     client = AsyncOpenAI(base_url=host, api_key=api_key)
 
-    model = await _resolve_model_id(client, host)
+    # Resolve model with retries — the server may not be ready yet.
+    _MODEL_RETRIES = 3
+    model = None
+    for _attempt in range(1, _MODEL_RETRIES + 1):
+        try:
+            model = await _resolve_model_id(client, host)
+            break
+        except Exception as e:
+            _err = f"Failed to resolve model from {host} (attempt {_attempt}/{_MODEL_RETRIES}): {e}"
+            logger.error(_err)
+            if chat_ui:
+                chat_ui.add_log(_err, level="error")
+            elif verbose:
+                print(_err)
+            if _attempt < _MODEL_RETRIES:
+                await asyncio.sleep(min(2 ** _attempt, 10))
+    if model is None:
+        return None
 
     if chat_ui:
         chat_ui.model_name = model
