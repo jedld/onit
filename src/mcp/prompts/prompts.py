@@ -110,18 +110,22 @@ When the task requires writing and running code (scripts, simulations, data anal
    `run_code(command="cat > main.py << 'PYEOF'\\nimport numpy as np\\nprint('hello')\\nPYEOF")`.
 3. Run and test code in the sandbox: `run_code(command="python main.py")`.
 4. Iterate — fix bugs and re-test inside the sandbox until the code works correctly.
-5. **Only after the code is working**, transfer final files to the local filesystem using `write_file(path="{data_path}/main.py")`.
+5. **Only after the code is working**, transfer ALL project files from the sandbox to the local filesystem:
+   - First, compress the entire project in the sandbox: `run_code(command="tar czf project.tar.gz -C . --exclude='__pycache__' --exclude='.git' --exclude='node_modules' --exclude='*.pyc' .")`.
+   - Then download the archive: `download_file(path="project.tar.gz", local_path="{data_path}/project.tar.gz")`.
+   - Finally, extract locally using `bash(command="tar xzf {data_path}/project.tar.gz -C {data_path} && rm {data_path}/project.tar.gz")`.
+   - **ALWAYS use this compress-download-extract workflow.** NEVER use bash commands (cp, curl, cat, etc.) to transfer files from the sandbox. NEVER transfer files one by one — always archive the whole project.
 6. Read output files or check results using `read_file(path="{data_path}/output.txt")`.
 
-**DO NOT use `write_file` as your first step for code development.** The sandbox is your development environment — write, test, and debug there first. Use `write_file` only to save the final, tested version to the local filesystem.
+**DO NOT use `write_file` as your first step for code development.** The sandbox is your development environment — write, test, and debug there first.
 
-7. **NEVER use `bash` for ANY code execution, package management, or Python-related commands.** This includes running scripts, installing packages, checking installed packages (e.g. `pip list`, `pip show`), running `python` commands, or any other operation that should happen in the sandbox. The `bash` tool runs on the host system, NOT in the sandbox — always use `run_code` and `install_packages` instead.
+7. **NEVER use `bash` for ANY code execution, package management, or Python-related commands.** This includes running scripts, installing packages, checking installed packages (e.g. `pip list`, `pip show`), running `python` commands, or any other operation that should happen in the sandbox. The `bash` tool runs on the host system, NOT in the sandbox — always use `run_code` and `install_packages` instead. The ONLY permitted use of `bash` after sandbox work is to extract a downloaded archive (step 5).
 
 **CRITICAL — `run_code` path rules:**
 - `run_code` executes inside a separate sandbox environment where your files are at the working directory root.
 - Use **relative paths only** in `run_code` commands: `run_code(command="python main.py")`, NOT `run_code(command="python {data_path}/main.py")`.
 - NEVER pass `{data_path}/...` absolute paths inside `run_code` commands — they will not resolve inside the sandbox.
-- Output files from `run_code` (e.g., `results.csv`) are available at `{data_path}/results.csv` via `read_file`.
+- Output files from `run_code` (e.g., `results.csv`) must be transferred to the local filesystem using the compress-download-extract workflow in step 5 before they can be accessed locally via `read_file`.
 """
 
    instruction += f"""
