@@ -25,6 +25,7 @@ except ImportError:
 SERVICE_NAME = "onit"
 CONFIG_DIR = os.path.expanduser("~/.onit")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.yaml")
+_SECRETS_PATH = os.path.join(CONFIG_DIR, "secrets.yaml")
 
 # ── Configurable secrets ────────────────────────────────────────────
 # (keyring_key, prompt_label, env_var_name)
@@ -90,22 +91,49 @@ def _save_config(data: dict):
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)
 
 
+def _file_store_secret(key: str, value: str):
+    """Fallback: persist secret in ~/.onit/secrets.yaml (owner-only perms)."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    data = {}
+    if os.path.isfile(_SECRETS_PATH):
+        with open(_SECRETS_PATH, "r") as f:
+            data = yaml.safe_load(f) or {}
+    data[key] = value
+    with open(_SECRETS_PATH, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+    os.chmod(_SECRETS_PATH, 0o600)
+
+
+def _file_get_secret(key: str) -> str | None:
+    """Fallback: read secret from ~/.onit/secrets.yaml."""
+    if not os.path.isfile(_SECRETS_PATH):
+        return None
+    with open(_SECRETS_PATH, "r") as f:
+        data = yaml.safe_load(f) or {}
+    return data.get(key)
+
+
 def store_secret(key: str, value: str):
-    """Store a secret in the OS keychain."""
+    """Store a secret in the OS keychain, falling back to file storage."""
     if KEYRING_AVAILABLE:
-        keyring.set_password(SERVICE_NAME, key, value)
-    else:
-        raise RuntimeError("keyring is not available")
+        try:
+            keyring.set_password(SERVICE_NAME, key, value)
+            return
+        except Exception:
+            pass
+    _file_store_secret(key, value)
 
 
 def get_secret(key: str) -> str | None:
-    """Retrieve a secret from the OS keychain."""
-    if not KEYRING_AVAILABLE:
-        return None
-    try:
-        return keyring.get_password(SERVICE_NAME, key)
-    except Exception:
-        return None
+    """Retrieve a secret from the OS keychain, falling back to file storage."""
+    if KEYRING_AVAILABLE:
+        try:
+            val = keyring.get_password(SERVICE_NAME, key)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+    return _file_get_secret(key)
 
 
 def resolve_credential(cli_value: str | None,
