@@ -687,7 +687,23 @@ async def _handle_structured_tool_calls(
                 print("Safety queue triggered, exiting chat loop.")
             return _SAFETY_ABORT
         function_name = tool.function.name
-        function_arguments = json.loads(tool.function.arguments)
+        try:
+            function_arguments = json.loads(tool.function.arguments)
+        except json.JSONDecodeError:
+            # Try fixing common issues: single quotes, trailing commas
+            import re
+            fixed = tool.function.arguments.strip()
+            # Replace single quotes with double quotes
+            fixed = fixed.replace("'", '"')
+            # Remove trailing commas before closing braces/brackets
+            fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+            try:
+                function_arguments = json.loads(fixed)
+            except json.JSONDecodeError as e:
+                if verbose:
+                    print(f"Failed to parse tool arguments for {function_name}: {e}")
+                    print(f"Raw arguments: {tool.function.arguments}")
+                function_arguments = {}
         bail = await _execute_tool(
             function_name, function_arguments, tool.id,
             tool_registry, timeout, data_path, chat_ui, verbose,
