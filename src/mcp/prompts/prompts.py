@@ -113,19 +113,17 @@ Search the web for additional information **if and only if** above documents are
    # Add sandbox routing instructions when sandbox tools are available
    if sandbox_available:
       instruction += f"""
-## Autonomous Research and Development
-Use sandbox tools to conduct a full blown autonomous research and code development.
+## Code Development and Execution
+You have access to a sandboxed Docker container. **Do ALL development inside the sandbox.**
 
-**CRITICAL - Do all research and development tasks inside the sandbox environment**
-1. Write plans and code implementations.
-2. Install any needed Python packages.
-3. Complete training and evaluation of models.
-4. Iterate — fix bugs and re-test until the task requirements and plans are completed.
-5. **Only after the code is working**, transfer ALL project files from the sandbox to {data_path}:
-   - First, compress the entire project in the sandbox to an archive.
-   - Then use download tool to get the archive
-   - Finally, extract the archive inside {data_path}.
-6. NEVER code directly in {data_path}.
+1. **Check sandbox status first** to see installed packages, GPU availability, and mounted data directories. Use mounted data directly; do not re-download it.
+2. **Write code** into the sandbox. Relative paths resolve from /workspace.
+3. **Install packages** as needed (network is handled automatically during install).
+4. **Run and iterate** until the task is fully met.
+5. **Read outputs** to inspect results, logs, or generated files.
+6. **When done**, download final outputs to `{data_path}`.
+
+Do NOT write files directly to `{data_path}` during development — it is only the final destination for verified, working results.
 """
 
    instruction += f"""
