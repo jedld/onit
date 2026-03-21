@@ -347,6 +347,7 @@ async def _execute_tool_call(function_name: str,
         call_kwargs['_session_id'] = session_id
         call_kwargs['_task_id'] = task_id
         call_kwargs['_operation_id'] = f"mcp_{uuid.uuid4().hex[:12]}"
+        _tool_start = time.monotonic()
         try:
             tool_response = await asyncio.wait_for(
                 tool_handler(**call_kwargs),
@@ -355,12 +356,14 @@ async def _execute_tool_call(function_name: str,
         except asyncio.TimeoutError:
             tool_response = (
                 f"- tool call timed out after {timeout} seconds. Tool might have succeeded "
-                "but no response was received. Check expected output."
+                "but no response was received. Check expected output. "
+                "This is a transient error — the tool may work on a future call."
             )
             if chat_ui:
                 chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
             elif verbose:
                 print(f"{function_name} timed out after {timeout}s")
+        _tool_elapsed_ms = round((time.monotonic() - _tool_start) * 1000)
         tool_response = "" if tool_response is None else str(tool_response)
         if data_path and "file_data_base64" in tool_response:
             tool_response = _extract_base64_file(tool_response, data_path)
@@ -376,12 +379,16 @@ async def _execute_tool_call(function_name: str,
                 task_id=task_id,
                 spatial_memory=spatial_memory,
             )
+        if spatial_memory and spatial_memory.should_surface_to_planner(function_name):
+            planner_context = spatial_memory.planner_context()
+            if planner_context and planner_context not in tool_response:
+                tool_response = f"{tool_response}\n\n{planner_context}"
 
         truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
         if chat_ui:
-            chat_ui.add_log(f"{function_name}({function_arguments}) returned: {truncated}", level="debug")
+            chat_ui.add_log(f"{function_name} [{_tool_elapsed_ms} ms] returned: {truncated}", level="debug")
         elif verbose:
-            print(f"{function_name}({function_arguments}) returned: {truncated}")
+            print(f"{function_name} [{_tool_elapsed_ms} ms] returned: {truncated}")
 
         return {
             'role': 'tool',
@@ -397,7 +404,7 @@ async def _execute_tool_call(function_name: str,
             print(f"{function_name}({function_arguments}) encountered an error: {e}")
         return {
             'role': 'tool',
-            'content': f'Error: {e}',
+            'content': f'Error: {e}. This is a transient error — the tool may work on a future call.',
             'name': function_name,
             'parameters': function_arguments,
             'tool_call_id': tool_call_id,
@@ -507,6 +514,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     iteration_count = 0
     tool_call_history = []  # list of (name, args_json) tuples
     non_vlm_mode = False  # set True after a "not a multimodal model" error
+    no_tool_mode = False   # set True after server rejects tool_choice="auto"
 
     while True:
         iteration_count += 1
@@ -529,7 +537,6 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 model=model,
                 messages=messages,
                 stream=stream,
-                tool_choice="auto",          # never "required"
                 temperature=0.6,             # official recommendation
                 top_p=0.95,
                 max_tokens=max_tokens,             # cap to prevent runaway generation
@@ -539,8 +546,9 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     "chat_template_kwargs": {"enable_thinking": think},  # if not using CoT
                 },
             )
-            if tools: # and not images_bytes:  # vLLM doesn't support tools + images in the same message, so only include tools if no images are present
+            if tools and not no_tool_mode:
                 completion_kwargs["tools"] = tools
+                completion_kwargs["tool_choice"] = "auto"  # never "required"
 
             # In non-VLM mode strip any image_url content before every request
             if non_vlm_mode:
@@ -561,6 +569,11 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
 
             chat_completion = await client.chat.completions.create(**completion_kwargs)
             llm_latency_ms = (time.monotonic() - llm_started) * 1000
+
+            if chat_ui:
+                chat_ui.add_log(f"LLM responded in {llm_latency_ms:.0f} ms (iter {iteration_count})", level="debug")
+            elif verbose:
+                print(f"LLM responded in {llm_latency_ms:.0f} ms (iter {iteration_count})")
 
             response_message = chat_completion.choices[0].message
             response_preview = response_message.content if isinstance(response_message.content, str) else None
@@ -620,6 +633,16 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     elif verbose:
                         print(warn)
                     continue
+            # Auto-recover: server does not support tool calling
+            if "enable-auto-tool-choice" in error_str or ("400" in error_str and "tool-call-parser" in error_str):
+                no_tool_mode = True
+                warn = f"Server does not support tool calling — retrying without tools."
+                logger.warning(warn)
+                if chat_ui:
+                    chat_ui.add_log(warn, level="warning")
+                elif verbose:
+                    print(warn)
+                continue
             # Auto-recover: model rejected image content because it is text-only
             if "not a multimodal model" in error_str or ("400" in error_str and "multimodal" in error_str):
                 non_vlm_mode = True

@@ -334,6 +334,41 @@ class TestChat:
         assert spatial_memory.last_pose.yaw_deg == 90.0
 
     @pytest.mark.asyncio
+    async def test_execute_tool_call_appends_landmark_hypothesis_context(self, tmp_path):
+        pose_handler = AsyncMock(return_value=json.dumps({"x": 1.0, "y": 2.0, "yaw_deg": 45.0}))
+
+        mock_registry = MagicMock()
+        mock_registry.tools = {"get_robot_pose"}
+        mock_registry.__getitem__ = MagicMock(return_value=pose_handler)
+
+        from lib.spatial_memory import SpatialMemory
+        spatial_memory = SpatialMemory(str(tmp_path))
+        spatial_memory.observe("get_robot_pose", {}, json.dumps({"x": 0.0, "y": 0.0, "yaw_deg": 0.0}))
+        spatial_memory.observe(
+            "ask_vision_agent",
+            {},
+            json.dumps({"vlm_response": "FOUND. The front side of the toolbox is centered in the frame at about 0.8m."}),
+        )
+
+        tool_message = await _execute_tool_call(
+            function_name="get_robot_pose",
+            function_arguments={},
+            tool_call_id="call_pose",
+            tool_registry=mock_registry,
+            timeout=30,
+            data_path=str(tmp_path),
+            chat_ui=None,
+            verbose=False,
+            trace_recorder=None,
+            session_id="sess-1",
+            task_id="task-1",
+            spatial_memory=spatial_memory,
+        )
+
+        assert "Persistent landmark hypotheses" in tool_message["content"]
+        assert "label=toolbox" in tool_message["content"]
+
+    @pytest.mark.asyncio
     async def test_session_history_injected(self):
         """Session history entries are added as user/assistant message pairs."""
         mock_client = AsyncMock()

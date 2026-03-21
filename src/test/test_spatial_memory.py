@@ -128,3 +128,59 @@ Scene Description:
 
         assert len(memory.landmarks) == 1
         assert memory.landmarks[0]["label"] == "door"
+
+    def test_persists_landmark_hypothesis_fields_for_text_detection(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        memory.observe("get_robot_pose", {}, json.dumps({"x": 1.0, "y": 2.0, "yaw_deg": 90.0}))
+
+        response = {
+            "vlm_response": "FOUND. The front side of the toolbox is centered in the frame at about 0.8m."
+        }
+
+        memory.observe("ask_vision_agent", {}, json.dumps(response))
+
+        assert len(memory.landmarks) == 1
+        landmark = memory.landmarks[0]
+        assert landmark["label"] == "toolbox"
+        assert landmark["visible_face"] == "front"
+        assert landmark["approximate_range_m"] == 0.8
+        assert landmark["last_confirmed_pose"] == {"x": 1.0, "y": 2.0, "yaw_deg": 90.0}
+        assert landmark["hypothesis"] == {
+            "object_label": "toolbox",
+            "estimated_bearing_deg": 0.0,
+            "approximate_range_m": 0.8,
+            "visible_face": "front",
+            "relative_position": "centered in the frame at about 0.8m.",
+            "last_confirmed_pose": {"x": 1.0, "y": 2.0, "yaw_deg": 90.0},
+            "last_confirmed_source": "ask_vision_agent",
+            "confidence": 0.7,
+        }
+
+    def test_rejects_junk_landmarks_from_negative_vlm_responses(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        memory.observe("get_robot_pose", {}, json.dumps({"x": 0.0, "y": 0.0, "yaw_deg": 0.0}))
+
+        response = {
+            "vlm_response": (
+                "NOT FOUND\n\n"
+                "There is no television visible in the image. The scene shows:\n"
+                "- A black refrigerator on the far-left\n"
+                "- A stainless steel trash bin in the center-left\n"
+                "- A glossy tiled floor that reflects the objects\n"
+                "- The image shows various household items\n"
+            ),
+        }
+
+        memory.observe("ask_vision_agent", {}, json.dumps(response))
+
+        labels = [lm["label"] for lm in memory.landmarks]
+        # Real objects should be kept
+        assert "black refrigerator" in labels
+        assert "stainless steel trash bin" in labels
+        # VLM prose stubs and generic surfaces should be rejected
+        for label in labels:
+            assert "floor" not in label.lower(), f"floor landmark not rejected: {label}"
+            assert "image shows" not in label.lower(), f"prose stub not rejected: {label}"
+        # Confidence should be 0.3 (incidental from negative response), not None
+        for lm in memory.landmarks:
+            assert lm["confidence"] == 0.3, f"Expected 0.3 confidence, got {lm['confidence']}"

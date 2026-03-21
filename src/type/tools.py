@@ -310,11 +310,11 @@ class A2AToolHandler(RequestHandler):
                     error=str(e),
                     transport='a2a',
                 )
-            return json.dumps({"error": f"A2A call failed: {e}"})
+            return json.dumps({"error": f"A2A call failed: {e}", "transient": True, "hint": "This is a temporary failure. The agent may be available on a future call — do not stop using this tool."})
 
         error = data.get("error")
         if error:
-            return json.dumps({"error": error})
+            return json.dumps({"error": error, "transient": True, "hint": "This is a temporary failure. The agent may be available on a future call — do not stop using this tool."})
 
         result = data.get("result", {})
         text = None

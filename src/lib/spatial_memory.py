@@ -13,6 +13,15 @@ from typing import Any
 
 DEFAULT_HFOV_DEG = 62.0
 MOTION_TOOL_NAMES = {"move_robot", "move_distance", "rotate_angle", "navigate_to_pose", "go_to_waypoint"}
+PLANNER_CONTEXT_TOOL_NAMES = MOTION_TOOL_NAMES | {
+    "get_robot_pose",
+    "get_sensor_snapshot",
+    "detect_objects_in_image",
+    "ask_vision_agent",
+    "ask_cosmos_agent",
+    "get_depth_zones",
+    "get_laser_scan",
+}
 
 
 @dataclass
@@ -89,15 +98,82 @@ def _clean_landmark_label(label: str) -> str | None:
         return None
     if _looks_negative_observation(cleaned):
         return None
+    # Reject VLM prose stubs ("The image shows:", "image shows what …")
+    _PROSE_HEADS = {"image", "photo", "picture", "scene", "view", "frame"}
+    first_word = cleaned.split()[0].lower()
+    if first_word in _PROSE_HEADS:
+        return None
+    # Reject generic architectural surfaces that are not useful navigation landmarks
+    _SURFACE_NOUNS = {"floor", "ceiling", "ground", "pavement", "carpet"}
+    label_words = set(cleaned.lower().split())
+    if label_words & _SURFACE_NOUNS and not label_words & {
+        "lamp", "fan", "vent", "mat", "rug", "sign", "door", "outlet",
+    }:
+        return None
     return cleaned
+
+
+def _normalize_visible_face(face: str | None) -> str | None:
+    if not face:
+        return None
+    lowered = face.strip().lower()
+    aliases = {
+        "back": "rear",
+        "rear": "rear",
+        "front": "front",
+        "left": "left",
+        "right": "right",
+    }
+    return aliases.get(lowered)
+
+
+def _split_landmark_identity(label: str) -> tuple[str | None, str | None]:
+    raw = (label or "").strip()
+    if not raw:
+        return None, None
+    patterns = [
+        r"^(?P<face>front|back|rear|left|right)\s+(?:side|face|view)\s+of\s+(?:the\s+)?(?P<object>.+)$",
+        r"^(?P<face>front|back|rear|left|right)\s+of\s+(?:the\s+)?(?P<object>.+)$",
+        r"^(?:the\s+)?(?P<object>.+?)\s+(?P<face>front|back|rear|left|right)\s+(?:side|face|view)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, raw, re.IGNORECASE)
+        if not match:
+            continue
+        object_label = _clean_landmark_label(match.group("object") or "")
+        if object_label:
+            return object_label, _normalize_visible_face(match.group("face"))
+    return _clean_landmark_label(raw), None
+
+
+def _infer_text_confidence(text: str, source: str) -> float | None:
+    lowered = (text or "").lower()
+    if not lowered:
+        return None
+    if _looks_negative_observation(lowered):
+        # Incidental observation from a negative VLM response — objects are real
+        # but were not the queried target, so assign low confidence.
+        return 0.3
+    if re.search(r"\b(maybe|might|possibly|unclear|uncertain)\b", lowered):
+        return 0.35
+    if re.search(r"\b(likely|probably|appears|seems)\b", lowered):
+        return 0.45
+    if re.search(r"\b(found|visible|identified|detected)\b", lowered):
+        return 0.7
+    if source == "ask_vision_agent":
+        return 0.6
+    if source == "ask_cosmos_agent":
+        return 0.5
+    return 0.55
 
 
 def _extract_scene_object(line: str) -> dict[str, Any] | None:
     if not line or _looks_negative_observation(line):
         return None
+    normalized_line = re.sub(r"^(?:found|identified|detected)\s*[:.-]?\s*", "", line, flags=re.IGNORECASE)
     match = re.match(
         r"^(?:a|an|the)\s+(?P<label>.+?)(?:\s+(?:on|in|at|near|behind|beside|by|under)\s+(?P<position>.+?))?(?:\s*\((?P<extra>[^)]*)\))?$",
-        line,
+        normalized_line,
         re.IGNORECASE,
     )
     if not match:
@@ -107,11 +183,19 @@ def _extract_scene_object(line: str) -> dict[str, Any] | None:
         return None
     extra = match.group("extra") or ""
     position = match.group("position") or None
+    if position is None:
+        position_match = re.search(
+            r"\b(?:on|in|at)\s+the\s+([^.,;]+(?:frame|view|scene|left|right|center|centre)[^.,;]*)",
+            normalized_line,
+            re.IGNORECASE,
+        )
+        if position_match:
+            position = position_match.group(1).strip()
     return {
         "label": label,
         "relative_position": position,
-        "distance_m": _extract_number(extra) if extra else None,
-        "state": _extract_state(extra) or _extract_state(line),
+        "distance_m": _extract_number(extra) if extra else _extract_number(normalized_line),
+        "state": _extract_state(extra) or _extract_state(normalized_line),
     }
 
 
@@ -222,13 +306,55 @@ class SpatialMemory:
         if not self.landmarks:
             return "none"
         items = []
-        for landmark in self.landmarks[:max_items]:
+        for landmark in self._ranked_landmarks()[:max_items]:
             position = landmark.get("estimated_position")
+            hypothesis = landmark.get("hypothesis") or {}
             status = landmark.get("state")
             where = f" @ ({position['x']}, {position['y']})" if position else ""
-            suffix = f" [{status}]" if status else ""
+            details = []
+            if hypothesis.get("visible_face"):
+                details.append(f"face={hypothesis['visible_face']}")
+            if hypothesis.get("estimated_bearing_deg") is not None:
+                details.append(f"bearing={hypothesis['estimated_bearing_deg']}deg")
+            if hypothesis.get("approximate_range_m") is not None:
+                details.append(f"range~{hypothesis['approximate_range_m']}m")
+            if hypothesis.get("confidence") is not None:
+                details.append(f"conf={hypothesis['confidence']}")
+            if status:
+                details.append(f"state={status}")
+            suffix = f" [{', '.join(details)}]" if details else ""
             items.append(f"{landmark['label']}{suffix}{where}")
         return "; ".join(items)
+
+    def planner_context(self, max_items: int = 3) -> str | None:
+        if not self.landmarks:
+            return None
+        entries = []
+        for landmark in self._ranked_landmarks()[:max_items]:
+            hypothesis = landmark.get("hypothesis") or {}
+            parts = [f"label={hypothesis.get('object_label') or landmark.get('label')}"]
+            if hypothesis.get("visible_face"):
+                parts.append(f"visible_face={hypothesis['visible_face']}")
+            if hypothesis.get("estimated_bearing_deg") is not None:
+                parts.append(f"bearing_deg={hypothesis['estimated_bearing_deg']}")
+            if hypothesis.get("approximate_range_m") is not None:
+                parts.append(f"range_m={hypothesis['approximate_range_m']}")
+            if hypothesis.get("relative_position"):
+                parts.append(f"relative_position={hypothesis['relative_position']}")
+            if hypothesis.get("confidence") is not None:
+                parts.append(f"confidence={hypothesis['confidence']}")
+            pose = hypothesis.get("last_confirmed_pose")
+            if isinstance(pose, dict):
+                parts.append(
+                    "last_confirmed_pose="
+                    f"({pose.get('x')}, {pose.get('y')}, yaw={pose.get('yaw_deg')})"
+                )
+            entries.append("{" + ", ".join(parts) + "}")
+        return (
+            "[Persistent landmark hypotheses: "
+            + "; ".join(entries)
+            + ". Reuse and update these hypotheses after each view or motion instead of restarting the search from scratch.]"
+        )
 
     def export(self) -> dict[str, Any]:
         return {
@@ -237,6 +363,19 @@ class SpatialMemory:
             "last_pose": None if self.last_pose is None else self.last_pose.__dict__,
             "landmarks": self.landmarks,
         }
+
+    def should_surface_to_planner(self, function_name: str) -> bool:
+        return bool(self.landmarks) and function_name in PLANNER_CONTEXT_TOOL_NAMES
+
+    def _ranked_landmarks(self) -> list[dict[str, Any]]:
+        return sorted(
+            self.landmarks,
+            key=lambda landmark: (
+                float((landmark.get("hypothesis") or {}).get("confidence") or 0.0),
+                int(landmark.get("observation_count") or 0),
+            ),
+            reverse=True,
+        )
 
     def _persist(self) -> None:
         if not self.state_path:
@@ -380,6 +519,7 @@ class SpatialMemory:
         for line in lines:
             if not line or line.startswith("["):
                 continue
+            line = re.sub(r"^(?:found|identified|detected)\s*[:.-]?\s*", "", line, flags=re.IGNORECASE)
 
             if current is None:
                 direct_candidate = _extract_positive_entity_sentence(line) or _extract_scene_object(line)
@@ -423,6 +563,7 @@ class SpatialMemory:
                 relative_position=candidate.get("relative_position"),
                 state=candidate.get("state"),
                 raw={"text": text[:400]},
+                confidence=_infer_text_confidence(text, source),
             )
             if changed_label:
                 changed.append(changed_label)
@@ -472,21 +613,32 @@ class SpatialMemory:
                          state: str | None = None,
                          raw: Any | None = None,
                          confidence: float | None = None) -> str | None:
-        normalized = _normalize_label(label)
+        object_label, visible_face = _split_landmark_identity(label)
+        if object_label is None:
+            return None
+        normalized = _normalize_label(object_label)
         estimated_position = _position_from_pose(self.last_pose, float(distance_m) if distance_m is not None else None, bearing_deg)
         landmark = self._match_landmark(normalized, estimated_position)
+        numeric_confidence = round(float(confidence), 2) if confidence is not None else None
+        pose_snapshot = None if self.last_pose is None else dict(self.last_pose.__dict__)
         if landmark is None:
             landmark = {
                 "id": f"landmark_{uuid.uuid4().hex[:12]}",
-                "label": label.strip(),
+                "label": object_label.strip(),
                 "normalized_label": normalized,
                 "estimated_position": estimated_position,
                 "relative_position": relative_position,
+                "visible_face": visible_face,
+                "estimated_bearing_deg": round(float(bearing_deg), 2) if bearing_deg is not None else None,
+                "approximate_range_m": round(float(distance_m), 2) if distance_m is not None else None,
+                "last_confirmed_pose": pose_snapshot,
+                "last_confirmed_source": source,
                 "state": state.lower() if isinstance(state, str) else None,
-                "confidence": confidence,
+                "confidence": numeric_confidence,
                 "observation_count": 0,
                 "sources": [],
                 "observations": [],
+                "hypothesis": {},
             }
             self.landmarks.append(landmark)
         elif estimated_position and landmark.get("estimated_position"):
@@ -498,12 +650,21 @@ class SpatialMemory:
         elif estimated_position and not landmark.get("estimated_position"):
             landmark["estimated_position"] = estimated_position
 
-        landmark["label"] = landmark.get("label") or label.strip()
+        landmark["label"] = landmark.get("label") or object_label.strip()
         landmark["relative_position"] = relative_position or landmark.get("relative_position")
+        if visible_face:
+            landmark["visible_face"] = visible_face
+        if bearing_deg is not None:
+            landmark["estimated_bearing_deg"] = round(float(bearing_deg), 2)
+        if distance_m is not None:
+            landmark["approximate_range_m"] = round(float(distance_m), 2)
+        if pose_snapshot is not None:
+            landmark["last_confirmed_pose"] = pose_snapshot
+            landmark["last_confirmed_source"] = source
         if state:
             landmark["state"] = state.lower()
-        if confidence is not None:
-            landmark["confidence"] = max(float(confidence), float(landmark.get("confidence") or 0.0))
+        if numeric_confidence is not None:
+            landmark["confidence"] = max(numeric_confidence, float(landmark.get("confidence") or 0.0))
         landmark["observation_count"] += 1
         if source not in landmark["sources"]:
             landmark["sources"].append(source)
@@ -513,11 +674,23 @@ class SpatialMemory:
             "bearing_deg": bearing_deg,
             "bbox": bbox,
             "relative_position": relative_position,
+            "visible_face": visible_face,
             "state": state,
+            "confidence": numeric_confidence,
             "pose": None if self.last_pose is None else self.last_pose.__dict__,
             "raw": raw,
         })
         landmark["observations"] = landmark["observations"][-8:]
+        landmark["hypothesis"] = {
+            "object_label": landmark["label"],
+            "estimated_bearing_deg": landmark.get("estimated_bearing_deg"),
+            "approximate_range_m": landmark.get("approximate_range_m"),
+            "visible_face": landmark.get("visible_face"),
+            "relative_position": landmark.get("relative_position"),
+            "last_confirmed_pose": landmark.get("last_confirmed_pose"),
+            "last_confirmed_source": landmark.get("last_confirmed_source"),
+            "confidence": landmark.get("confidence"),
+        }
         return landmark["label"]
 
     def _match_landmark(self, normalized_label: str, estimated_position: dict[str, float] | None) -> dict[str, Any] | None:
