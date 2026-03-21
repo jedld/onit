@@ -61,6 +61,16 @@ class TestDiscoverServerTools:
         assert handlers[0].tool_item["function"]["name"] == "search"
 
     @pytest.mark.asyncio
+    async def test_discovers_openai_compatible_tool_schema(self):
+        server = {"name": "ToolsMCPServer", "url": "http://127.0.0.1:18201/sse", "enabled": True}
+        mock = _mock_client(tools=[_fake_tool("search")])
+        with patch("lib.tools.Client", return_value=mock):
+            handlers = await _discover_server_tools(server)
+
+        function_schema = handlers[0].tool_item["function"]
+        assert "returns" not in function_schema
+
+    @pytest.mark.asyncio
     async def test_prompts_not_discovered_as_tools(self):
         server = {"name": "Prompts", "url": "http://127.0.0.1:18200/sse", "enabled": True}
         mock = _mock_client(prompts=[_fake_prompt("assistant")])

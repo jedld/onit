@@ -227,6 +227,49 @@ class TestLoadSessionHistory:
         history = onit.load_session_history()
         assert history == []
 
+    def test_uses_smaller_default_history_for_small_context_window(self, tmp_path):
+        cfg = _make_config(tmp_path, overrides={
+            "serving": {
+                "host": "http://localhost:8000/v1",
+                "model": "test-model",
+                "think": False,
+                "max_tokens": 1024,
+                "context_window": 16384,
+            },
+        })
+        with _mock_discover():
+            onit = OnIt(config=cfg)
+        with open(onit.session_path, "w") as f:
+            for i in range(10):
+                f.write(json.dumps({"task": f"q{i}", "response": f"a{i}"}) + "\n")
+
+        history = onit.load_session_history()
+        assert len(history) == 4
+        assert history[0]["task"] == "q6"
+
+    def test_limits_history_by_token_budget(self, tmp_path):
+        cfg = _make_config(tmp_path, overrides={
+            "serving": {
+                "host": "http://localhost:8000/v1",
+                "model": "test-model",
+                "think": False,
+                "max_tokens": 1024,
+                "context_window": 32768,
+            },
+            "session_history_max_turns": 8,
+            "session_history_token_budget": 80,
+        })
+        with _mock_discover():
+            onit = OnIt(config=cfg)
+        with open(onit.session_path, "w") as f:
+            for i in range(6):
+                long_text = "x" * 120
+                f.write(json.dumps({"task": f"q{i}-{long_text}", "response": f"a{i}-{long_text}"}) + "\n")
+
+        history = onit.load_session_history()
+        assert len(history) == 1
+        assert history[0]["task"].startswith("q5-")
+
 
 # ── OnIt.process_task ───────────────────────────────────────────────────────
 

@@ -34,6 +34,31 @@ from ...lib.spatial_memory import MOTION_TOOL_NAMES, SpatialMemory
 logger = logging.getLogger(__name__)
 
 
+def _derive_retry_max_tokens_from_context_error(error_message: str,
+                                                requested_max_tokens: int) -> Optional[tuple[int, int, int, int]]:
+    """Parse a vLLM/OpenAI-compatible context error and derive a safe retry budget."""
+    lower_error = error_message.lower()
+    if "context length" not in lower_error or "input tokens" not in lower_error:
+        return None
+
+    context_match = re.search(r"context length is only (\d+) tokens", error_message, re.IGNORECASE)
+    input_match = re.search(r"you passed (\d+) input tokens", error_message, re.IGNORECASE)
+    output_match = re.search(r"requested (\d+) output tokens", error_message, re.IGNORECASE)
+    if not context_match or not input_match:
+        return None
+
+    context_length = int(context_match.group(1))
+    input_tokens = int(input_match.group(1))
+    requested_output_tokens = int(output_match.group(1)) if output_match else requested_max_tokens
+    available_output_tokens = context_length - input_tokens
+    if available_output_tokens <= 0:
+        return context_length, input_tokens, requested_output_tokens, 1
+
+    safety_margin = 32 if available_output_tokens > 64 else 0
+    retry_max_tokens = max(1, available_output_tokens - safety_margin)
+    return context_length, input_tokens, requested_output_tokens, retry_max_tokens
+
+
 def _tool_call_succeeded(tool_response: str) -> bool:
     if not tool_response:
         return False
@@ -482,10 +507,12 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     # sees prior context first and treats the latest user message as the
     # one to respond to.
     session_history = kwargs.get('session_history', None)
+    history_turn_count = 0
     if session_history:
         for entry in session_history:
             messages.append({"role": "user", "content": entry["task"]})
             messages.append({"role": "assistant", "content": entry["response"]})
+            history_turn_count += 1
 
     # Current instruction goes last so the model responds to it
     if images_bytes:
@@ -499,10 +526,6 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     else:
         messages.append({"role": "user", "content": instruction})   
         
-    if not memories and not session_history:
-        message = {'role': 'tool', 'content': '', 'name': '', 'parameters': {}, "tool_call_id": ''}
-        messages.append(message)
-
     api_key = _resolve_api_key(host, host_key)
     client = AsyncOpenAI(base_url=host, api_key=api_key)
 
@@ -619,20 +642,34 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
         except OpenAIError as e:
             error_str = str(e)
             # Auto-recover: context length exceeded — reduce max_tokens to fit
-            if "400" in error_str and "context length" in error_str and "maximum input length" in error_str:
-                import re as _re
-                m = _re.search(r"context length is only (\d+).*?maximum input length of (\d+)", error_str)
-                if m:
-                    ctx_len = int(m.group(1))
-                    max_input = int(m.group(2))
-                    new_max = max(256, max_input - 256)
-                    warn = f"Context length exceeded ({ctx_len} total, {max_input} input). Reducing max_tokens from {max_tokens} to {new_max} and retrying."
-                    max_tokens = new_max
-                    if chat_ui:
-                        chat_ui.add_log(warn, level="warning")
-                    elif verbose:
-                        print(warn)
-                    continue
+            retry_budget = _derive_retry_max_tokens_from_context_error(error_str, max_tokens)
+            if retry_budget is not None:
+                ctx_len, input_tokens, requested_output_tokens, new_max = retry_budget
+                changes = []
+                if new_max < max_tokens:
+                    changes.append(f"reducing max_tokens from {max_tokens} to {new_max}")
+                max_tokens = min(max_tokens, new_max)
+
+                if history_turn_count > 0:
+                    del messages[1:3]
+                    history_turn_count -= 1
+                    changes.append("dropping the oldest session turn")
+                elif tools and not no_tool_mode:
+                    no_tool_mode = True
+                    changes.append("retrying without tools")
+
+                if not changes:
+                    changes.append("retrying with the same prompt")
+
+                warn = (
+                    f"Context budget exceeded ({input_tokens} input + {requested_output_tokens} requested "
+                    f"output > {ctx_len}); {', '.join(changes)}."
+                )
+                if chat_ui:
+                    chat_ui.add_log(warn, level="warning")
+                elif verbose:
+                    print(warn)
+                continue
             # Auto-recover: server does not support tool calling
             if "enable-auto-tool-choice" in error_str or ("400" in error_str and "tool-call-parser" in error_str):
                 no_tool_mode = True

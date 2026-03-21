@@ -11,7 +11,13 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lib.observability import TraceRecorder
-from model.serving.chat import _resolve_api_key, _parse_tool_call_from_content, _execute_tool_call, chat
+from model.serving.chat import (
+    _derive_retry_max_tokens_from_context_error,
+    _resolve_api_key,
+    _parse_tool_call_from_content,
+    _execute_tool_call,
+    chat,
+)
 
 
 # ── _resolve_api_key ────────────────────────────────────────────────────────
@@ -420,3 +426,111 @@ class TestChat:
         system_content = messages[0]["content"]
         assert "custom bot" in system_content
         assert "OnIt" not in system_content
+
+    @pytest.mark.asyncio
+    async def test_does_not_inject_empty_tool_message(self):
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_completion("ok")
+        )
+
+        with patch("model.serving.chat.AsyncOpenAI", return_value=mock_client):
+            await chat(
+                host="http://localhost:8000/v1",
+                model="test",
+                instruction="hello",
+                safety_queue=asyncio.Queue(),
+            )
+
+        messages = mock_client.chat.completions.create.call_args.kwargs["messages"]
+        assert all(message["role"] != "tool" for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_retries_with_reduced_max_tokens_on_vllm_context_budget_error(self):
+        from openai import OpenAIError
+
+        error_message = (
+            "You passed 4353 input tokens and requested 12032 output tokens. However, the model's "
+            "context length is only 16384 tokens, resulting in a maximum input length of 4352 tokens. "
+            "Please reduce the length of the input prompt. (parameter=input_tokens, value=4353)"
+        )
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(
+            side_effect=[OpenAIError(error_message), _mock_completion("Recovered")]
+        )
+
+        with patch("model.serving.chat.AsyncOpenAI", return_value=mock_client):
+            result = await chat(
+                host="http://localhost:8000/v1",
+                model="test",
+                instruction="hello",
+                safety_queue=asyncio.Queue(),
+                max_tokens=12032,
+            )
+
+        assert result == "Recovered"
+        first_call = mock_client.chat.completions.create.call_args_list[0].kwargs
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert first_call["max_tokens"] == 12032
+        assert second_call["max_tokens"] == 11999
+
+    @pytest.mark.asyncio
+    async def test_trims_oldest_history_turn_on_context_budget_retry(self):
+        from openai import OpenAIError
+
+        error_message = (
+            "You passed 15523 input tokens and requested 862 output tokens. However, the model's "
+            "context length is only 16384 tokens, resulting in a maximum input length of 15522 tokens. "
+            "Please reduce the length of the input prompt. (parameter=input_tokens, value=15523)"
+        )
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(
+            side_effect=[OpenAIError(error_message), _mock_completion("Recovered")]
+        )
+
+        history = [
+            {"task": "old question", "response": "old answer"},
+            {"task": "recent question", "response": "recent answer"},
+        ]
+
+        with patch("model.serving.chat.AsyncOpenAI", return_value=mock_client):
+            result = await chat(
+                host="http://localhost:8000/v1",
+                model="test",
+                instruction="hello",
+                safety_queue=asyncio.Queue(),
+                session_history=history,
+                max_tokens=862,
+            )
+
+        assert result == "Recovered"
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        second_messages = second_call["messages"]
+        second_contents = [m.get("content", "") for m in second_messages if isinstance(m, dict)]
+        assert "old question" not in second_contents
+        assert "old answer" not in second_contents
+        assert "recent question" in second_contents
+        assert "recent answer" in second_contents
+        assert second_call["max_tokens"] == 829
+
+
+class TestContextBudgetParsing:
+    def test_parses_vllm_context_budget_error(self):
+        error_message = (
+            "You passed 4353 input tokens and requested 12032 output tokens. However, the model's "
+            "context length is only 16384 tokens, resulting in a maximum input length of 4352 tokens."
+        )
+
+        result = _derive_retry_max_tokens_from_context_error(error_message, 12032)
+
+        assert result == (16384, 4353, 12032, 11999)
+
+    def test_parses_zero_output_budget_context_error(self):
+        error_message = (
+            "You passed 32768 input tokens and requested 1 output tokens. However, the model's "
+            "context length is only 32768 tokens, resulting in a maximum input length of 32767 tokens."
+        )
+
+        result = _derive_retry_max_tokens_from_context_error(error_message, 1)
+
+        assert result == (32768, 32768, 1, 1)

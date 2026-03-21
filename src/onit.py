@@ -270,6 +270,9 @@ class OnIt(BaseModel):
     auto_summarize: bool = Field(default=True)
     auto_summarize_threshold: int = Field(default=52000)
     auto_summarize_keep_recent: int = Field(default=6)
+    session_history_max_turns: int | None = Field(default=None)
+    session_history_token_budget: int | None = Field(default=None)
+    context_window: int = Field(default=262144)
     trace_recorder: Any | None = Field(default=None, exclude=True)
     introspection_server: Any | None = Field(default=None, exclude=True)
     trace_enabled: bool = Field(default=True)
@@ -392,6 +395,7 @@ class OnIt(BaseModel):
                     "  - --host CLI flag\n"
                     "  - serving.host in the config YAML"
                 )
+                self.context_window = int(self.model_serving.get('context_window', 262144))
         self.user_id = self.config_data.get('user_id', 'default_user')
         self.status = "initialized"
         self.verbose = self.config_data.get('verbose', False)
@@ -474,8 +478,26 @@ class OnIt(BaseModel):
         self.viber_webhook_url = self.config_data.get('viber_webhook_url', None)
         self.viber_port = self.config_data.get('viber_port', 8443)
         self.auto_summarize = self.config_data.get('auto_summarize', True)
-        self.auto_summarize_threshold = int(self.config_data.get('auto_summarize_threshold', 52000))
+        configured_threshold = self.config_data.get('auto_summarize_threshold', None)
+        if configured_threshold is None:
+            self.auto_summarize_threshold = self._default_auto_summarize_threshold()
+        else:
+            configured_threshold = int(configured_threshold)
+            if configured_threshold == 52000 and self.context_window <= 32768:
+                self.auto_summarize_threshold = self._default_auto_summarize_threshold()
+            else:
+                self.auto_summarize_threshold = configured_threshold
         self.auto_summarize_keep_recent = int(self.config_data.get('auto_summarize_keep_recent', 6))
+        configured_history_turns = self.config_data.get('session_history_max_turns', None)
+        if configured_history_turns is None:
+            self.session_history_max_turns = self._default_session_history_max_turns()
+        else:
+            self.session_history_max_turns = int(configured_history_turns)
+        configured_history_token_budget = self.config_data.get('session_history_token_budget', None)
+        if configured_history_token_budget is None:
+            self.session_history_token_budget = self._default_session_history_token_budget()
+        else:
+            self.session_history_token_budget = int(configured_history_token_budget)
 
     def _ensure_introspection_server(self) -> None:
         if not self.introspection_enabled or not self.trace_recorder:
@@ -515,6 +537,24 @@ class OnIt(BaseModel):
     def _estimate_tokens(text: str) -> int:
         """Rough token estimate: 1 token ≈ 4 characters."""
         return max(1, len(text) // 4)
+
+    def _default_auto_summarize_threshold(self) -> int:
+        """Pick a summary threshold that scales with the model context window."""
+        return max(2048, int(self.context_window * 0.25))
+
+    def _default_session_history_max_turns(self) -> int:
+        """Keep fewer verbatim turns for smaller context windows."""
+        if self.context_window <= 16384:
+            return 4
+        if self.context_window <= 32768:
+            return 8
+        if self.context_window <= 65536:
+            return 12
+        return 20
+
+    def _default_session_history_token_budget(self) -> int:
+        """Reserve only a modest portion of the context window for raw history."""
+        return max(1024, int(self.context_window * 0.15))
 
     async def _auto_summarize_history(self, session_path: str) -> None:
         """If session history exceeds the token threshold, summarize old turns via the LLM
@@ -619,7 +659,7 @@ class OnIt(BaseModel):
         except Exception as e:
             logger.warning("Failed to write summarized session file: %s", e)
 
-    def load_session_history(self, max_turns: int = 20, session_path: str | None = None) -> list[dict]:
+    def load_session_history(self, max_turns: int | None = None, session_path: str | None = None) -> list[dict]:
         """Load recent session history from the JSONL session file.
 
         Args:
@@ -651,8 +691,24 @@ class OnIt(BaseModel):
                                 continue
         except Exception:
             pass
+        if max_turns is None:
+            max_turns = self.session_history_max_turns or self._default_session_history_max_turns()
+        if max_turns <= 0:
+            return []
+        history = history[-max_turns:]
+        token_budget = self.session_history_token_budget or self._default_session_history_token_budget()
+        if token_budget > 0:
+            kept_history = []
+            tokens_used = 0
+            for entry in reversed(history):
+                entry_tokens = self._estimate_tokens(entry.get("task", "") + entry.get("response", ""))
+                if kept_history and tokens_used + entry_tokens > token_budget:
+                    break
+                kept_history.append(entry)
+                tokens_used += entry_tokens
+            history = list(reversed(kept_history))
         # return only the most recent turns
-        return history[-max_turns:]
+        return history
 
     async def _build_instruction(self,
                                  task: str,

@@ -27,6 +27,8 @@ instruction_template: |
   3. Query the **camera** (as well as Visual Language Models if needed) to identify objects, people, or landmarks relevant to the task.
      Provide the Vision Language Model with the latest camera frame (and camera intrinsic parameters) and ask for a description of the scene, including any objects of interest, their positions, and any relevant spatial relationships.
   4. Cross-reference sensor data to build a consistent picture of the environment before acting.
+  5. Prefer the describe_scene tool for scene description instead of having a seperate camera capture + vision model step. The describe_scene tool will automatically capture the latest camera frame and provide a detailed description of the scene, including object identities, positions, and spatial relationships. This streamlines perception and ensures that the vision model has the most up-to-date visual information
+     without requiring separate steps and using up context space for the image. Only capture the image separately if you need to save it or use it for a different purpose.
 
   ## Motion & Navigation Policy
   - For point-to-point navigation, prefer **Nav2** goal commands over raw velocity control.

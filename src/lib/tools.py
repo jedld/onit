@@ -78,21 +78,12 @@ async def _discover_server_tools(server: dict) -> list[ToolHandler]:
                             ]
                         else:
                             parameters[attr] = value
-            returns = None
-            if hasattr(tool_item, 'outputSchema'):
-                returns = tool_item.outputSchema
-            else:
-                returns = {}
-            if returns is not None:
-                returns = returns['properties'] if 'properties' in returns else {}
-
             tool_entry = {
                 'type': 'function',
                 'function': {
                     'name': tool_item.name,
                     'description': tool_item.description,
                     'parameters': parameters,
-                    'returns': returns,
                     }
             }
             handler = ToolHandler(url=url, tool_item=tool_entry)
@@ -155,7 +146,6 @@ async def _discover_a2a_agent(agent: dict) -> list:
                 },
                 'required': ['task'],
             },
-            'returns': {},
         }
     }
     handler = A2AToolHandler(url=url, tool_item=tool_entry)
