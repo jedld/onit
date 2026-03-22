@@ -924,7 +924,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     stream=stream,
                     tool_choice="auto",          # never "required"
                     temperature=0.6,             # official recommendation
-                    top_p=0.95,
+                    top_p=0.9,
                     max_tokens=max_tokens,             # cap to prevent runaway generation
                     extra_body={
                         "top_k": 20,             # vLLM extension, important for Qwen3

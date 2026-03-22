@@ -497,7 +497,15 @@ class OnIt(BaseModel):
                 else:
                     banner = "OnIt Chat Interface"
                 self.chat_ui = ChatUI(self.theme, show_logs=self.show_logs, banner_title=banner)
-        
+                # When resuming a session, pre-populate input history for arrow-key nav
+                if self.config_data.get('resume_session_id'):
+                    history = self.load_session_history(max_turns=100)
+                    for entry in history:
+                        task = entry.get("task", "").strip()
+                        if task and (not self.chat_ui.input_history
+                                     or self.chat_ui.input_history[-1] != task):
+                            self.chat_ui.input_history.append(task)
+
     def initialize(self):
         self._setup_mcp_servers()
         self._setup_tool_registry()
@@ -588,17 +596,36 @@ class OnIt(BaseModel):
             logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
 
     def _setup_session(self) -> None:
-        """Create session ID, session file, and data directory."""
-        # append session id to sessions path
-        self.session_id = str(uuid.uuid4())
-        self.session_path = os.path.join(self.config_data.get('session_path', '~/.onit/sessions'), f"{self.session_id}.jsonl")
-        # create the sessions directory and file if not exists. expand ~ to home directory
-        self.session_path = os.path.expanduser(self.session_path)
-        sessions_dir = os.path.dirname(self.session_path)
-        os.makedirs(sessions_dir, exist_ok=True)
-        if not os.path.exists(self.session_path):
-            with open(self.session_path, "w", encoding="utf-8") as f:
-                f.write("")
+        """Create session ID, session file, and data directory.
+
+        If ``config_data['resume_session_id']`` is set, resume that session
+        instead of creating a new one.
+        """
+        from .sessions import register_session
+
+        sessions_base = self.config_data.get('session_path', '~/.onit/sessions')
+        sessions_base = os.path.expanduser(sessions_base)
+
+        resume_id = self.config_data.get('resume_session_id')
+        if resume_id:
+            # Resume an existing session
+            self.session_id = resume_id
+            self.session_path = os.path.join(sessions_base, f"{self.session_id}.jsonl")
+            if not os.path.exists(self.session_path):
+                raise FileNotFoundError(
+                    f"Session file not found: {self.session_path}\n"
+                    f"Cannot resume session '{resume_id}'."
+                )
+        else:
+            # Create a new session
+            self.session_id = str(uuid.uuid4())
+            self.session_path = os.path.join(sessions_base, f"{self.session_id}.jsonl")
+            os.makedirs(sessions_base, exist_ok=True)
+            if not os.path.exists(self.session_path):
+                with open(self.session_path, "w", encoding="utf-8") as f:
+                    f.write("")
+            register_session(self.session_id, sessions_base)
+
         configured_data_path = self.config_data.get('data_path')
         if configured_data_path:
             self.data_path = str(Path(configured_data_path).expanduser().resolve())
@@ -834,6 +861,14 @@ class OnIt(BaseModel):
                     "timestamp": asyncio.get_event_loop().time(),
                 }
                 f.write(json.dumps(session_data) + "\n")
+        except Exception:
+            pass
+        # Update session index (auto-tag on first message, track turns)
+        try:
+            from .sessions import update_session
+            effective_sid = session_id or self.session_id
+            sessions_dir = os.path.dirname(effective_session_path)
+            update_session(effective_sid, task=task, sessions_dir=sessions_dir)
         except Exception:
             pass
         return response

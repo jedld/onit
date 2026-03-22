@@ -489,14 +489,30 @@ def _build_parser() -> argparse.ArgumentParser:
         description="OnIt — an intelligent agent for task automation and assistance.",
     )
 
-    # Subcommands (setup)
+    # Subcommands (setup, sessions)
     subparsers = parser.add_subparsers(dest="command")
     setup_parser = subparsers.add_parser("setup",
                                          help="Interactive setup wizard.")
     setup_parser.add_argument("--show", action="store_true",
                               help="Display current configuration.")
+    sessions_parser = subparsers.add_parser("sessions",
+                                            help="List and manage previous sessions.")
+    sessions_parser.add_argument("--limit", type=int, default=20,
+                                 help="Maximum number of sessions to list (default: 20).")
+    sessions_parser.add_argument("--rebuild", action="store_true",
+                                 help="Rebuild the session index from existing JSONL files.")
+    sessions_parser.add_argument("--tag", type=str, nargs=2, metavar=("SESSION", "TAG"),
+                                 help="Tag a session: --tag <session-id-or-tag> <new-tag>")
+    sessions_parser.add_argument("--clear", action="store_true",
+                                 help="Delete all previous sessions and the index.")
+    resume_parser = subparsers.add_parser("resume",
+                                          help="Resume a previous session.")
+    resume_parser.add_argument("session", nargs="?", default="last",
+                               help='Session tag, UUID, or "last" (default: last).')
 
     # General options
+    parser.add_argument('--resume', type=str, default=None, metavar='TAG_OR_ID',
+                        help='Resume a previous session by tag, UUID, or "last" for the most recent.')
     parser.add_argument('--config', type=str, default=None,
                         help='Path to the configuration YAML file.')
     parser.add_argument('--host', type=str, default=None,
@@ -804,6 +820,48 @@ def main():
         run_setup(show_only=args.show)
         return
 
+    # Sessions management
+    if args.command == "sessions":
+        from .sessions import (list_sessions, format_sessions_table,
+                               rebuild_index, resolve_session, tag_session,
+                               clear_sessions)
+        sessions_dir = os.path.expanduser("~/.onit/sessions")
+        if args.clear:
+            answer = input("This will delete ALL session history. Are you sure? (yes/no): ")
+            if answer.strip().lower() in ("yes", "y"):
+                count = clear_sessions(sessions_dir)
+                print(f"Deleted {count} session(s).")
+            else:
+                print("Cancelled.")
+            return
+        if args.rebuild:
+            print("Rebuilding session index...")
+            rebuild_index(sessions_dir)
+            print("Done.")
+        if args.tag:
+            identifier, new_tag = args.tag
+            sid = resolve_session(identifier, sessions_dir)
+            if not sid:
+                print(f"Error: Session '{identifier}' not found.", file=sys.stderr)
+                sys.exit(1)
+            result = tag_session(sid, new_tag, sessions_dir)
+            if result is True:
+                print(f"Tagged session {sid[:8]}... as '{new_tag}'")
+            elif isinstance(result, str):
+                print(f"Error: {result}", file=sys.stderr)
+                sys.exit(1)
+            else:
+                print(f"Error: Session not found.", file=sys.stderr)
+                sys.exit(1)
+            return
+        sessions = list_sessions(sessions_dir, limit=args.limit)
+        print(format_sessions_table(sessions))
+        return
+
+    # Resume subcommand: translate to --resume flag and continue normal startup
+    if args.command == "resume":
+        args.resume = args.session
+
     # Client mode: send task to remote A2A server and exit
     if args.a2a_client:
         if not args.a2a_task:
@@ -830,6 +888,20 @@ def main():
         return
 
     config_data = _parse_and_resolve_config(args)
+
+    # Handle --resume: resolve tag/id to session_id and inject into config
+    if args.resume:
+        from .sessions import resolve_session
+        sessions_dir = os.path.expanduser(
+            config_data.get('session_path', '~/.onit/sessions'))
+        sid = resolve_session(args.resume, sessions_dir)
+        if not sid:
+            print(f"Error: Session '{args.resume}' not found.", file=sys.stderr)
+            print("Use 'onit sessions' to list available sessions.", file=sys.stderr)
+            sys.exit(1)
+        config_data['resume_session_id'] = sid
+        print(f"Resuming session: {sid[:8]}...")
+
     _setup_servers(config_data)
     _dispatch_mode(config_data)
 
