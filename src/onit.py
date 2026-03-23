@@ -826,18 +826,33 @@ class OnIt(BaseModel):
         }
         if self.prompt_intro:
             kwargs['prompt_intro'] = self.prompt_intro
-        last_response = await chat(
-            host=self.model_serving["host"],
-            host_key=self.model_serving.get("host_key", "EMPTY"),
-            model=self.model_serving.get("model"),
-            instruction=instruction,
-            images=images,
-            tool_registry=self.tool_registry,
-            safety_queue=effective_safety_queue,
-            think=self.model_serving.get("think", False),
-            timeout=self.timeout,
-            **kwargs,
-        )
+        MAX_PROCESS_RETRIES = 3
+        last_response = None
+        for _pt_attempt in range(1, MAX_PROCESS_RETRIES + 1):
+            if not effective_safety_queue.empty():
+                break
+            last_response = await chat(
+                host=self.model_serving["host"],
+                host_key=self.model_serving.get("host_key", "EMPTY"),
+                model=self.model_serving.get("model"),
+                instruction=instruction,
+                images=images,
+                tool_registry=self.tool_registry,
+                safety_queue=effective_safety_queue,
+                think=self.model_serving.get("think", False),
+                timeout=self.timeout,
+                **kwargs,
+            )
+            _usable = last_response and remove_tags(last_response).strip()
+            if _usable:
+                break
+            if _pt_attempt < MAX_PROCESS_RETRIES and effective_safety_queue.empty():
+                kind = "Empty" if last_response is not None else "No"
+                retry_msg = f"{kind} response from model, retrying ({_pt_attempt}/{MAX_PROCESS_RETRIES})..."
+                logger.warning(retry_msg)
+                if hasattr(self, 'chat_ui') and self.chat_ui and hasattr(self.chat_ui, 'add_log'):
+                    self.chat_ui.add_log(retry_msg, level="warning")
+                await asyncio.sleep(min(2 ** _pt_attempt, 10))
 
         # Flush any pending async streaming events (e.g. A2A) before
         # returning, so the client sees all partial updates before the
@@ -847,9 +862,10 @@ class OnIt(BaseModel):
             if stats is not None:
                 stats["tokens_per_second"] = _adapter.tokens_per_second
 
-        if last_response is None:
-            logger.error("chat() returned None — likely a safety queue trigger or unhandled error. "
-                         "Host: %s, Model: auto-detected", self.model_serving["host"])
+        if not last_response or not remove_tags(last_response).strip():
+            logger.error("chat() returned empty/None after %d retries. "
+                         "Host: %s, Model: auto-detected",
+                         MAX_PROCESS_RETRIES, self.model_serving["host"])
             return "I am sorry \U0001f614. Could you please rephrase your question?"
 
         response = remove_tags(last_response)
@@ -1169,9 +1185,15 @@ class OnIt(BaseModel):
         response = remove_tags(response).strip()
         # Skip empty responses — model returned nothing useful.
         if not response:
+            # Surface any error from logs so user knows what went wrong
+            error_detail = ""
+            if hasattr(self.chat_ui, 'execution_logs') and self.chat_ui.execution_logs:
+                last_log = self.chat_ui.execution_logs[-1]
+                if last_log.get("level") in ("error", "warning"):
+                    error_detail = f": {last_log['message']}"
             self.chat_ui.add_message(
-                "assistant",
-                "I wasn't able to generate a response. Please try again or rephrase your question.",
+                "system",
+                f"The model returned an empty response{error_detail}. Try rephrasing or providing more detail.",
                 elapsed=elapsed_time,
             )
             return
@@ -1296,7 +1318,8 @@ class OnIt(BaseModel):
             self._cleanup_enter_key_listener(loop)
             
     async def agent_session(self) -> None:
-        """Start the agent session"""
+        """Start the agent session with automatic retry on transient failures."""
+        MAX_AGENT_RETRIES = 3
         while True:
             try:
                 instruction = await self.input_queue.get()
@@ -1315,15 +1338,37 @@ class OnIt(BaseModel):
                           'stream': self.stream}
                 if self.prompt_intro:
                     kwargs['prompt_intro'] = self.prompt_intro
-                last_response = await chat(host=self.model_serving["host"],
-                                            host_key=self.model_serving.get("host_key", "EMPTY"),
-                                            model=self.model_serving.get("model"),
-                                            instruction=instruction,
-                                            tool_registry=self.tool_registry,
-                                            safety_queue=self.safety_queue,
-                                            think=self.model_serving.get("think", False),
-                                            timeout=self.timeout,
-                                            **kwargs)
+
+                last_response = None
+                for attempt in range(1, MAX_AGENT_RETRIES + 1):
+                    if not self.safety_queue.empty():
+                        break
+                    last_response = await chat(
+                        host=self.model_serving["host"],
+                        host_key=self.model_serving.get("host_key", "EMPTY"),
+                        model=self.model_serving.get("model"),
+                        instruction=instruction,
+                        tool_registry=self.tool_registry,
+                        safety_queue=self.safety_queue,
+                        think=self.model_serving.get("think", False),
+                        timeout=self.timeout,
+                        **kwargs)
+                    # Treat empty/whitespace-only responses as failures too
+                    _usable = last_response and remove_tags(last_response).strip()
+                    if _usable:
+                        break
+                    if attempt < MAX_AGENT_RETRIES and self.safety_queue.empty():
+                        kind = "Empty" if last_response is not None else "No"
+                        retry_msg = f"{kind} response from model, retrying ({attempt}/{MAX_AGENT_RETRIES})..."
+                        logger.warning(retry_msg)
+                        if self.chat_ui and hasattr(self.chat_ui, 'add_log'):
+                            self.chat_ui.add_log(retry_msg, level="warning")
+                        await asyncio.sleep(min(2 ** attempt, 10))
+
+                # Normalize: if final response is empty/whitespace, treat as None
+                if not last_response or not remove_tags(last_response).strip():
+                    last_response = None
+
                 if last_response is None and self.safety_queue.empty():
                     await self.output_queue.put(None)
                     return

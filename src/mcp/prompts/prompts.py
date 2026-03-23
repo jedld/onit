@@ -114,19 +114,48 @@ Search the web for additional information **if and only if** above documents are
    if sandbox_available:
       instruction += f"""
 ## Code Development and Execution
+
 **Do ALL** development inside the sandboxed Docker container.
-**DO NOT** run code in the agent environment and file system.
+**DO NOT** run code in the agent environment or local filesystem.
+
+---
+
+### Prime Directive
+**Do not stop until the goal is fully achieved.** Code must be written, executed, verified, and committed. Partial implementations and unresolved errors are not acceptable. Fix every error, including errors introduced by fixes. Only declare something unresolvable after exhausting every reasonable approach.
+
+---
 
 ### Filesystem Rules
-- **Sandbox tools** (sandbox_write_file, sandbox_read_file, etc.) → use `/workspace/...` paths only.
-- **Agent tools** (write_file, read_file) → use `{data_path}/...` paths only.
+- Use **sandbox tools exclusively** for all file operations.
+- Never touch files outside the sandbox.
+
+---
+
+### Git Workflow (Required)
+All changes must go through Git. Never modify files without tracking them.
+
+1. **Orient** — run `git status`, `git branch`, `git log --oneline -10` before starting.
+2. **Branch** — create a feature branch: `git checkout -b <type>/<short-description>`.
+3. **Commit** — atomic commits with Conventional Commit messages. Never commit broken code.
+4. **Clean up** — confirm `git status` is clean and `git log` looks correct before finishing.
+
+---
 
 ### Workflow
-1. **Check sandbox status** — note installed packages, GPU, and mounted data directories. 
-2. **Use sandbox folder `/data` for data related tasks**
-3. **Write and run code** in the sandbox (e.g., `/workspace/train.py`). Install packages as needed.
-4. **Iterate on errors** — read logs, diagnose, and fix. Exhaust all reasonable fixes before stopping. Only report an error if it is truly unresolvable.
-5. **Save final outputs and complete codebase** to `{data_path}` using agent tools.
+1. Check sandbox status — packages, GPU, mounted data directories.
+2. Explore the repo structure and conventions before writing anything.
+3. Install missing packages; update the manifest (`requirements.txt`, `package.json`, etc.) and commit it with the code.
+4. Write → run → verify → fix → repeat until the code works end-to-end.
+
+---
+
+### Definition of Done
+Do not stop until **all** are true:
+- [ ] Code runs end-to-end without errors.
+- [ ] Output matches the goal.
+- [ ] All changes committed with clean history.
+- [ ] `git status` is clean.
+- [ ] New dependencies recorded in the manifest.
 """
 
    instruction += f"""
