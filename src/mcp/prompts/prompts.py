@@ -109,19 +109,8 @@ Search the web for additional information **if and only if** above documents are
    if sandbox_available:
       instruction += f"""
 ## Code Development and Execution
-
 **Do ALL** development inside the sandboxed Docker container.
 **DO NOT** run code in the agent environment or local filesystem.
-
----
-
-### Prime Directive
-**Do not stop until the goal is fully achieved.** 
-**Code must be written, executed, verified, and committed.**
-**Data must be processed until expected results are achieved.**
-**Models must be trained until they achieve expected performance.**
-**Evaluation must be completed until expected results are achieved.**
-**Do not use timeouts when running code.** 
 
 ---
 
@@ -129,17 +118,12 @@ Search the web for additional information **if and only if** above documents are
 - Use the sandbox filesystem for all code, data, and outputs. 
 - The sandbox filesystem is the only environment where code should be executed.
 - Use sandbox tools exclusively for all sandbox file operations.
-- Never touch files outside the sandbox.
+- Never modify files outside the sandbox.
 
 ---
 
-### Git Workflow (If a git repository is present in the sandbox)
-All changes must go through Git. Never modify files without tracking them.
-
-1. **Orient** — run `git status`, `git branch`, `git log --oneline -10` before starting.
-2. **Branch** — create a feature branch: `git checkout -b <type>/<short-description>`.
-3. **Commit** — atomic commits with Conventional Commit messages. Never commit broken code.
-4. **Clean up** — confirm `git status` is clean and `git log` looks correct before finishing.
+### Git Workflow (If using git repository)
+- Use git related tools for all file operations (create, read, update, delete). Commit and push changes with clear messages.
 
 ---
 
@@ -161,7 +145,7 @@ Do not stop until **all** are true:
 - [ ] Evaluation completes successfully and achieves expected results.
 - [ ] Output matches the goal.
 - [ ] All changes committed with clean history.
-- [ ] `git status` is clean if applicable.
+- [ ] Git status is clean (if using git repository).
 - [ ] New dependencies recorded in the manifest.
 """
 
