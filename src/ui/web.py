@@ -498,6 +498,14 @@ class WebChatUI:
         """No-op for web UI."""
         pass
 
+    def show_tool_call(self, name: str, arguments: dict | None = None) -> None:
+        """No-op for web UI; tool calls are visible via execution logs."""
+        pass
+
+    def show_tool_result(self, name: str, elapsed_ms: int, success: bool = True, error: str | None = None) -> None:
+        """No-op for web UI; tool results are visible via execution logs."""
+        pass
+
     def _load_chat_from_session(self, session_path: str | None = None, data_path: str | None = None, session_id: str | None = None) -> list:
         """Load chat history from the JSONL session file for display in the chatbot."""
         effective_path = session_path or self.session_path

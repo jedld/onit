@@ -422,6 +422,37 @@ class ChatUI:
             height=3
         )
     
+    def show_tool_call(self, name: str, arguments: dict | None = None) -> None:
+        """Display a tool call notification in the console and update the spinner."""
+        args_str = ", ".join(f"{k}={v!r}" for k, v in (arguments or {}).items())
+        if len(args_str) > 80:
+            args_str = args_str[:77] + "..."
+        self.console.print(f"  [dim]🔧 calling[/dim] [bold cyan]{name}[/bold cyan][dim]({args_str})[/dim]")
+        # Show tool name in spinner instead of generic message
+        if self._spinner_timer:
+            self._spinner_timer.cancel()
+            self._spinner_timer = None
+        style = self.theme.styles.get('prompt', 'bold dark_blue')
+        self.status.update(f"[{style}] 🔧 Running {name}...[/]")
+
+    def show_tool_result(self, name: str, elapsed_ms: int, success: bool = True, error: str | None = None) -> None:
+        """Display a tool result summary line in the console."""
+        if success:
+            self.console.print(
+                f"  [dim]✅[/dim] [bold cyan]{name}[/bold cyan] [dim]completed in {elapsed_ms}ms[/dim]"
+            )
+        else:
+            msg = error or "failed"
+            if len(msg) > 60:
+                msg = msg[:57] + "..."
+            self.console.print(
+                f"  [dim]❌[/dim] [bold cyan]{name}[/bold cyan] [dim]{msg} ({elapsed_ms}ms)[/dim]"
+            )
+        # Resume generic spinner rotation
+        self._spinner_step = 0
+        self._update_spinner_text()
+        self._schedule_spinner_rotation()
+
     def start_status(self) -> None:
         """Start the status spinner with rotating messages."""
         self._spinner_step = 0

@@ -198,32 +198,32 @@ def _strip_image_content(messages: list) -> int:
     return removed
 
 
-def _save_data_url_images(data_urls: list[str], data_path: str | None) -> list[str]:
-    """Decode data-URL images and save them to data_path (or tempdir).
+def _extract_data_url_images(tool_response: str, data_path: str) -> str:
+    """Find data-URL images in a tool response, save them to *data_path*,
+    and replace each data URL with the local file path.
 
-    Returns a list of absolute file paths, one per data URL.
-    The caller can embed these paths as markdown ``![alt](path)`` so the
-    web UI's _extract_file_paths picks them up and serves them via /uploads/.
+    This prevents huge base64 blobs from polluting the message chain and
+    lets the web UI serve the images via ``/uploads/``.
     """
-    save_dir = data_path or tempfile.gettempdir()
-    os.makedirs(save_dir, exist_ok=True)
-    saved = []
-    for url in data_urls:
-        m = re.match(r'data:image/([^;]+);base64,(.+)', url, re.DOTALL)
-        if not m:
-            continue
+    pattern = re.compile(r'data:image/([^;]+);base64,([A-Za-z0-9+/=\s]+)', re.DOTALL)
+    os.makedirs(data_path, exist_ok=True)
+
+    def _replace(m: re.Match) -> str:
         mime_sub = m.group(1).strip()
-        b64 = m.group(2).replace("\n", "").replace("\r", "").strip()
+        b64 = m.group(2).replace("\n", "").replace("\r", "").replace(" ", "")
         ext = "jpg" if mime_sub in ("jpeg", "jpg") else mime_sub
         fname = f"{uuid.uuid4()}.{ext}"
-        fpath = os.path.join(save_dir, fname)
+        fpath = os.path.join(data_path, fname)
         try:
-            with open(fpath, "wb") as f:
-                f.write(base64.b64decode(b64))
-            saved.append(fpath)
+            raw = base64.b64decode(b64)
+            fd = os.open(fpath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+            return fpath
         except Exception:
-            pass
-    return saved
+            return m.group(0)  # leave unchanged on failure
+
+    return pattern.sub(_replace, tool_response)
 
 
 def _parse_truncated_tool_call(text: str, tool_registry) -> Optional[dict]:
@@ -296,6 +296,30 @@ def _looks_like_raw_tool_call(content: str) -> bool:
     return bool(re.search(r'"name"\s*:\s*"[^"]+"', text) and re.search(r'"arguments"\s*:', text))
 
 
+def _detect_tool_name_loop(history: list, min_repeats: int = 4) -> str | None:
+    """Detect if recent tool calls form a short repeating name pattern.
+
+    Checks for a 2-tool alternating pattern (A→B→A→B...) that repeats
+    at least *min_repeats* times.  Returns a human-readable description
+    of the pattern, or None.
+    """
+    names = [name for name, _ in history]
+    if len(names) < min_repeats * 2:
+        return None
+    pair = (names[-2], names[-1])
+    count = 0
+    idx = len(names) - 2
+    while idx >= 0 and idx + 1 < len(names):
+        if (names[idx], names[idx + 1]) == pair:
+            count += 1
+            idx -= 2
+        else:
+            break
+    if count >= min_repeats:
+        return f"{pair[0]} → {pair[1]} (repeated {count} times)"
+    return None
+
+
 def _extract_base64_file(tool_response: str, data_path: str) -> str:
     """Detect base64-encoded file data in a tool response and save it to disk.
 
@@ -353,6 +377,8 @@ async def _execute_tool_call(function_name: str,
 
     if chat_ui:
         chat_ui.add_log(f"Calling: {function_name}({function_arguments})", level="info")
+        if hasattr(chat_ui, 'show_tool_call'):
+            chat_ui.show_tool_call(function_name, function_arguments)
         chat_ui.render()
     elif verbose:
         print(f"{function_name}({function_arguments})")
@@ -386,12 +412,17 @@ async def _execute_tool_call(function_name: str,
             )
             if chat_ui:
                 chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
+                if hasattr(chat_ui, 'show_tool_result'):
+                    chat_ui.show_tool_result(function_name, round((time.monotonic() - _tool_start) * 1000),
+                                             success=False, error=f"timed out after {timeout}s")
             elif verbose:
                 print(f"{function_name} timed out after {timeout}s")
         _tool_elapsed_ms = round((time.monotonic() - _tool_start) * 1000)
         tool_response = "" if tool_response is None else str(tool_response)
         if data_path and "file_data_base64" in tool_response:
             tool_response = _extract_base64_file(tool_response, data_path)
+        if data_path and "data:image/" in tool_response:
+            tool_response = _extract_data_url_images(tool_response, data_path)
         if spatial_memory:
             spatial_update = spatial_memory.observe(function_name, function_arguments, tool_response)
             if spatial_update:
@@ -412,6 +443,8 @@ async def _execute_tool_call(function_name: str,
         truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
         if chat_ui:
             chat_ui.add_log(f"{function_name} [{_tool_elapsed_ms} ms] returned: {truncated}", level="debug")
+            if hasattr(chat_ui, 'show_tool_result'):
+                chat_ui.show_tool_result(function_name, _tool_elapsed_ms)
         elif verbose:
             print(f"{function_name} [{_tool_elapsed_ms} ms] returned: {truncated}")
 
@@ -425,6 +458,8 @@ async def _execute_tool_call(function_name: str,
     except Exception as e:
         if chat_ui:
             chat_ui.add_log(f"{function_name}({function_arguments}) error: {e}", level="error")
+            if hasattr(chat_ui, 'show_tool_result'):
+                chat_ui.show_tool_result(function_name, 0, success=False, error=str(e))
         elif verbose:
             print(f"{function_name}({function_arguments}) encountered an error: {e}")
         return {
@@ -534,8 +569,10 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
 
     MAX_CHAT_ITERATIONS = 100
     MAX_REPEATED_TOOL_CALLS = 30
+    MAX_TOOL_LOOP_PATTERN_REPEATS = 4  # 4 repeats of a 2-tool pair = 8 calls
     iteration_count = 0
     tool_call_history = []  # list of (name, args_json) tuples
+    loop_warning_injected = False
     non_vlm_mode = False  # set True after a "not a multimodal model" error
     no_tool_mode = False   # set True after server rejects tool_choice="auto"
 
@@ -789,6 +826,25 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     elif verbose:
                         print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
                     return msg
+                # Check for tool-name pattern loop (e.g. describe_scene→rotate_angle repeating)
+                loop_pattern = _detect_tool_name_loop(tool_call_history, MAX_TOOL_LOOP_PATTERN_REPEATS)
+                if loop_pattern:
+                    if loop_warning_injected:
+                        if chat_ui:
+                            chat_ui.add_log(f"Tool loop persisted after warning: {loop_pattern}", level="warning")
+                        return "I got stuck in a repetitive action loop. Let me report what I found so far and try a different approach next time."
+                    loop_warning_injected = True
+                    if chat_ui:
+                        chat_ui.add_log(f"Tool loop detected, injecting redirect: {loop_pattern}", level="warning")
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"[SYSTEM] Tool-call loop detected: {loop_pattern}. "
+                            "STOP the current repetitive pattern immediately. You MUST either: "
+                            "(1) navigate_to_pose or move_distance to a completely different location at least 1 m away, then scan from there, OR "
+                            "(2) if you believe the target cannot be found, summarize what you have searched and report your findings."
+                        ),
+                    })
                 continue  # loop back for the model to generate the final response
 
             # Guard against returning raw tool-call JSON to the user.
@@ -841,3 +897,22 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 elif verbose:
                     print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
                 return msg
+        # Check for tool-name pattern loop after processing all tool calls in this batch
+        loop_pattern = _detect_tool_name_loop(tool_call_history, MAX_TOOL_LOOP_PATTERN_REPEATS)
+        if loop_pattern:
+            if loop_warning_injected:
+                if chat_ui:
+                    chat_ui.add_log(f"Tool loop persisted after warning: {loop_pattern}", level="warning")
+                return "I got stuck in a repetitive action loop. Let me report what I found so far and try a different approach next time."
+            loop_warning_injected = True
+            if chat_ui:
+                chat_ui.add_log(f"Tool loop detected, injecting redirect: {loop_pattern}", level="warning")
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"[SYSTEM] Tool-call loop detected: {loop_pattern}. "
+                    "STOP the current repetitive pattern immediately. You MUST either: "
+                    "(1) navigate_to_pose or move_distance to a completely different location at least 1 m away, then scan from there, OR "
+                    "(2) if you believe the target cannot be found, summarize what you have searched and report your findings."
+                ),
+            })

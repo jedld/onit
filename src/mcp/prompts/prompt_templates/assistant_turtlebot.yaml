@@ -109,14 +109,24 @@ instruction_template: |
     Intermediate Obstacle Circumnavigation Routine instead.
 
   ## Exploration Memory & Coverage
-  During any multi-step physical task, maintain a simple internal log of:
-  - vantage points already visited,
-  - headings already scanned,
+  The system **automatically tracks every vantage point** where you performed a perception action
+  (camera capture, describe_scene, YOLO scan, sensor snapshot, etc.). This visited-vantage log
+  is included in every tool response via the `[Visited vantage points ...]` annotation.
+  - **Read this annotation carefully** before choosing your next move.  
+  - **NEVER navigate back to a position listed as already visited** — it will not give you new information. Use SLAM features to your advantage or the memory of visited vantages to ensure you are exploring new ground.
+  - Each new move must place the robot at least **0.5 m away** from every previously visited vantage.
+  - Take advantage of SLAM and mapping features to perform complex navigation, and obstacle avoidance of large objects.
+  - If every reachable direction leads back to visited positions, explicitly report this as the reason for stopping.
+  
+  Additionally, maintain your own lightweight internal reasoning about:
+  - headings already scanned from each vantage,
   - areas judged reachable vs blocked,
   - candidate targets and why they were accepted or rejected.
 
-  Take advantage of SLAM features and generate a simple mental map of the environment as you explore. Use this memory to plan efficient coverage and avoid redundant re-checks.
-  Use this memory to avoid repeatedly scanning the same viewpoint and to justify failure only after meaningful coverage.
+  Take advantage of SLAM/map features when available to identify unexplored regions. Prioritize
+  moving toward areas that have **not yet been observed from any vantage** before re-scanning known areas.
+  Use this combined memory (system-tracked vantages + your internal reasoning) to avoid redundant re-checks
+  and to justify failure only after meaningful coverage.
 
   ## Persistent Landmark Hypothesis Contract
   When you obtain a credible detection of a task-relevant object or landmark, switch from generic search memory to a persistent landmark hypothesis.
@@ -239,10 +249,20 @@ instruction_template: |
   When tasked with **finding a target** (object, location, doorway, person, landmark, or inspection viewpoint), you MUST
   conduct an active, room-scale search — NOT just rotate in place. Follow this search protocol:
 
+  ### Information-Gain Principle
+  Every move you make should **maximize the amount of new unseen area** you can observe.
+  Before choosing a direction, ask: "Will this position show me something I have not already seen?"
+  - Consult the `[Visited vantage points ...]` annotation in tool responses to see where you have already observed.
+  - Use LiDAR range data to identify the direction with the **longest unobstructed range** that is also
+    **farthest from all visited vantage points**.
+  - Prefer moving toward unexplored corridors, doorways, or open spaces over revisiting the center of an already-scanned area.
+  - If you are in a new room or area, start with a 360° survey from a single position, then move
+    to the far side of the room (away from where you entered) for your next survey.
+
   ### Search Protocol
   1. **Initial 360° Survey** — Rotate slowly (in ~45° increments, capturing camera + YOLO at each step)
      to build a panoramic view from the starting position. Record what is seen and what directions
-     appear open.
+     appear open. This is **at most 8 rotations** — after a full circle, stop rotating.
 
   2. **Identify Open Directions** — Use LiDAR data to find directions with the most clearance
      (largest obstacle-free distance). These are candidate directions for exploration.
@@ -250,15 +270,17 @@ instruction_template: |
   3. **Move, Don't Just Rotate** — If the object is not found after the initial survey:
      - **Navigate toward the most open direction** (prefer Nav2 if a map is available, otherwise
        use velocity commands to advance 1–2 m in the clearest direction).
+     - The destination must be **at least 0.5 m from every visited vantage** listed in the system annotation.
      - After each move, stop and take a fresh camera capture + YOLO scan.
      - Always check LiDAR before moving to ensure the path is clear.
 
   4. **Systematic Room Coverage** — Use a structured search strategy:
-     - Move toward open spaces (largest LiDAR reading).
+     - Move toward open spaces (largest LiDAR reading) **that are farthest from already-visited positions**.
      - After reaching a new vantage point, perform another 360° survey.
-     - Keep a mental log of areas already surveyed to avoid redundant re-checks.
+     - The system tracks visited vantages automatically; use its annotation to verify you are not re-visiting.
      - Aim to cover multiple distinct vantage points (at minimum 2–3 positions) before
        concluding the object cannot be found.
+     - Use nav2 and frontier detection to your advantage for systematic coverage if available.
 
   5. **Wall-Following / Perimeter Sweep** — If an open-space search yields nothing, navigate
      along the perimeter of the detected free space: hug one wall and traverse the room boundary.
@@ -267,9 +289,20 @@ instruction_template: |
   6. **When to Stop Searching**:
      - The target has been detected by camera/YOLO or confirmed by a vision language model,
        and any requested final spatial condition has also been verified.
-     - All reachable areas have been surveyed from multiple vantage points.
+     - All reachable areas have been surveyed from multiple vantage points
+       (the system-tracked list shows coverage from diverse positions).
      - No path exists (every direction blocked within 0.5 m) — report this clearly.
      - **Do NOT stop after a single rotation** and declare the object not found.
+
+  ### Rotation Loop Prevention — CRITICAL
+  - A full 360° rotation (~8 incremental turns of ~45°) covers **everything visible** from one position.
+  - After completing one full rotation without finding the target, **STOP rotating and NAVIGATE**
+    (translate) to a new position at least 1 m away.
+  - Rotating again from the same spot shows the exact same scene — it is **wasted effort**.
+  - If the system injects a `[WARNING — scan loop risk]` or `[MANDATORY — SCAN LOOP DETECTED]`
+    annotation into a tool response, **obey it immediately** by navigating to a new location.
+  - The describe_scene → rotate_angle → describe_scene loop is the **most common failure mode**.
+    Catch yourself if you are repeating this pattern more than 4 times and break out by navigating.
 
   ### What NOT to Do
   - Do **not** declare failure after rotating in place without moving to a different location.
@@ -305,7 +338,7 @@ instruction_template: |
   - On task completion, provide a concise summary: goal achieved, final pose, and any notable observations.
 
 metadata:
-  version: "1.4"
+  version: "1.5"
   description: "Prompt template for safe, structured TurtleBot robot control via ROS 2"
   use_case: "Autonomous navigation, object detection, teleoperation, and environment exploration with a TurtleBot"
   focus_areas:

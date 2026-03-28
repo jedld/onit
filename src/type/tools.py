@@ -166,12 +166,23 @@ class ToolHandler(RequestHandler):
 
         # MCP data types: https://github.com/modelcontextprotocol/python-sdk/blob/main/src/mcp/types.py
         if isinstance(content, ImageContent):
-            # Return as a data URL so vision-language models can receive the
-            # image inline through the tool-response message chain.
-            # content.data is already a base64 string; content.mimeType carries
-            # the correct type (e.g. "image/jpeg") set by the MCP server.
+            # Save the image to a temp file and return its path so it can
+            # be served via /uploads/ without bloating the message chain
+            # with a huge base64 blob.
             mime = content.mimeType or "image/jpeg"
-            response = f"data:{mime};base64,{content.data}"
+            mime_sub = mime.split("/")[-1] if "/" in mime else "png"
+            ext = "jpg" if mime_sub in ("jpeg", "jpg") else mime_sub
+            fname = f"{uuid.uuid4()}.{ext}"
+            fpath = os.path.join(tempfile.gettempdir(), fname)
+            try:
+                raw = base64.b64decode(content.data)
+                fd = os.open(fpath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+                response = fpath
+            except Exception:
+                # Fallback to data URL if file write fails
+                response = f"data:{mime};base64,{content.data}"
             if self.observer:
                 self.observer.record(
                     'mcp.response',

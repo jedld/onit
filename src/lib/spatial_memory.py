@@ -12,15 +12,22 @@ from typing import Any
 
 
 DEFAULT_HFOV_DEG = 62.0
+VANTAGE_DEDUP_RADIUS_M = 0.5
+MAX_VISITED_VANTAGES = 30
+SCAN_LOOP_SOFT_THRESHOLD = 3
+SCAN_LOOP_HARD_THRESHOLD = 6
 MOTION_TOOL_NAMES = {"move_robot", "move_distance", "rotate_angle", "navigate_to_pose", "go_to_waypoint"}
-PLANNER_CONTEXT_TOOL_NAMES = MOTION_TOOL_NAMES | {
-    "get_robot_pose",
+PERCEPTION_TOOL_NAMES = {
     "get_sensor_snapshot",
     "detect_objects_in_image",
+    "describe_scene",
     "ask_vision_agent",
     "ask_cosmos_agent",
     "get_depth_zones",
     "get_laser_scan",
+}
+PLANNER_CONTEXT_TOOL_NAMES = MOTION_TOOL_NAMES | PERCEPTION_TOOL_NAMES | {
+    "get_robot_pose",
 }
 
 
@@ -272,6 +279,8 @@ class SpatialMemory:
         self.state_path = os.path.join(data_path, "spatial_memory.json") if data_path else ""
         self.landmarks: list[dict[str, Any]] = []
         self.last_pose: _Pose | None = None
+        self.visited_vantages: list[dict[str, Any]] = []
+        self._scans_since_move: int = 0
         self.camera_hfov_deg = DEFAULT_HFOV_DEG
         self.image_width_px = 640.0
         if self.state_path:
@@ -284,23 +293,29 @@ class SpatialMemory:
             return None
         before = len(self.landmarks)
         changed_labels = parser(function_arguments, tool_response) or []
-        if not changed_labels:
+        scan_warning = self._scan_loop_warning()
+        if not changed_labels and not scan_warning:
             return None
-        self._persist()
-        if self.trace_recorder:
-            self.trace_recorder.record(
-                "agent.spatial_memory_updated",
-                session_id=self.session_id,
-                task_id=self.task_id,
-                tool_name=function_name,
-                landmarks=len(self.landmarks),
-                changed=changed_labels,
+        parts = []
+        if changed_labels:
+            self._persist()
+            if self.trace_recorder:
+                self.trace_recorder.record(
+                    "agent.spatial_memory_updated",
+                    session_id=self.session_id,
+                    task_id=self.task_id,
+                    tool_name=function_name,
+                    landmarks=len(self.landmarks),
+                    changed=changed_labels,
+                )
+            action = "added" if len(self.landmarks) > before else "updated"
+            parts.append(
+                f"[Spatial memory {action}: {', '.join(changed_labels)}. "
+                f"Tracked landmarks: {self.summary(max_items=6)}]"
             )
-        action = "added" if len(self.landmarks) > before else "updated"
-        return (
-            f"[Spatial memory {action}: {', '.join(changed_labels)}. "
-            f"Tracked landmarks: {self.summary(max_items=6)}]"
-        )
+        if scan_warning:
+            parts.append(scan_warning)
+        return "\n\n".join(parts)
 
     def summary(self, max_items: int = 8) -> str:
         if not self.landmarks:
@@ -327,34 +342,51 @@ class SpatialMemory:
         return "; ".join(items)
 
     def planner_context(self, max_items: int = 3) -> str | None:
-        if not self.landmarks:
+        if not self.landmarks and not self.visited_vantages:
             return None
-        entries = []
-        for landmark in self._ranked_landmarks()[:max_items]:
-            hypothesis = landmark.get("hypothesis") or {}
-            parts = [f"label={hypothesis.get('object_label') or landmark.get('label')}"]
-            if hypothesis.get("visible_face"):
-                parts.append(f"visible_face={hypothesis['visible_face']}")
-            if hypothesis.get("estimated_bearing_deg") is not None:
-                parts.append(f"bearing_deg={hypothesis['estimated_bearing_deg']}")
-            if hypothesis.get("approximate_range_m") is not None:
-                parts.append(f"range_m={hypothesis['approximate_range_m']}")
-            if hypothesis.get("relative_position"):
-                parts.append(f"relative_position={hypothesis['relative_position']}")
-            if hypothesis.get("confidence") is not None:
-                parts.append(f"confidence={hypothesis['confidence']}")
-            pose = hypothesis.get("last_confirmed_pose")
-            if isinstance(pose, dict):
-                parts.append(
-                    "last_confirmed_pose="
-                    f"({pose.get('x')}, {pose.get('y')}, yaw={pose.get('yaw_deg')})"
+        sections = []
+        if self.landmarks:
+            entries = []
+            for landmark in self._ranked_landmarks()[:max_items]:
+                hypothesis = landmark.get("hypothesis") or {}
+                parts = [f"label={hypothesis.get('object_label') or landmark.get('label')}"]
+                if hypothesis.get("visible_face"):
+                    parts.append(f"visible_face={hypothesis['visible_face']}")
+                if hypothesis.get("estimated_bearing_deg") is not None:
+                    parts.append(f"bearing_deg={hypothesis['estimated_bearing_deg']}")
+                if hypothesis.get("approximate_range_m") is not None:
+                    parts.append(f"range_m={hypothesis['approximate_range_m']}")
+                if hypothesis.get("relative_position"):
+                    parts.append(f"relative_position={hypothesis['relative_position']}")
+                if hypothesis.get("confidence") is not None:
+                    parts.append(f"confidence={hypothesis['confidence']}")
+                pose = hypothesis.get("last_confirmed_pose")
+                if isinstance(pose, dict):
+                    parts.append(
+                        "last_confirmed_pose="
+                        f"({pose.get('x')}, {pose.get('y')}, yaw={pose.get('yaw_deg')})"
+                    )
+                entries.append("{" + ", ".join(parts) + "}")
+            sections.append(
+                "Persistent landmark hypotheses: "
+                + "; ".join(entries)
+                + ". Reuse and update these hypotheses after each view or motion instead of restarting the search from scratch."
+            )
+        if self.visited_vantages:
+            vantage_strs = []
+            for v in self.visited_vantages[-8:]:
+                vantage_strs.append(
+                    f"({v['x']:.1f}, {v['y']:.1f}, yaw={v['yaw_deg']:.0f})"
                 )
-            entries.append("{" + ", ".join(parts) + "}")
-        return (
-            "[Persistent landmark hypotheses: "
-            + "; ".join(entries)
-            + ". Reuse and update these hypotheses after each view or motion instead of restarting the search from scratch.]"
-        )
+            sections.append(
+                f"Visited vantage points ({len(self.visited_vantages)} total): "
+                + ", ".join(vantage_strs)
+                + ". Do NOT revisit these positions — move to a NEW location that provides a different viewing angle before scanning again."
+            )
+        scan_warning = self._scan_loop_warning()
+        if scan_warning:
+            sections.append(scan_warning)
+        return "[" + " | " .join(sections) + "]" if sections else None
 
     def export(self) -> dict[str, Any]:
         return {
@@ -362,10 +394,47 @@ class SpatialMemory:
             "image_width_px": self.image_width_px,
             "last_pose": None if self.last_pose is None else self.last_pose.__dict__,
             "landmarks": self.landmarks,
+            "visited_vantages": self.visited_vantages,
+            "scans_since_move": self._scans_since_move,
         }
 
     def should_surface_to_planner(self, function_name: str) -> bool:
-        return bool(self.landmarks) and function_name in PLANNER_CONTEXT_TOOL_NAMES
+        return (bool(self.landmarks) or bool(self.visited_vantages)) and function_name in PLANNER_CONTEXT_TOOL_NAMES
+
+    def _record_vantage(self) -> None:
+        """Record the current pose as a visited vantage point if it is far enough from all existing ones."""
+        if self.last_pose is None:
+            return
+        for v in self.visited_vantages:
+            if math.hypot(v["x"] - self.last_pose.x, v["y"] - self.last_pose.y) < VANTAGE_DEDUP_RADIUS_M:
+                return
+        self.visited_vantages.append({
+            "x": round(self.last_pose.x, 2),
+            "y": round(self.last_pose.y, 2),
+            "yaw_deg": round(self.last_pose.yaw_deg, 1),
+        })
+        if len(self.visited_vantages) > MAX_VISITED_VANTAGES:
+            self.visited_vantages = self.visited_vantages[-MAX_VISITED_VANTAGES:]
+
+    def _scan_loop_warning(self) -> str | None:
+        """Return an escalating warning if perception scans repeat without translational motion."""
+        n = self._scans_since_move
+        if n >= SCAN_LOOP_HARD_THRESHOLD:
+            return (
+                f"[MANDATORY — SCAN LOOP DETECTED] You have performed {n} perception scans "
+                "without moving to a new position. Rotating in place does NOT count as exploration. "
+                "You MUST call navigate_to_pose or move_distance to travel at least 1 m to a new "
+                "location before any further scanning. Everything visible from this position has "
+                "already been seen — continued scanning here is wasted effort."
+            )
+        if n >= SCAN_LOOP_SOFT_THRESHOLD:
+            return (
+                f"[WARNING — scan loop risk] {n} perception scans from approximately the same "
+                "position without translational movement. After one full rotation (~8 turns), "
+                "everything visible from this location has been seen. Navigate to a different "
+                "position (at least 0.5 m away) to gain a new vantage point."
+            )
+        return None
 
     def _ranked_landmarks(self) -> list[dict[str, Any]]:
         return sorted(
@@ -396,11 +465,13 @@ class SpatialMemory:
         return []
 
     def _observe_get_sensor_snapshot(self, _arguments: dict[str, Any], tool_response: str) -> list[str]:
+        self._scans_since_move += 1
         payload = _safe_json_loads(tool_response)
         if not isinstance(payload, dict):
             return []
         pose = payload.get("pose") or {}
         self._observe_get_robot_pose({}, json.dumps(pose))
+        self._record_vantage()
         changed = []
         detections = payload.get("detections") or []
         for detection in detections:
@@ -420,6 +491,8 @@ class SpatialMemory:
         return changed
 
     def _observe_detect_objects_in_image(self, _arguments: dict[str, Any], tool_response: str) -> list[str]:
+        self._scans_since_move += 1
+        self._record_vantage()
         payload = _safe_json_loads(tool_response)
         if isinstance(payload, dict):
             detections = payload.get("detections") or payload.get("objects") or []
@@ -456,18 +529,29 @@ class SpatialMemory:
             self.camera_hfov_deg = float(hfov)
         return []
 
+    def _observe_describe_scene(self, _arguments: dict[str, Any], tool_response: str) -> list[str]:
+        self._scans_since_move += 1
+        self._record_vantage()
+        return self._observe_textual_scene("describe_scene", tool_response)
+
     def _observe_ask_vision_agent(self, _arguments: dict[str, Any], tool_response: str) -> list[str]:
+        self._scans_since_move += 1
+        self._record_vantage()
         return self._observe_textual_scene("ask_vision_agent", tool_response)
 
     def _observe_ask_cosmos_agent(self, _arguments: dict[str, Any], tool_response: str) -> list[str]:
+        self._scans_since_move += 1
+        self._record_vantage()
         return self._observe_textual_scene("ask_cosmos_agent", tool_response)
 
     def _observe_move_robot(self, _arguments: dict[str, Any], _tool_response: str) -> list[str]:
         self.last_pose = None
+        self._scans_since_move = 0
         return []
 
     def _observe_move_distance(self, _arguments: dict[str, Any], _tool_response: str) -> list[str]:
         self.last_pose = None
+        self._scans_since_move = 0
         return []
 
     def _observe_rotate_angle(self, _arguments: dict[str, Any], _tool_response: str) -> list[str]:
@@ -476,10 +560,12 @@ class SpatialMemory:
 
     def _observe_navigate_to_pose(self, _arguments: dict[str, Any], _tool_response: str) -> list[str]:
         self.last_pose = None
+        self._scans_since_move = 0
         return []
 
     def _observe_go_to_waypoint(self, _arguments: dict[str, Any], _tool_response: str) -> list[str]:
         self.last_pose = None
+        self._scans_since_move = 0
         return []
 
     def _observe_textual_scene(self, source: str, tool_response: str) -> list[str]:

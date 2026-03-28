@@ -184,3 +184,161 @@ Scene Description:
         # Confidence should be 0.3 (incidental from negative response), not None
         for lm in memory.landmarks:
             assert lm["confidence"] == 0.3, f"Expected 0.3 confidence, got {lm['confidence']}"
+
+    # ---- Vantage point tracking tests ----
+
+    def test_records_vantage_on_sensor_snapshot(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        payload = {
+            "pose": {"x": 1.0, "y": 2.0, "yaw_deg": 90.0},
+            "detections": [],
+        }
+        memory.observe("get_sensor_snapshot", {}, json.dumps(payload))
+
+        assert len(memory.visited_vantages) == 1
+        assert memory.visited_vantages[0]["x"] == 1.0
+        assert memory.visited_vantages[0]["y"] == 2.0
+
+    def test_deduplicates_nearby_vantage_points(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        memory.observe("get_robot_pose", {}, json.dumps({"x": 0.0, "y": 0.0, "yaw_deg": 0.0}))
+        memory.observe("ask_vision_agent", {}, json.dumps({"vlm_response": "A chair on the left side"}))
+        # Same position — should not add a second vantage
+        memory.observe("ask_vision_agent", {}, json.dumps({"vlm_response": "A table on the right side"}))
+
+        assert len(memory.visited_vantages) == 1
+
+    def test_records_distinct_vantage_points(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        memory.observe("get_robot_pose", {}, json.dumps({"x": 0.0, "y": 0.0, "yaw_deg": 0.0}))
+        memory.observe("ask_vision_agent", {}, json.dumps({"vlm_response": "A chair on the left side"}))
+        # Move far enough away — should add a new vantage
+        memory.observe("get_robot_pose", {}, json.dumps({"x": 3.0, "y": 0.0, "yaw_deg": 180.0}))
+        memory.observe("ask_vision_agent", {}, json.dumps({"vlm_response": "A door ahead"}))
+
+        assert len(memory.visited_vantages) == 2
+
+    def test_describe_scene_records_vantage_and_extracts_landmarks(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        memory.observe("get_robot_pose", {}, json.dumps({"x": 1.0, "y": 1.0, "yaw_deg": 45.0}))
+        response = {"vlm_response": "A red toolbox is centered in the frame at about 1.5m."}
+        update = memory.observe("describe_scene", {}, json.dumps(response))
+
+        assert len(memory.visited_vantages) == 1
+        assert memory.visited_vantages[0]["x"] == 1.0
+        assert update is not None
+        labels = [lm["label"] for lm in memory.landmarks]
+        assert any("toolbox" in label.lower() for label in labels)
+
+    def test_planner_context_includes_visited_vantages(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        memory.observe("get_robot_pose", {}, json.dumps({"x": 0.0, "y": 0.0, "yaw_deg": 0.0}))
+        memory.observe(
+            "get_sensor_snapshot",
+            {},
+            json.dumps({
+                "pose": {"x": 0.0, "y": 0.0, "yaw_deg": 0.0},
+                "detections": [{"label": "chair", "distance_m": 1.0, "bbox": {"cx": 320, "cy": 100, "w": 50, "h": 60}, "confidence": 0.8}],
+            }),
+        )
+        context = memory.planner_context()
+        assert context is not None
+        assert "Visited vantage points" in context
+        assert "(0.0, 0.0" in context
+        assert "Do NOT revisit" in context
+
+    def test_planner_context_with_only_vantages_no_landmarks(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        # Observe sensor snapshot with empty detections — vantage recorded but no landmarks
+        memory.observe(
+            "get_sensor_snapshot",
+            {},
+            json.dumps({"pose": {"x": 2.0, "y": 3.0, "yaw_deg": 90.0}, "detections": []}),
+        )
+        assert len(memory.visited_vantages) == 1
+        assert len(memory.landmarks) == 0
+        # should_surface_to_planner should still be True because of vantages
+        assert memory.should_surface_to_planner("get_sensor_snapshot") is True
+        context = memory.planner_context()
+        assert context is not None
+
+    # ── Scan-loop detection tests ──
+
+    def test_scan_counter_increments_on_perception(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        assert memory._scans_since_move == 0
+        memory.observe("describe_scene", {}, '{"vlm_response": "A room with a table."}')
+        assert memory._scans_since_move == 1
+        memory.observe("describe_scene", {}, '{"vlm_response": "A room with a table."}')
+        assert memory._scans_since_move == 2
+
+    def test_scan_counter_resets_on_translational_motion(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        memory.observe("describe_scene", {}, '{"vlm_response": "A room."}')
+        memory.observe("describe_scene", {}, '{"vlm_response": "A room."}')
+        assert memory._scans_since_move == 2
+        memory.observe("move_distance", {}, '{"success": true}')
+        assert memory._scans_since_move == 0
+
+    def test_scan_counter_not_reset_by_rotation(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        memory.observe("describe_scene", {}, '{"vlm_response": "A room."}')
+        memory.observe("describe_scene", {}, '{"vlm_response": "A room."}')
+        assert memory._scans_since_move == 2
+        memory.observe("rotate_angle", {}, '{"success": true}')
+        assert memory._scans_since_move == 2  # rotation does NOT reset
+
+    def test_soft_warning_at_threshold(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        from lib.spatial_memory import SCAN_LOOP_SOFT_THRESHOLD
+        for _ in range(SCAN_LOOP_SOFT_THRESHOLD):
+            memory.observe("describe_scene", {}, '{"vlm_response": "Nothing here."}')
+        warning = memory._scan_loop_warning()
+        assert warning is not None
+        assert "WARNING" in warning
+
+    def test_hard_warning_at_threshold(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        from lib.spatial_memory import SCAN_LOOP_HARD_THRESHOLD
+        for _ in range(SCAN_LOOP_HARD_THRESHOLD):
+            memory.observe("describe_scene", {}, '{"vlm_response": "Nothing here."}')
+        warning = memory._scan_loop_warning()
+        assert warning is not None
+        assert "MANDATORY" in warning
+
+    def test_scan_warning_surfaces_in_observe(self, tmp_path):
+        """observe() should return the scan-loop warning even when no landmarks changed."""
+        memory = SpatialMemory(str(tmp_path))
+        from lib.spatial_memory import SCAN_LOOP_SOFT_THRESHOLD
+        for _ in range(SCAN_LOOP_SOFT_THRESHOLD):
+            result = memory.observe("describe_scene", {}, '{"vlm_response": "Empty room."}')
+        # The last observe should return the warning
+        assert result is not None
+        assert "WARNING" in result
+
+    def test_scan_warning_surfaces_in_planner_context(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        from lib.spatial_memory import SCAN_LOOP_SOFT_THRESHOLD
+        # Set pose so vantage is recorded
+        memory.observe("get_robot_pose", {}, json.dumps({"x": 1.0, "y": 1.0, "yaw_deg": 0.0}))
+        for _ in range(SCAN_LOOP_SOFT_THRESHOLD):
+            memory.observe("describe_scene", {}, '{"vlm_response": "Empty room."}')
+        context = memory.planner_context()
+        assert context is not None
+        assert "WARNING" in context or "scan loop" in context.lower()
+
+    def test_navigate_to_pose_resets_scan_counter(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        for _ in range(5):
+            memory.observe("describe_scene", {}, '{"vlm_response": "Nothing."}')
+        assert memory._scans_since_move == 5
+        memory.observe("navigate_to_pose", {}, '{"success": true}')
+        assert memory._scans_since_move == 0
+        assert memory._scan_loop_warning() is None
+
+    def test_export_includes_scans_since_move(self, tmp_path):
+        memory = SpatialMemory(str(tmp_path))
+        memory.observe("describe_scene", {}, '{"vlm_response": "A table."}')
+        export = memory.export()
+        assert "scans_since_move" in export
+        assert export["scans_since_move"] == 1
