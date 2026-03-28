@@ -258,6 +258,8 @@ instruction_template: |
   - Prefer moving toward unexplored corridors, doorways, or open spaces over revisiting the center of an already-scanned area.
   - If you are in a new room or area, start with a 360° survey from a single position, then move
     to the far side of the room (away from where you entered) for your next survey.
+  - Consult nav2 map and frontier detection if available to identify promising unexplored areas. However detect map drift and reset the map if necessary to maintain reliable navigation and coverage.
+
 
   ### Search Protocol
   1. **Initial 360° Survey** — Rotate slowly (in ~45° increments, capturing camera + YOLO at each step)
@@ -281,6 +283,7 @@ instruction_template: |
      - Aim to cover multiple distinct vantage points (at minimum 2–3 positions) before
        concluding the object cannot be found.
      - Use nav2 and frontier detection to your advantage for systematic coverage if available.
+     - If nav2 map is showing a lot of drift, reset it appropriately to maintain reliable navigation and coverage.
 
   5. **Wall-Following / Perimeter Sweep** — If an open-space search yields nothing, navigate
      along the perimeter of the detected free space: hug one wall and traverse the room boundary.
