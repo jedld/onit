@@ -1318,19 +1318,54 @@ class OnIt(BaseModel):
                     break
 
                 if response is None:
-                    # API error — ask user whether to retry
-                    self._cleanup_enter_key_listener(loop)
-                    # Surface the last error log so the user can diagnose the issue
+                    # API error — auto-retry with backoff before giving up
                     error_detail = ""
                     if hasattr(self.chat_ui, 'execution_logs') and self.chat_ui.execution_logs:
                         last_log = self.chat_ui.execution_logs[-1]
                         if last_log.get("level") in ("error", "warning"):
                             error_detail = f" ({last_log['message']})"
-                    self.chat_ui.add_message("system", f"Unable to get a response from the model{error_detail}. Would you like to retry? (yes/no)")
-                    retry_input = await self._get_user_task(loop)
-                    if retry_input.lower().strip() in ('yes', 'y'):
-                        self._restore_enter_key_listener(loop, on_enter_cb)
-                        continue
+
+                    retry_delays = [30, 60, 120]
+                    retry_succeeded = False
+                    for attempt, delay in enumerate(retry_delays, 1):
+                        self.chat_ui.add_message("system", f"Unable to get a response from the model{error_detail}. Retrying in {delay}s (attempt {attempt}/{len(retry_delays)})...")
+                        await asyncio.sleep(delay)
+
+                        # Clear queues before retry
+                        while not self.safety_queue.empty():
+                            self.safety_queue.get_nowait()
+
+                        agent_task = asyncio.create_task(self.agent_session())
+                        await self.input_queue.put(instruction)
+
+                        final_answer_task = asyncio.create_task(self.output_queue.get())
+                        done, pending = await asyncio.wait([final_answer_task],
+                                                           return_when=asyncio.FIRST_COMPLETED)
+                        for t in pending:
+                            t.cancel()
+
+                        if final_answer_task in done:
+                            response = final_answer_task.result()
+                            if response is not None and response != STOP_TAG:
+                                retry_succeeded = True
+                                break
+                            if response == STOP_TAG:
+                                await _call_sandbox_stop(self.tool_registry, self.session_id, sandbox=self.sandbox)
+                                self.chat_ui.add_message("system", "Task stopped by user.")
+                                break
+
+                    if retry_succeeded:
+                        # success on retry
+                        elapsed_time = self._format_elapsed_time(loop.time() - start_time)
+                        self._handle_successful_response(response, task, elapsed_time, loop)
+                        break
+
+                    if response == STOP_TAG:
+                        break
+
+                    # All retries exhausted — give up
+                    self._cleanup_enter_key_listener(loop)
+                    self.chat_ui.add_message("system", f"Unable to get a response from the model{error_detail} after {len(retry_delays)} retries. Giving up.")
                     break
 
                 # success
