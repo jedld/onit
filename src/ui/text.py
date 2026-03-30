@@ -894,41 +894,37 @@ class ChatUI:
         Returns:
             Updated (current_input, cursor_pos, temp_history_index, saved_input, num_display_lines).
         """
-        if code == 'A':  # Up arrow
-            if self.input_history:
-                if temp_history_index == -1:
-                    saved_input = ''.join(current_input)
-                    temp_history_index = len(self.input_history) - 1
-                elif temp_history_index > 0:
-                    temp_history_index -= 1
+        if code == 'A' and self.input_history:  # Up arrow
+            if temp_history_index == -1:
+                saved_input = ''.join(current_input)
+                temp_history_index = len(self.input_history) - 1
+            elif temp_history_index > 0:
+                temp_history_index -= 1
 
-                if temp_history_index >= 0:
-                    current_input = list(self.input_history[temp_history_index])
-                    cursor_pos = len(current_input)
-                    num_display_lines = self._redraw_line(prompt, current_input, num_display_lines)
-
-        elif code == 'B':  # Down arrow
-            if temp_history_index != -1:
-                temp_history_index += 1
-                if temp_history_index >= len(self.input_history):
-                    temp_history_index = -1
-                    current_input = list(saved_input)
-                else:
-                    current_input = list(self.input_history[temp_history_index])
+            if temp_history_index >= 0:
+                current_input = list(self.input_history[temp_history_index])
                 cursor_pos = len(current_input)
                 num_display_lines = self._redraw_line(prompt, current_input, num_display_lines)
 
-        elif code == 'C':  # Right arrow
-            if cursor_pos < len(current_input):
-                cursor_pos += 1
-                sys.stdout.write('\033[C')
-                sys.stdout.flush()
+        elif code == 'B' and temp_history_index != -1:  # Down arrow
+            temp_history_index += 1
+            if temp_history_index >= len(self.input_history):
+                temp_history_index = -1
+                current_input = list(saved_input)
+            else:
+                current_input = list(self.input_history[temp_history_index])
+            cursor_pos = len(current_input)
+            num_display_lines = self._redraw_line(prompt, current_input, num_display_lines)
 
-        elif code == 'D':  # Left arrow
-            if cursor_pos > 0:
-                cursor_pos -= 1
-                sys.stdout.write('\033[D')
-                sys.stdout.flush()
+        elif code == 'C' and cursor_pos < len(current_input):  # Right arrow
+            cursor_pos += 1
+            sys.stdout.write('\033[C')
+            sys.stdout.flush()
+
+        elif code == 'D' and cursor_pos > 0:  # Left arrow
+            cursor_pos -= 1
+            sys.stdout.write('\033[D')
+            sys.stdout.flush()
 
         return current_input, cursor_pos, temp_history_index, saved_input, num_display_lines
 
