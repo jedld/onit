@@ -44,6 +44,13 @@ def _truncate_tool_response(response: str) -> str:
     return response[:half] + f"\n\n... [truncated {len(response) - MAX_TOOL_RESPONSE} chars] ...\n\n" + response[-half:]
 
 
+def _log_to_ui_or_verbose(message: str, chat_ui, verbose: bool, level: str = "info") -> None:
+    if chat_ui:
+        chat_ui.add_log(message, level=level)
+    elif verbose:
+        print(message)
+
+
 def _resolve_api_key(host: str, host_key: str = "EMPTY") -> str:
     """Resolve the API key based on the host URL.
 
@@ -424,96 +431,86 @@ async def _execute_tool(function_name: str, function_arguments: dict,
     elif verbose:
         print(f"{function_name}({function_arguments})")
 
-    for tool_name in tool_registry.tools:
-        if tool_name == function_name:
-            try:
-                tool_handler = tool_registry[tool_name]
-                try:
-                    # Build a log handler to forward MCP notifications/message
-                    # to the UI in real-time (e.g. sandbox stdout/stderr).
-                    _log_handler = None
-                    if chat_ui and hasattr(chat_ui, 'tool_log'):
-                        async def _log_handler(msg):
-                            chat_ui.tool_log(function_name, msg.data, level=msg.level)
-                    tool_task = asyncio.ensure_future(tool_handler(log_handler=_log_handler, **function_arguments))
-
-                    async def _heartbeat(interval=10):
-                        """Send periodic progress events to keep SSE alive."""
-                        elapsed = 0
-                        while True:
-                            await asyncio.sleep(interval)
-                            elapsed += interval
-                            if chat_ui:
-                                chat_ui.tool_progress(function_name, elapsed)
-
-                    heartbeat_task = asyncio.ensure_future(_heartbeat())
-                    try:
-                        tool_response = await asyncio.wait_for(tool_task, timeout=timeout)
-                    finally:
-                        heartbeat_task.cancel()
-                        try:
-                            await heartbeat_task
-                        except asyncio.CancelledError:
-                            pass
-                except asyncio.TimeoutError:
-                    tool_response = (f"- tool call timed out after {timeout} seconds. "
-                                     "Tool might have succeeded but no response was received. "
-                                     "Check expected output.")
-                    if chat_ui:
-                        chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
-                    elif verbose:
-                        print(f"{function_name} timed out after {timeout}s")
-                if is_structured and chat_ui:
-                    chat_ui.stop_tool_spinner()
-                tool_response = "" if tool_response is None else str(tool_response)
-                _vision_b64, _vision_mime = None, None
-                if data_path and "file_data_base64" in tool_response:
-                    tool_response, _vision_b64, _vision_mime = _extract_base64_file(tool_response, data_path)
-                tool_response = _truncate_tool_response(tool_response)
-                if _vision_b64:
-                    tool_content = [
-                        {"type": "text", "text": tool_response},
-                        {"type": "image_url", "image_url": {"url": f"data:{_vision_mime};base64,{_vision_b64}"}},
-                    ]
-                else:
-                    tool_content = tool_response
-                tool_message = {'role': 'tool', 'content': tool_content, 'name': function_name,
-                                'parameters': function_arguments, "tool_call_id": tool_call_id}
-                messages.append(tool_message)
-                if chat_ui:
-                    chat_ui.add_tool_result(function_name, tool_response)
-                    if is_structured:
-                        chat_ui.show_tool_done(function_name, tool_response)
-                elif verbose:
-                    truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
-                    print(f"{function_name}({function_arguments}) returned: {truncated}")
-            except Exception as e:
-                if chat_ui:
-                    if is_structured:
-                        chat_ui.stop_tool_spinner()
-                        chat_ui.show_tool_done(function_name, str(e), success=False)
-                    chat_ui.add_log(f"{function_name} error: {e}", level="error")
-                elif verbose:
-                    print(f"{function_name}({function_arguments}) encountered an error: {e}")
-                tool_message = {'role': 'tool', 'content': f'Error: {e}', 'name': function_name,
-                                'parameters': function_arguments, "tool_call_id": tool_call_id}
-                messages.append(tool_message)
-            break
-    else:
+    if function_name not in tool_registry.tools:
         tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found',
                         'name': function_name, 'parameters': function_arguments,
                         "tool_call_id": tool_call_id}
         messages.append(tool_message)
+    else:
+        tool_handler = tool_registry[function_name]
+        try:
+            try:
+                # Build a log handler to forward MCP notifications/message
+                # to the UI in real-time (e.g. sandbox stdout/stderr).
+                _log_handler = None
+                if chat_ui and hasattr(chat_ui, 'tool_log'):
+                    async def _log_handler(msg):
+                        chat_ui.tool_log(function_name, msg.data, level=msg.level)
+                tool_task = asyncio.ensure_future(tool_handler(log_handler=_log_handler, **function_arguments))
+
+                async def _heartbeat(interval=10):
+                    """Send periodic progress events to keep SSE alive."""
+                    elapsed = 0
+                    while True:
+                        await asyncio.sleep(interval)
+                        elapsed += interval
+                        if chat_ui:
+                            chat_ui.tool_progress(function_name, elapsed)
+
+                heartbeat_task = asyncio.ensure_future(_heartbeat())
+                try:
+                    tool_response = await asyncio.wait_for(tool_task, timeout=timeout)
+                finally:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+            except asyncio.TimeoutError:
+                tool_response = (f"- tool call timed out after {timeout} seconds. "
+                                 "Tool might have succeeded but no response was received. "
+                                 "Check expected output.")
+                _log_to_ui_or_verbose(f"{function_name} timed out after {timeout}s", chat_ui, verbose, level="warning")
+            if is_structured and chat_ui:
+                chat_ui.stop_tool_spinner()
+            tool_response = "" if tool_response is None else str(tool_response)
+            _vision_b64, _vision_mime = None, None
+            if data_path and "file_data_base64" in tool_response:
+                tool_response, _vision_b64, _vision_mime = _extract_base64_file(tool_response, data_path)
+            tool_response = _truncate_tool_response(tool_response)
+            if _vision_b64:
+                tool_content = [
+                    {"type": "text", "text": tool_response},
+                    {"type": "image_url", "image_url": {"url": f"data:{_vision_mime};base64,{_vision_b64}"}},
+                ]
+            else:
+                tool_content = tool_response
+            tool_message = {'role': 'tool', 'content': tool_content, 'name': function_name,
+                            'parameters': function_arguments, "tool_call_id": tool_call_id}
+            messages.append(tool_message)
+            if chat_ui:
+                chat_ui.add_tool_result(function_name, tool_response)
+                if is_structured:
+                    chat_ui.show_tool_done(function_name, tool_response)
+            elif verbose:
+                truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
+                print(f"{function_name}({function_arguments}) returned: {truncated}")
+        except Exception as e:
+            if chat_ui:
+                if is_structured:
+                    chat_ui.stop_tool_spinner()
+                    chat_ui.show_tool_done(function_name, str(e), success=False)
+            _log_to_ui_or_verbose(f"{function_name} error: {e}", chat_ui, verbose, level="error")
+            tool_message = {'role': 'tool', 'content': f'Error: {e}', 'name': function_name,
+                            'parameters': function_arguments, "tool_call_id": tool_call_id}
+            messages.append(tool_message)
 
     # Check for repeated tool calls
     call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
     tool_call_history.append(call_key)
     if tool_call_history.count(call_key) >= max_repeated:
         msg = f"I am sorry 😊. Could you try to rephrase or provide additional details?"
-        if chat_ui:
-            chat_ui.add_log(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", level="warning")
-        elif verbose:
-            print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
+        _log_to_ui_or_verbose(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", chat_ui, verbose, level="warning")
         return msg
     return None
 
@@ -527,20 +524,14 @@ def _load_images(images: List[str] | str | None, chat_ui, verbose: bool) -> list
                 with open(image_path, 'rb') as image_file:
                     images_bytes.append(base64.b64encode(image_file.read()).decode('utf-8'))
             else:
-                if chat_ui:
-                    chat_ui.add_log(f"Image file {image_path} not found, proceeding without this image.", level="warning")
-                elif verbose:
-                    print(f"Image file {image_path} not found, proceeding without this image.")
+                _log_to_ui_or_verbose(f"Image file {image_path} not found, proceeding without this image.", chat_ui, verbose, level="warning")
     elif isinstance(images, str):
         image_path = images
         if os.path.exists(image_path):
             with open(image_path, 'rb') as image_file:
                 images_bytes = [base64.b64encode(image_file.read()).decode('utf-8')]
         else:
-            if chat_ui:
-                chat_ui.add_log(f"Image file {image_path} not found, proceeding without this image.", level="warning")
-            elif verbose:
-                print(f"Image file {image_path} not found, proceeding without this image.")
+            _log_to_ui_or_verbose(f"Image file {image_path} not found, proceeding without this image.", chat_ui, verbose, level="warning")
     return images_bytes
 
 
@@ -765,10 +756,7 @@ async def _handle_raw_tool_call(
     # If the content looks like a tool call but couldn't be parsed,
     # ask the model to retry without tools.
     if _looks_like_raw_tool_call(last_response):
-        if chat_ui:
-            chat_ui.add_log("Model returned unparseable raw tool-call JSON, retrying without tools.", level="warning")
-        elif verbose:
-            print("Model returned unparseable raw tool-call JSON, retrying without tools.")
+        _log_to_ui_or_verbose("Model returned unparseable raw tool-call JSON, retrying without tools.", chat_ui, verbose, level="warning")
         messages.append({"role": "assistant", "content": last_response})
         messages.append({"role": "user", "content": "Please provide your answer as plain text, not as a JSON tool call."})
         return True, None
@@ -869,10 +857,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             except Exception as e:
                 _err = f"Failed to resolve model from {host} (attempt {_attempt}/{_MODEL_RETRIES}): {e}"
                 logger.error(_err)
-                if chat_ui:
-                    chat_ui.add_log(_err, level="error")
-                elif verbose:
-                    print(_err)
+                _log_to_ui_or_verbose(_err, chat_ui, verbose, level="error")
                 if _attempt < _MODEL_RETRIES:
                     await asyncio.sleep(min(2 ** _attempt, 10))
         if model is None:
@@ -880,9 +865,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
 
     if chat_ui:
         chat_ui.model_name = model
-        chat_ui.add_log(f"Starting chat with model: {model}", level="info")
-    elif verbose:
-        print(f"Starting chat with model: {model}")
+    _log_to_ui_or_verbose(f"Starting chat with model: {model}", chat_ui, verbose, level="info")
 
     MAX_CHAT_ITERATIONS = -1
     MAX_REPEATED_TOOL_CALLS = 30
@@ -894,10 +877,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
         iteration_count += 1
         if MAX_CHAT_ITERATIONS >= 0 and iteration_count > MAX_CHAT_ITERATIONS:
             msg = f"I am sorry 😊. Could you try to rephrase or provide additional details?"
-            if chat_ui:
-                chat_ui.add_log(f"Chat loop exceeded {MAX_CHAT_ITERATIONS} iterations, stopping.", level="warning")
-            elif verbose:
-                print(f"Chat loop exceeded {MAX_CHAT_ITERATIONS} iterations, stopping.")
+            _log_to_ui_or_verbose(f"Chat loop exceeded {MAX_CHAT_ITERATIONS} iterations, stopping.", chat_ui, verbose, level="warning")
             return msg
 
         _strip_old_images(messages)
@@ -954,33 +934,21 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             except (APITimeoutError, httpx.ReadTimeout) as e:
                 api_error = f"Request to {host} timed out (read timeout during streaming)."
                 logger.error(api_error)
-                if chat_ui:
-                    chat_ui.add_log(api_error, level="error")
-                elif verbose:
-                    print(api_error)
+                _log_to_ui_or_verbose(api_error, chat_ui, verbose, level="error")
             except OpenAIError as e:
                 api_error = f"Error communicating with {host}: {e}."
                 logger.error(api_error)
-                if chat_ui:
-                    chat_ui.add_log(api_error, level="warning")
-                elif verbose:
-                    print(api_error)
+                _log_to_ui_or_verbose(api_error, chat_ui, verbose, level="warning")
             except Exception as e:
                 api_error = f"Unexpected error ({type(e).__name__}): {e}"
                 logger.error(api_error, exc_info=True)
-                if chat_ui:
-                    chat_ui.add_log(api_error, level="error")
-                elif verbose:
-                    print(api_error)
+                _log_to_ui_or_verbose(api_error, chat_ui, verbose, level="error")
 
             # Log retry attempt if we haven't exhausted retries
             if api_attempt < MAX_API_RETRIES:
                 retry_msg = f"Retrying API call (attempt {api_attempt + 1}/{MAX_API_RETRIES})..."
                 logger.info(retry_msg)
-                if chat_ui:
-                    chat_ui.add_log(retry_msg, level="info")
-                elif verbose:
-                    print(retry_msg)
+                _log_to_ui_or_verbose(retry_msg, chat_ui, verbose, level="info")
                 await asyncio.sleep(min(2 ** api_attempt, 10))  # exponential backoff
 
         if api_error is not None:
