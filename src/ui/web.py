@@ -525,25 +525,27 @@ class WebChatUI:
                         continue
                     try:
                         entry = json.loads(line)
-                        if "task" in entry and "response" in entry:
-                            # Replace raw absolute file paths with friendly basenames
-                            task_display = entry["task"]
-                            task_display = re.sub(
-                                r'Relevant files:\s*/[^\s]+/([^\s/]+)',
-                                lambda m: f'📎 {m.group(1)}',
-                                task_display,
+                        if "task" not in entry or "response" not in entry:
+                            continue
+                        # Replace raw absolute file paths with friendly basenames
+                        task_display = entry["task"]
+                        task_display = re.sub(
+                            r'Relevant files:\s*/[^\s]+/([^\s/]+)',
+                            lambda m: f'📎 {m.group(1)}',
+                            task_display,
+                        )
+                        messages.append(gr.ChatMessage(role="user", content=task_display))
+                        display, file_paths = self._extract_file_paths(entry["response"], data_path=data_path, session_id=session_id)
+                        messages.append(gr.ChatMessage(role="assistant", content=display))
+                        for fpath in file_paths:
+                            if not os.path.isfile(fpath):
+                                continue
+                            messages.append(
+                                gr.ChatMessage(
+                                    role="assistant",
+                                    content=gr.FileData(path=fpath, mime_type=None),
+                                )
                             )
-                            messages.append(gr.ChatMessage(role="user", content=task_display))
-                            display, file_paths = self._extract_file_paths(entry["response"], data_path=data_path, session_id=session_id)
-                            messages.append(gr.ChatMessage(role="assistant", content=display))
-                            for fpath in file_paths:
-                                if os.path.isfile(fpath):
-                                    messages.append(
-                                        gr.ChatMessage(
-                                            role="assistant",
-                                            content=gr.FileData(path=fpath, mime_type=None),
-                                        )
-                                    )
                     except json.JSONDecodeError:
                         continue
         except Exception:
