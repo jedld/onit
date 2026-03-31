@@ -135,6 +135,7 @@ class ChatUI:
         self._thinking_thread: Optional[threading.Thread] = None
         self.model_name = ""  # auto-detected model name, set by chat()
         self._context_pct: float = 0.0  # context window usage 0-100, updated after each LLM call
+        self._context_max_tokens: int = 0  # max context window size in tokens
         self._stream_header_printed = False  # lazy: header deferred until first visible token
         self._stream_pending = ""  # buffer tokens until first non-whitespace
         self._stream_think_started = False  # True while a think block is open
@@ -423,7 +424,7 @@ class ChatUI:
         content.append(f"┌─ ⚙️  {name} ", style="bold dark_orange3")
         content.append(f"[{msg_time}]", style=self.theme.styles.get("timestamp", "cyan"))
         if self._context_pct > 0:
-            content.append(f"  ctx:{self._context_pct:.0f}%", style="dim cyan")
+            content.append(f"  {self._fmt_ctx_label()}", style="bright_cyan")
         content.append("\n", style="default")
         content.append(f"{args_str}\n", style="dim white")
         content.append("└" + "─" * 40 + "\n", style="dark_orange3")
@@ -554,7 +555,7 @@ class ChatUI:
             while True:
                 frame = _FRAMES[frame_idx % len(_FRAMES)]
                 msg = self._spinner_messages[msg_idx % len(self._spinner_messages)]
-                line = f"\r\033[1;34m{frame} {msg}\033[0m\033[K"
+                line = f"\r\033[1;96m{frame} {msg}\033[0m\033[K"
                 sys.stdout.write(line)
                 sys.stdout.flush()
                 frame_idx += 1
@@ -592,9 +593,19 @@ class ChatUI:
 
     # ── Context usage display ──────────────────────────────────────
 
-    def set_context_usage(self, pct: float) -> None:
-        """Update the context window usage percentage (0–100)."""
+    def _fmt_ctx_label(self) -> str:
+        """Return a compact ctx label like 'ctx:42%/128k'."""
+        label = f"ctx:{self._context_pct:.0f}%"
+        if self._context_max_tokens:
+            k = self._context_max_tokens // 1000
+            label += f"/{k}k"
+        return label
+
+    def set_context_usage(self, pct: float, max_tokens: int = 0) -> None:
+        """Update the context window usage percentage (0–100) and max token count."""
         self._context_pct = pct
+        if max_tokens:
+            self._context_max_tokens = max_tokens
 
     def show_context_compaction(self, orig_msg_count: int, summary_chars: int) -> None:
         """Print an inline notification when the context window is compacted."""
@@ -611,11 +622,11 @@ class ChatUI:
         ts = self.format_timestamp()
         args_str = json.dumps(arguments, ensure_ascii=False)
         t = Text()
-        ctx_suffix = f"  ctx:{self._context_pct:.0f}%" if self._context_pct > 0 else ""
+        ctx_suffix = f"  {self._fmt_ctx_label()}" if self._context_pct > 0 else ""
         t.append(f"┌─ ⚙️  {name} ", style="bold dark_orange3")
         t.append(f"[{ts}]", style=self.theme.styles.get("timestamp", "cyan"))
         if ctx_suffix:
-            t.append(ctx_suffix, style="dim cyan")
+            t.append(ctx_suffix, style="bright_cyan")
         t.append("\n", style="default")
         t.append(f"{args_str}\n", style="dim white")
         t.append("└" + "─" * 40, style="dark_orange3")
@@ -821,10 +832,13 @@ class ChatUI:
         if stream_elapsed > 0 and self._stream_token_count > 0:
             tok_s = self._stream_token_count / stream_elapsed
             footer += f"  ({tok_s:.1f} tok/s)"
-        # Append context window usage percentage
         if self._context_pct > 0:
-            footer += f"  ctx:{self._context_pct:.0f}%"
-        self.console.print(footer, style=self.theme.styles.get("assistant", "magenta"))
+            t = Text()
+            t.append(footer, style=self.theme.styles.get("assistant", "magenta"))
+            t.append(f"  {self._fmt_ctx_label()}", style="bright_cyan")
+            self.console.print(t)
+        else:
+            self.console.print(footer, style=self.theme.styles.get("assistant", "magenta"))
         # Warn when context is getting full (≥75%)
         if self._context_pct >= 90:
             self.console.print(

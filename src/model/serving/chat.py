@@ -1013,7 +1013,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
         if _last_prompt_tokens > 0 and max_context_tokens:
             usage_pct = _last_prompt_tokens / max_context_tokens
             if chat_ui and hasattr(chat_ui, "set_context_usage"):
-                chat_ui.set_context_usage(usage_pct * 100)
+                chat_ui.set_context_usage(usage_pct * 100, max_context_tokens)
             if usage_pct >= CONTEXT_COMPACT_THRESHOLD:
                 _log_to_ui_or_verbose(
                     f"Context at {usage_pct:.0%} ({_last_prompt_tokens:,}/{max_context_tokens:,} tokens). Compacting...",
@@ -1069,7 +1069,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     if _stream_usage is not None:
                         _last_prompt_tokens = _stream_usage.prompt_tokens
                         if max_context_tokens and chat_ui and hasattr(chat_ui, "set_context_usage"):
-                            chat_ui.set_context_usage(_last_prompt_tokens / max_context_tokens * 100)
+                            chat_ui.set_context_usage(_last_prompt_tokens / max_context_tokens * 100, max_context_tokens)
                     _content, _tool_calls, _message_for_history = _unify_streaming_result(
                         _full_content, _full_tool_calls,
                     )
@@ -1113,7 +1113,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             if chat_completion.usage is not None:
                 _last_prompt_tokens = chat_completion.usage.prompt_tokens
                 if max_context_tokens and chat_ui and hasattr(chat_ui, "set_context_usage"):
-                    chat_ui.set_context_usage(_last_prompt_tokens / max_context_tokens * 100)
+                    chat_ui.set_context_usage(_last_prompt_tokens / max_context_tokens * 100, max_context_tokens)
 
         tool_calls = _tool_calls
         if tool_calls is None or len(tool_calls) == 0:
