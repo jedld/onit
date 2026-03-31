@@ -598,7 +598,7 @@ class ChatUI:
         label = f"ctx:{self._context_pct:.0f}%"
         if self._context_max_tokens:
             k = self._context_max_tokens // 1000
-            label += f"/{k}k"
+            label += f" of {k}k max tokens"
         return label
 
     def set_context_usage(self, pct: float, max_tokens: int = 0) -> None:
