@@ -93,6 +93,29 @@ async def _resolve_model_id(client: AsyncOpenAI, host: str) -> str:
     return model_id
 
 
+async def _get_model_max_context(host: str, api_key: str, model: str) -> Optional[int]:
+    """Query vLLM for the model's maximum context length.
+
+    vLLM exposes ``max_model_len`` in the ``/v1/models`` response as an extra
+    field.  Returns None for OpenRouter or any host that doesn't provide it.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            resp = await http_client.get(
+                f"{host.rstrip('/')}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code == 200:
+                for m in resp.json().get("data", []):
+                    if m.get("id") == model:
+                        val = m.get("max_model_len")
+                        if val:
+                            return int(val)
+    except Exception as e:
+        logger.debug("Could not query max_model_len from vLLM: %s", e)
+    return None
+
+
 def _parse_commands_format(obj: dict, tool_registry) -> Optional[list[dict]]:
     """Parse the commands-style response format used by some models.
 
@@ -589,16 +612,19 @@ def _build_messages(instruction: str, images_bytes: list[str],
 async def _process_streaming_response(
     chat_completion, safety_queue: asyncio.Queue,
     chat_ui, think: bool,
-) -> tuple[str, str, dict, bool] | None:
+) -> tuple[str, str, dict, bool, Any] | None:
     """Consume a streaming chat completion and return accumulated results.
 
-    Returns (full_content, full_reasoning, full_tool_calls_dict, ui_was_streaming)
-    or None if the safety queue fired mid-stream.
+    Returns (full_content, full_reasoning, full_tool_calls_dict, ui_was_streaming, usage)
+    or None if the safety queue fired mid-stream.  ``usage`` is the
+    CompletionUsage object from the final chunk (requires stream_options
+    include_usage=True), or None if not available.
     """
     full_content = ""
     full_reasoning = ""
     full_tool_calls: dict = {}  # index -> {id, name, arguments}
     ui_streaming = False
+    usage = None
     in_think = think  # True if we expect <think>...</think> in delta.content
 
     async for chunk in chat_completion:
@@ -606,6 +632,9 @@ async def _process_streaming_response(
             if ui_streaming and chat_ui:
                 chat_ui.stream_end()
             return None
+        # Capture usage from the final chunk (stream_options include_usage=True)
+        if chunk.usage is not None:
+            usage = chunk.usage
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -675,7 +704,7 @@ async def _process_streaming_response(
     if ui_streaming and chat_ui:
         chat_ui.stream_end()
 
-    return full_content, full_reasoning, full_tool_calls, ui_streaming
+    return full_content, full_reasoning, full_tool_calls, ui_streaming, usage
 
 
 def _unify_streaming_result(
@@ -817,6 +846,94 @@ async def _handle_structured_tool_calls(
     return None
 
 
+async def _compact_context(
+    messages: list, client: AsyncOpenAI, model: str,
+    max_tokens: int, chat_ui, verbose: bool,
+) -> list:
+    """Summarize the conversation and return a compacted messages list.
+
+    Keeps the system message, generates a dense LLM summary of all other
+    messages, and returns [system_msg, compacted_user_msg, ack_assistant_msg].
+    Falls back to the original messages list if the summarization call fails.
+    """
+    system_msg = (
+        messages[0]
+        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system"
+        else None
+    )
+    messages_to_summarize = messages[1:] if system_msg else messages[:]
+    if not messages_to_summarize:
+        return messages
+
+    # Build plain-text conversation transcript for the summarization prompt
+    parts: list[str] = []
+    for msg in messages_to_summarize:
+        role = msg.get("role", "?")
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+        content = str(content)
+        name = msg.get("name", "")
+        if role == "user":
+            parts.append(f"User: {content[:600]}")
+        elif role == "assistant":
+            tcs = msg.get("tool_calls")
+            if tcs:
+                tc_names = []
+                for tc in tcs:
+                    if isinstance(tc, dict):
+                        tc_names.append(tc.get("function", {}).get("name", "?"))
+                    else:
+                        tc_names.append(getattr(getattr(tc, "function", None), "name", "?"))
+                parts.append(f"Assistant called tools: {', '.join(tc_names)}")
+            elif content:
+                parts.append(f"Assistant: {content[:600]}")
+        elif role == "tool":
+            parts.append(f"Tool({name}): {content[:400]}")
+
+    compaction_prompt = (
+        "Summarize the following agent conversation. Include: the original task, "
+        "key tool results and findings, decisions made, and what still needs to be "
+        "done. Be thorough but concise — this summary replaces the full history.\n\n"
+        + "\n".join(parts)
+    )
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": compaction_prompt}],
+            max_tokens=min(2048, max_tokens),
+            stream=False,
+        )
+        summary = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.warning("Context compaction failed: %s", e)
+        return messages
+
+    _log_to_ui_or_verbose(
+        f"Context compacted: {len(messages_to_summarize)} messages → {len(summary):,} char summary",
+        chat_ui, verbose, level="info",
+    )
+    if chat_ui and hasattr(chat_ui, "show_context_compaction"):
+        chat_ui.show_context_compaction(len(messages_to_summarize), len(summary))
+
+    new_messages: list = []
+    if system_msg:
+        new_messages.append(system_msg)
+    new_messages.append({
+        "role": "user",
+        "content": (
+            "[CONTEXT COMPACTED]\nThe following is a summary of prior work:\n\n"
+            + summary
+            + "\n\n[Continue the task based on the summary above.]"
+        ),
+    })
+    new_messages.append({
+        "role": "assistant",
+        "content": "Understood. Continuing based on the context summary.",
+    })
+    return new_messages
+
+
 async def chat(host: str = "http://127.0.0.1:8001/v1",
          host_key: str = "EMPTY",
          model: str = None,
@@ -837,6 +954,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     max_tokens = kwargs.get('max_tokens', 8192)
     memories = kwargs.get('memories', None)
     prompt_intro = kwargs.get('prompt_intro', "I am a helpful AI assistant. My name is OnIt.")
+    max_context_tokens: Optional[int] = kwargs.get('max_context_tokens', None)
 
     images_bytes = _load_images(images, chat_ui, verbose)
     messages = _build_messages(instruction, images_bytes, prompt_intro,
@@ -867,11 +985,22 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
         chat_ui.model_name = model
     _log_to_ui_or_verbose(f"Starting chat with model: {model}", chat_ui, verbose, level="info")
 
+    # Query vLLM for the model's maximum context window if not provided in config.
+    # Skip for OpenRouter (doesn't expose max_model_len).
+    if max_context_tokens is None and "openrouter.ai" not in host:
+        max_context_tokens = await _get_model_max_context(host, api_key, model)
+        if max_context_tokens:
+            _log_to_ui_or_verbose(
+                f"Model max context: {max_context_tokens:,} tokens", chat_ui, verbose, level="info"
+            )
+
     MAX_CHAT_ITERATIONS = -1
     MAX_REPEATED_TOOL_CALLS = 30
     MAX_API_RETRIES = 3
+    CONTEXT_COMPACT_THRESHOLD = 0.90
     iteration_count = 0
     tool_call_history: list = []  # list of (name, args_json) tuples
+    _last_prompt_tokens: int = 0  # prompt token count from the last API response
 
     while True:
         iteration_count += 1
@@ -879,6 +1008,19 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             msg = f"I am sorry 😊. Could you try to rephrase or provide additional details?"
             _log_to_ui_or_verbose(f"Chat loop exceeded {MAX_CHAT_ITERATIONS} iterations, stopping.", chat_ui, verbose, level="warning")
             return msg
+
+        # Context compaction: check if the previous call used ≥90% of the context window.
+        if _last_prompt_tokens > 0 and max_context_tokens:
+            usage_pct = _last_prompt_tokens / max_context_tokens
+            if chat_ui and hasattr(chat_ui, "set_context_usage"):
+                chat_ui.set_context_usage(usage_pct * 100)
+            if usage_pct >= CONTEXT_COMPACT_THRESHOLD:
+                _log_to_ui_or_verbose(
+                    f"Context at {usage_pct:.0%} ({_last_prompt_tokens:,}/{max_context_tokens:,} tokens). Compacting...",
+                    chat_ui, verbose, level="warning",
+                )
+                messages = await _compact_context(messages, client, model, max_tokens, chat_ui, verbose)
+                _last_prompt_tokens = 0
 
         _strip_old_images(messages)
 
@@ -911,6 +1053,8 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 )
                 if tools: # and not images_bytes:  # vLLM doesn't support tools + images in the same message, so only include tools if no images are present
                     completion_kwargs["tools"] = tools
+                if stream:
+                    completion_kwargs["stream_options"] = {"include_usage": True}
 
                 chat_completion = await client.chat.completions.create(**completion_kwargs)
 
@@ -921,7 +1065,11 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                     )
                     if stream_result is None:
                         return None
-                    _full_content, _full_reasoning, _full_tool_calls, _ = stream_result
+                    _full_content, _full_reasoning, _full_tool_calls, _, _stream_usage = stream_result
+                    if _stream_usage is not None:
+                        _last_prompt_tokens = _stream_usage.prompt_tokens
+                        if max_context_tokens and chat_ui and hasattr(chat_ui, "set_context_usage"):
+                            chat_ui.set_context_usage(_last_prompt_tokens / max_context_tokens * 100)
                     _content, _tool_calls, _message_for_history = _unify_streaming_result(
                         _full_content, _full_tool_calls,
                     )
@@ -961,6 +1109,11 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             _content = _msg.content
             _tool_calls = _msg.tool_calls if _msg.tool_calls else None
             _message_for_history = _msg
+            # Capture token usage for context tracking
+            if chat_completion.usage is not None:
+                _last_prompt_tokens = chat_completion.usage.prompt_tokens
+                if max_context_tokens and chat_ui and hasattr(chat_ui, "set_context_usage"):
+                    chat_ui.set_context_usage(_last_prompt_tokens / max_context_tokens * 100)
 
         tool_calls = _tool_calls
         if tool_calls is None or len(tool_calls) == 0:

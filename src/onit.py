@@ -213,6 +213,20 @@ class StreamingAdapter:
         if self.show_logs:
             print(f"[{level}] {message}")
 
+    def set_context_usage(self, pct: float) -> None:
+        """No-op for external clients; context % is informational only."""
+        pass
+
+    def show_context_compaction(self, orig_msg_count: int, summary_chars: int) -> None:
+        """Forward context compaction notice as a streaming token."""
+        if self.on_token:
+            msg = f"\n[Context compacted: {orig_msg_count} messages → {summary_chars:,} char summary]\n"
+            self._content += msg
+            result = self.on_token(msg, self._content)
+            if asyncio.iscoroutine(result):
+                task = asyncio.ensure_future(result)
+                self._pending.append(task)
+
 
 class OnItA2AExecutor(AgentExecutor):
     """A2A executor that delegates task processing to an OnIt instance.
@@ -839,6 +853,7 @@ class OnIt(BaseModel):
             'data_path': effective_data_path,
             'session_id': effective_session_id,
             'max_tokens': self.model_serving.get('max_tokens', 8192),
+            'max_context_tokens': self.model_serving.get('max_context_tokens', None),
             'session_history': self.load_session_history(session_path=effective_session_path),
             'stream': self.stream,
         }
@@ -951,6 +966,7 @@ class OnIt(BaseModel):
                           'data_path': self.data_path,
                           'session_id': self.session_id,
                           'max_tokens': self.model_serving.get('max_tokens', 8192),
+                          'max_context_tokens': self.model_serving.get('max_context_tokens', None),
                           'session_history': self.load_session_history()}
                 last_response = await chat(host=self.model_serving["host"],
                                             host_key=self.model_serving.get("host_key", "EMPTY"),
@@ -1393,6 +1409,7 @@ class OnIt(BaseModel):
                           'data_path': self.data_path,
                           'session_id': self.session_id,
                           'max_tokens': self.model_serving.get('max_tokens', 8192),
+                          'max_context_tokens': self.model_serving.get('max_context_tokens', None),
                           'session_history': self.load_session_history(),
                           'stream': self.stream}
                 if self.prompt_intro:

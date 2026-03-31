@@ -134,6 +134,7 @@ class ChatUI:
         self._thinking_stop_event: Optional[threading.Event] = None
         self._thinking_thread: Optional[threading.Thread] = None
         self.model_name = ""  # auto-detected model name, set by chat()
+        self._context_pct: float = 0.0  # context window usage 0-100, updated after each LLM call
         self._stream_header_printed = False  # lazy: header deferred until first visible token
         self._stream_pending = ""  # buffer tokens until first non-whitespace
         self._stream_think_started = False  # True while a think block is open
@@ -586,6 +587,19 @@ class ChatUI:
         """Public API: stop the animated thinking spinner."""
         self._stop_thinking_spinner()
 
+    # ── Context usage display ──────────────────────────────────────
+
+    def set_context_usage(self, pct: float) -> None:
+        """Update the context window usage percentage (0–100)."""
+        self._context_pct = pct
+
+    def show_context_compaction(self, orig_msg_count: int, summary_chars: int) -> None:
+        """Print an inline notification when the context window is compacted."""
+        self.console.print(
+            f"  ⚡ Context compacted  ({orig_msg_count} messages → {summary_chars:,} char summary)",
+            style="bold yellow",
+        )
+
     # ── Inline tool-call display (streaming mode) ──────────────────
 
     def show_tool_start(self, name: str, arguments: dict) -> None:
@@ -800,7 +814,21 @@ class ChatUI:
         if stream_elapsed > 0 and self._stream_token_count > 0:
             tok_s = self._stream_token_count / stream_elapsed
             footer += f"  ({tok_s:.1f} tok/s)"
+        # Append context window usage percentage
+        if self._context_pct > 0:
+            footer += f"  ctx:{self._context_pct:.0f}%"
         self.console.print(footer, style=self.theme.styles.get("assistant", "magenta"))
+        # Warn when context is getting full (≥75%)
+        if self._context_pct >= 90:
+            self.console.print(
+                f"  ⚠  Context window {self._context_pct:.0f}% full — compaction imminent",
+                style="bold red",
+            )
+        elif self._context_pct >= 75:
+            self.console.print(
+                f"  ⚠  Context window {self._context_pct:.0f}% full",
+                style="bold yellow",
+            )
         # Save to history so intermediate AI turns appear in the chat panel.
         # Strip all XML-style tags (same as remove_tags) so the final turn's
         # content matches onit.py's comparison and gets elapsed time updated.
