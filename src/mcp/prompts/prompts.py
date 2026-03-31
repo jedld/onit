@@ -131,22 +131,18 @@ Search the web for additional information **if and only if** above documents are
 1. Check sandbox status. 
 2. Check the sandbox filesystem structure. 
 3. Check installed packages, GPU, mounted data directories.
-4. Explore the repo structure, if any, and conventions before writing anything.
-5. Install missing packages; update the manifest (`requirements.txt`, `package.json`, etc.) and commit it with the code.
-6. Write → run → verify → fix → repeat until the code works end-to-end.
+4. Write → run → verify → fix → repeat until the code works end-to-end and the target is achieved.
+5. Delete unnecessary files.
+6. Commit or save the codebase and documentation.
 
 ---
 
 ### Definition of Done
 Do not stop until **all** are true:
 - [ ] Code runs end-to-end without errors.
-- [ ] Data preprocessing completes successfully and outputs expected results.
-- [ ] Model trains successfully and achieves expected performance. 
-- [ ] Evaluation completes successfully and achieves expected results.
-- [ ] Output matches the goal.
-- [ ] All changes committed with clean history.
-- [ ] Git status is clean (if using git repository).
-- [ ] New dependencies recorded in the manifest.
+- [ ] The target is achieved.
+- [ ] Codebase is committed or saved.
+
 """
 
    instruction += f"""

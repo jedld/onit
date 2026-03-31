@@ -533,6 +533,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help='Default topic context (e.g. "machine learning"). The model will assume this topic unless specified otherwise.')
     parser.add_argument('--prompt-intro', type=str, default=None,
                         help='Custom system prompt intro for the model (default: "I am a helpful AI assistant. My name is OnIt.").')
+    parser.add_argument('--plan', type=str, default=None, metavar='FILE',
+                        help='Path to a .md or .txt file whose contents will be used as the system prompt intro.')
     # Text UI options
     parser.add_argument('--text-theme', type=str, default=None,
                         help='Text UI theme (e.g. "white", "dark").')
@@ -656,6 +658,15 @@ def _parse_and_resolve_config(args: argparse.Namespace) -> dict:
         value = getattr(args, arg_name, None)
         if value is not None:
             config_data[config_key] = value
+
+    # --plan reads a file and sets prompt_intro (--prompt-intro takes precedence)
+    if getattr(args, 'plan', None) and not getattr(args, 'prompt_intro', None):
+        plan_path = os.path.expanduser(args.plan)
+        if not os.path.isfile(plan_path):
+            print(f"Error: plan file '{plan_path}' not found.", file=sys.stderr)
+            sys.exit(1)
+        with open(plan_path, 'r') as _f:
+            config_data['prompt_intro'] = _f.read()
 
     # --no-stream explicitly disables streaming (default is True)
     if args.no_stream:
