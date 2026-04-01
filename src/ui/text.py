@@ -579,8 +579,8 @@ class ChatUI:
             thread.join(timeout=1.0)
         self._thinking_stop_event = None
         self._thinking_thread = None
-        # Erase the entire current line and restore blinking bar cursor
-        sys.stdout.write("\r\033[2K\033[?25h\033[5 q")
+        # Erase the entire current line and restore blinking block cursor
+        sys.stdout.write("\r\033[2K\033[?25h\033[1 q")
         sys.stdout.flush()
 
     def start_thinking(self) -> None:
@@ -1045,7 +1045,7 @@ class ChatUI:
             The user's input string
         """
         # Enable bracketed paste mode + show blinking bar cursor + bold green prompt
-        sys.stdout.write(f"\033[?2004h\033[?25h\033[5 q\033[1;32m{prompt}\033[0m")
+        sys.stdout.write(f"\033[?2004h\033[?25h\033[1 q\033[1;32m{prompt}\033[0m")
         sys.stdout.flush()
 
         fd = sys.stdin.fileno()
