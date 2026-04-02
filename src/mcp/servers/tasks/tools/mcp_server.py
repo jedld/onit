@@ -40,7 +40,7 @@ import os
 import tempfile
 from typing import Annotated, Optional
 
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 from pydantic import Field
 
 import logging
@@ -105,21 +105,25 @@ from src.mcp.servers.tasks.web.search.mcp_server import (
     extract_pdf_images as _extract_pdf_images,
 )
 
-@mcp.tool(
-    title="Search the Web",
-    description="""Search the web for news or general information using DuckDuckGo.
+# Conditionally register tools based on API key availability.
+# When the env var is set, the tool is not registered at all (not just disabled at runtime).
 
-Args:
-- query: Search terms (e.g., "AI regulations 2024", "how to bake bread")
-- type: "news" for recent news, "web" for general search (default: "web")
-- max_results: Number of results (default: 5, max: 10)
+if not os.environ.get('ONIT_DISABLE_WEB_SEARCH'):
+    @mcp.tool(
+        title="Search the Web",
+        description="""Search the web for news or general information using DuckDuckGo.
 
-Returns JSON: [{title, snippet, url, source, date}]"""
-)
-def search(query: Optional[str] = None, type: str = "web", max_results: int = 5) -> str:
-    if err := _validate_required(query=query):
-        return err
-    return _search(query=query, type=type, max_results=max_results)
+    Args:
+    - query: Search terms (e.g., "AI regulations 2024", "how to bake bread")
+    - type: "news" for recent news, "web" for general search (default: "web")
+    - max_results: Number of results (default: 5, max: 10)
+
+    Returns JSON: [{title, snippet, url, source, date}]"""
+    )
+    def search(query: Optional[str] = None, type: str = "web", max_results: int = 5) -> str:
+        if err := _validate_required(query=query):
+            return err
+        return _search(query=query, type=type, max_results=max_results)
 
 
 @mcp.tool(
@@ -153,20 +157,21 @@ def fetch_content(
     )
 
 
-@mcp.tool(
-    title="Get Weather",
-    description="""Get current weather and optional 5-day forecast. Auto-detects location if not specified.
+if not os.environ.get('ONIT_DISABLE_WEATHER'):
+    @mcp.tool(
+        title="Get Weather",
+        description="""Get current weather and optional 5-day forecast. Auto-detects location if not specified.
 
-Args:
-- place: City or location (e.g., "Tokyo, Japan"). Auto-detects from IP if omitted
-- forecast: Include 5-day forecast (default: False)
+    Args:
+    - place: City or location (e.g., "Tokyo, Japan"). Auto-detects from IP if omitted
+    - forecast: Include 5-day forecast (default: False)
 
-Returns JSON: {location, current: {description, temperature_c, humidity_percent, wind_speed_ms, sunrise, sunset}, forecast_5day}
+    Returns JSON: {location, current: {description, temperature_c, humidity_percent, wind_speed_ms, sunrise, sunset}, forecast_5day}
 
-Requires: OPENWEATHER_API_KEY environment variable."""
-)
-def get_weather(place: str = None, forecast: bool = False) -> str:
-    return _get_weather(place=place, forecast=forecast)
+    Requires: OPENWEATHER_API_KEY environment variable."""
+    )
+    def get_weather(place: str = None, forecast: bool = False) -> str:
+        return _get_weather(place=place, forecast=forecast)
 
 
 @mcp.tool(
@@ -213,10 +218,10 @@ Args:
 
 Returns JSON: {stdout, stderr, returncode, cwd, command, status}"""
 )
-def bash(command: Optional[str] = None, cwd: str = ".", timeout: int = 300) -> str:
+async def bash(command: Optional[str] = None, cwd: str = ".", timeout: int = 300, ctx: Context = None) -> str:
     if err := _validate_required(command=command):
         return err
-    return _bash(command=command, cwd=cwd, timeout=timeout)
+    return await _bash(command=command, cwd=cwd, timeout=timeout, ctx=ctx)
 
 
 @mcp.tool(
@@ -266,7 +271,7 @@ Args:
 - path: Path to the file within data_path folder (required)
 - callback_url: Full upload URL prefix (e.g., "http://host:9000/uploads/session_id"). File is POSTed to {callback_url}/ (optional)
 
-Returns JSON: {filename, size_bytes, download_url, status} or {filename, size_bytes, content_base64, status}"""
+Returns JSON: {path, filename, size_bytes, download_url, status} or {path, filename, size_bytes, file_data_base64, status}"""
 )
 def send_file(path: Optional[str] = None, callback_url: Optional[str] = None) -> str:
     if err := _validate_required(path=path):
@@ -479,6 +484,8 @@ def run(
 
     if 'data_path' in options:
         DATA_PATH = options['data_path']
+    elif os.environ.get('ONIT_DATA_PATH'):
+        DATA_PATH = os.environ['ONIT_DATA_PATH']
     abs_data = os.path.abspath(os.path.expanduser(DATA_PATH))
     _secure_makedirs(abs_data)
 

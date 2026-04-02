@@ -203,3 +203,6 @@ qdrant_storage/*
 tmp/*
 .DS_Store
 certificate.pem
+
+# Ignore src/configs/default.yaml which contains api keys and other secrets
+src/configs/default.yaml

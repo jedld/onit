@@ -2,7 +2,7 @@ serving:
   # Set via env var ONIT_HOST or --host CLI flag
   # host: http://localhost:8000/v1
   # host_key: EMPTY  # API key. For OpenRouter set here or via OPENROUTER_API_KEY env var
-  model: Qwen/Qwen3-30B-A3B-Instruct-2507
+  # model: auto-detected from endpoint. Set explicitly for OpenRouter.
   think: false
   max_tokens: 8192
 
@@ -25,6 +25,9 @@ timeout: -1
 web_title: "OnIt Chat"
 web: false
 web_port: 9000
+# Custom favicon URL or path (e.g. "https://example.com/icon.png").
+# Leave empty to suppress the default Gradio favicon.
+# web_favicon:
 
 # Google OAuth2 Authentication (Full Redirect Flow)
 # To set up Google OAuth2, follow these steps:
@@ -65,3 +68,9 @@ mcp:
       description: Web search, bash commands, file operations, and document tools
       url: http://127.0.0.1:18201/sse
       enabled: true
+
+    # External MCP servers using Streamable HTTP transport (URLs should NOT end in /sse)
+    # - name: SandboxMCPServer
+    #   description: Sandbox code execution server
+    #   url: http://127.0.0.1:18202/mcp
+    #   enabled: true

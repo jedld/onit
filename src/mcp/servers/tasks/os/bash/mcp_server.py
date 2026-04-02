@@ -24,7 +24,7 @@ Requires:
 1. bash - Execute bash/shell commands with timeout and directory control
 2. read_file - Read files (text, PDF returns content; binary files return metadata only)
 3. write_file - Write content to files (supports write/append modes)
-4. send_file - Send a file to a remote client via callback URL or base64
+4. send_file - Send a file to a remote client via callback URL
 5. search_document - Search for patterns in a document (text, PDF, markdown)
 6. search_directory - Search for patterns across files in a directory
 7. extract_tables - Extract tables from documents (PDF, markdown)
@@ -33,22 +33,54 @@ Requires:
 10. get_document_context - Extract relevant context from a document
 '''
 
+import asyncio
 import base64
 import json
 import os
+import platform
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import requests
 from pathlib import Path
-from typing import Annotated, Optional, List, Dict, Any
+from typing import Annotated, Optional, Dict, Any
 from pydantic import Field
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
+
+from src.mcp.servers.tasks.shared import (
+    truncate_output as _truncate_output,
+    secure_makedirs as _secure_makedirs,
+    validate_required as _validate_required,
+    search_document_impl,
+    search_directory_impl,
+    extract_tables_impl,
+    find_files_impl,
+    transform_text_impl,
+    get_document_context_impl,
+)
 
 import logging
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+IS_WINDOWS = platform.system() == "Windows"
+
+# Locate a usable bash executable on Windows (Git Bash, WSL, etc.)
+_BASH_EXE = None
+if IS_WINDOWS:
+    _BASH_EXE = shutil.which("bash")
+    if not _BASH_EXE:
+        # Common Git Bash locations
+        for candidate in (
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Windows\System32\bash.exe",
+        ):
+            if os.path.isfile(candidate):
+                _BASH_EXE = candidate
+                break
 
 mcp = FastMCP("Bash MCP Server")
 
@@ -85,31 +117,11 @@ BINARY_EXTENSIONS = {
 }
 
 
-def _truncate_output(text: str, max_size: int = MAX_OUTPUT_SIZE) -> str:
-    """Truncate output if it exceeds max size."""
-    if len(text) > max_size:
-        return text[:max_size] + f"\n\n... [OUTPUT TRUNCATED - {len(text)} bytes total]"
-    return text
-
-
-def _secure_makedirs(dir_path: str) -> None:
-    """Create directory with owner-only permissions (0o700)."""
-    os.makedirs(dir_path, mode=0o700, exist_ok=True)
-
-
-def _validate_required(**kwargs) -> str:
-    """Check for missing required arguments. Returns JSON error string or empty string."""
-    missing = [name for name, value in kwargs.items() if value is None]
-    if missing:
-        return json.dumps({
-            "error": f"Missing required argument(s): {', '.join(missing)}.",
-            "status": "error"
-        })
-    return ""
-
-
 def _validate_write_path(file_path: str) -> str:
-    """Validate that the write path is within DATA_PATH. Returns absolute path."""
+    """Validate that the write path is within DATA_PATH. Returns absolute path.
+    Relative paths are resolved against DATA_PATH (not CWD)."""
+    if not os.path.isabs(os.path.expanduser(file_path)):
+        file_path = os.path.join(DATA_PATH, file_path)
     abs_path = os.path.realpath(os.path.expanduser(file_path))
     abs_data = os.path.realpath(os.path.expanduser(DATA_PATH))
     if not abs_path.startswith(abs_data + os.sep) and abs_path != abs_data:
@@ -122,7 +134,10 @@ def _validate_write_path(file_path: str) -> str:
 
 def _validate_read_path(file_path: str) -> str:
     """Validate that the read path is within DATA_PATH or DOCUMENTS_PATH.
+    Relative paths are resolved against DATA_PATH (not CWD).
     Returns the resolved absolute path. Raises ValueError if outside allowed directories."""
+    if not os.path.isabs(os.path.expanduser(file_path)):
+        file_path = os.path.join(DATA_PATH, file_path)
     abs_path = os.path.realpath(os.path.expanduser(file_path))
     abs_data = os.path.realpath(os.path.expanduser(DATA_PATH))
 
@@ -143,7 +158,11 @@ def _validate_read_path(file_path: str) -> str:
 
 
 def _validate_dir_path(dir_path: str) -> str:
-    """Validate a directory path is within allowed directories. Returns resolved absolute path."""
+    """Validate a directory path is within allowed directories.
+    Relative paths are resolved against DATA_PATH (not CWD).
+    Returns resolved absolute path."""
+    if not os.path.isabs(os.path.expanduser(dir_path)):
+        dir_path = os.path.join(DATA_PATH, dir_path)
     abs_path = os.path.realpath(os.path.expanduser(dir_path))
     abs_data = os.path.realpath(os.path.expanduser(DATA_PATH))
 
@@ -180,9 +199,35 @@ def _get_sandbox_env() -> dict:
         "LC_ALL": "en_US.UTF-8",
         "HOME": abs_data,
         "TMPDIR": tmp_dir,
-        "PATH": "/usr/local/bin:/usr/bin:/bin",
         "DATA_PATH": abs_data,
     }
+
+    if IS_WINDOWS:
+        # Build PATH that includes Git Bash Unix tools + essential Windows paths
+        path_parts = []
+        # Git Bash provides Unix coreutils (wc, grep, sed, awk, etc.)
+        if _BASH_EXE:
+            git_root = os.path.dirname(os.path.dirname(_BASH_EXE))
+            for subdir in ("usr/bin", "bin", "mingw64/bin"):
+                d = os.path.join(git_root, subdir)
+                if os.path.isdir(d):
+                    path_parts.append(d)
+        # Essential Windows system paths (for python, pip, etc.)
+        sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+        path_parts.extend([
+            os.path.join(sys_root, "System32"),
+            sys_root,
+        ])
+        env.update({
+            "TEMP": tmp_dir,
+            "TMP": tmp_dir,
+            "PATH": os.pathsep.join(path_parts),
+            "SystemRoot": sys_root,
+            "COMSPEC": os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+        })
+    else:
+        env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+
     if DOCUMENTS_PATH:
         env["DOCUMENTS_PATH"] = os.path.realpath(os.path.expanduser(DOCUMENTS_PATH))
 
@@ -193,21 +238,157 @@ def _get_sandbox_env() -> dict:
 # Blocked command patterns for the bash tool
 _BLOCKED_PATTERNS = [
     # Environment variable access
-    (r'\benv\b', "env command"),
-    (r'\bprintenv\b', "printenv command"),
-    (r'\bexport\s', "export command"),
-    (r'/proc/self/environ', "/proc/self/environ"),
+    (re.compile(r'\benv\b', re.IGNORECASE), "env command"),
+    (re.compile(r'\bprintenv\b', re.IGNORECASE), "printenv command"),
+    (re.compile(r'\bexport\s', re.IGNORECASE), "export command"),
+    (re.compile(r'/proc/self/environ', re.IGNORECASE), "/proc/self/environ"),
     # Process listings
-    (r'\bps\b', "ps command"),
-    (r'\btop\b', "top command"),
-    (r'\bhtop\b', "htop command"),
-    (r'/proc/\d+', "/proc access"),
-    (r'/proc/self\b', "/proc/self access"),
+    (re.compile(r'\bps\b', re.IGNORECASE), "ps command"),
+    (re.compile(r'\btop\b', re.IGNORECASE), "top command"),
+    (re.compile(r'\bhtop\b', re.IGNORECASE), "htop command"),
+    (re.compile(r'/proc/\d+', re.IGNORECASE), "/proc access"),
+    (re.compile(r'/proc/self\b', re.IGNORECASE), "/proc/self access"),
     # Sensitive system files
-    (r'/etc/passwd', "/etc/passwd"),
-    (r'/etc/shadow', "/etc/shadow"),
-    (r'/etc/sudoers', "/etc/sudoers"),
+    (re.compile(r'/etc/passwd', re.IGNORECASE), "/etc/passwd"),
+    (re.compile(r'/etc/shadow', re.IGNORECASE), "/etc/shadow"),
+    (re.compile(r'/etc/sudoers', re.IGNORECASE), "/etc/sudoers"),
+    # Destructive filesystem operations
+    (re.compile(r'\brm\s+(-[^\s]*\s+)*-r\s*f?\s+/', re.IGNORECASE), "rm -rf on root"),
+    (re.compile(r'\brm\s+(-[^\s]*\s+)*-f\s*r?\s+/', re.IGNORECASE), "rm -rf on root"),
+    (re.compile(r'\brm\s+(-[^\s]*\s+)*/\s*$', re.IGNORECASE), "rm on root"),
+    (re.compile(r'>\s*/dev/(sd|hd|nvme|vd|xvd)', re.IGNORECASE), "write to block device"),
+    (re.compile(r'>\s*/dev/mem', re.IGNORECASE), "write to /dev/mem"),
+    (re.compile(r'\bdd\b.*\bof\s*=\s*/dev/', re.IGNORECASE), "dd to device"),
+    (re.compile(r'\bmkfs\b', re.IGNORECASE), "mkfs command"),
+    (re.compile(r'\bfdisk\b', re.IGNORECASE), "fdisk command"),
+    (re.compile(r'\bparted\b', re.IGNORECASE), "parted command"),
+    # Privilege escalation
+    (re.compile(r'\bsudo\b', re.IGNORECASE), "sudo command"),
+    (re.compile(r'\bsu\b\s', re.IGNORECASE), "su command"),
+    (re.compile(r'\bdoas\b', re.IGNORECASE), "doas command"),
+    (re.compile(r'\bchmod\s+[0-7]*s', re.IGNORECASE), "setuid/setgid chmod"),
+    (re.compile(r'\bchown\b', re.IGNORECASE), "chown command"),
+    # System state / shutdown
+    (re.compile(r'\bshutdown\b', re.IGNORECASE), "shutdown command"),
+    (re.compile(r'\breboot\b', re.IGNORECASE), "reboot command"),
+    (re.compile(r'\bpoweroff\b', re.IGNORECASE), "poweroff command"),
+    (re.compile(r'\bhalt\b', re.IGNORECASE), "halt command"),
+    (re.compile(r'\binit\s+[06]\b', re.IGNORECASE), "init runlevel change"),
+    (re.compile(r'\bsystemctl\s+(start|stop|restart|disable|enable|mask|reboot|poweroff|halt)', re.IGNORECASE), "systemctl service control"),
+    # Network / exfiltration
+    (re.compile(r'\bcurl\b.*\|\s*(ba)?sh', re.IGNORECASE), "curl piped to shell"),
+    (re.compile(r'\bwget\b.*\|\s*(ba)?sh', re.IGNORECASE), "wget piped to shell"),
+    (re.compile(r'\bnc\b\s+-[el]', re.IGNORECASE), "netcat listener"),
+    (re.compile(r'\bncat\b', re.IGNORECASE), "ncat command"),
+    (re.compile(r'\bsocat\b', re.IGNORECASE), "socat command"),
+    (re.compile(r'\biptables\b', re.IGNORECASE), "iptables command"),
+    (re.compile(r'\bufw\b', re.IGNORECASE), "ufw command"),
+    # Kernel / boot
+    (re.compile(r'\binsmod\b', re.IGNORECASE), "insmod command"),
+    (re.compile(r'\brmmod\b', re.IGNORECASE), "rmmod command"),
+    (re.compile(r'\bmodprobe\b', re.IGNORECASE), "modprobe command"),
+    (re.compile(r'\bsysctl\s+-w\b', re.IGNORECASE), "sysctl write"),
+    # Package managers (prevent installs that could alter the system)
+    (re.compile(r'\bapt(-get)?\s+(install|remove|purge|dist-upgrade)', re.IGNORECASE), "apt package modification"),
+    (re.compile(r'\byum\s+(install|remove|erase|update)', re.IGNORECASE), "yum package modification"),
+    (re.compile(r'\bdnf\s+(install|remove|erase|upgrade)', re.IGNORECASE), "dnf package modification"),
+    (re.compile(r'\bpacman\s+-[SRU]', re.IGNORECASE), "pacman package modification"),
+    (re.compile(r'\bbrew\s+(install|uninstall|remove)', re.IGNORECASE), "brew package modification"),
+    # Windows-specific dangerous commands
+    (re.compile(r'\bformat\b\s+[A-Za-z]:', re.IGNORECASE), "format drive"),
+    (re.compile(r'\bdiskpart\b', re.IGNORECASE), "diskpart command"),
+    (re.compile(r'\breg\s+(add|delete|import)\b', re.IGNORECASE), "registry modification"),
+    (re.compile(r'\bnet\s+(user|localgroup|stop|start)\b', re.IGNORECASE), "net service/user command"),
+    (re.compile(r'\bsc\s+(delete|stop|config)\b', re.IGNORECASE), "sc service command"),
+    (re.compile(r'\bbcdedit\b', re.IGNORECASE), "bcdedit command"),
+    (re.compile(r'\bschtasks\s+/(create|delete)\b', re.IGNORECASE), "scheduled task modification"),
 ]
+
+
+def _exec_shell(command: str, cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Run a command in a sandboxed shell, routing through Git Bash on Windows."""
+    if IS_WINDOWS and _BASH_EXE:
+        return subprocess.run(
+            [_BASH_EXE, "-c", command],
+            capture_output=True, text=True,
+            cwd=cwd, timeout=timeout, env=_get_sandbox_env()
+        )
+    return subprocess.run(
+        command, shell=True,
+        capture_output=True, text=True,
+        cwd=cwd, timeout=timeout, env=_get_sandbox_env()
+    )
+
+
+async def _exec_shell_streaming(command: str, cwd: str, timeout: int,
+                                ctx: Context | None = None) -> dict:
+    """Run a command asynchronously, streaming stdout/stderr lines via ctx.log().
+
+    Returns a dict with stdout, stderr, and returncode.
+    Falls back to synchronous _exec_shell if ctx is None.
+    """
+    if ctx is None:
+        result = _exec_shell(command, cwd, timeout)
+        return {
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+            "returncode": result.returncode,
+        }
+
+    env = _get_sandbox_env()
+    if IS_WINDOWS and _BASH_EXE:
+        proc = await asyncio.create_subprocess_exec(
+            _BASH_EXE, "-c", command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd, env=env,
+        )
+    else:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd, env=env,
+        )
+
+    stdout_lines = []
+    stderr_lines = []
+    _MAX_LINES = 10_000  # Cap collected lines to prevent OOM on verbose commands
+
+    async def _read_stream(stream, collector, level):
+        async for raw_line in stream:
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+            if len(collector) < _MAX_LINES:
+                collector.append(line)
+            await ctx.log(level=level, message=line)
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                _read_stream(proc.stdout, stdout_lines, "info"),
+                _read_stream(proc.stderr, stderr_lines, "warning"),
+            ),
+            timeout=timeout,
+        )
+        await proc.wait()
+    except asyncio.TimeoutError:
+        proc.kill()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass  # Process didn't respond to SIGKILL; nothing more we can do
+        return {
+            "stdout": "\n".join(stdout_lines),
+            "stderr": "\n".join(stderr_lines),
+            "returncode": -1,
+            "timeout": True,
+        }
+
+    return {
+        "stdout": "\n".join(stdout_lines),
+        "stderr": "\n".join(stderr_lines),
+        "returncode": proc.returncode,
+    }
 
 
 def _validate_bash_command(command: str) -> str | None:
@@ -215,30 +396,57 @@ def _validate_bash_command(command: str) -> str | None:
     Returns error message or None if command is allowed."""
     # Check blocked command patterns
     for pattern, description in _BLOCKED_PATTERNS:
-        if re.search(pattern, command, re.IGNORECASE):
+        if pattern.search(command):
             return f"Command blocked: {description} is not allowed."
 
     # Check for absolute path references outside allowed directories
     abs_data = os.path.realpath(os.path.expanduser(DATA_PATH))
     abs_docs = os.path.realpath(os.path.expanduser(DOCUMENTS_PATH)) if DOCUMENTS_PATH else None
 
-    # Match only absolute paths (preceded by whitespace, start of string, or shell operators)
+    # Normalize for comparison (on Windows, realpath uses backslashes)
+    abs_data_lower = abs_data.lower() if IS_WINDOWS else abs_data
+    abs_docs_lower = abs_docs.lower() if (IS_WINDOWS and abs_docs) else abs_docs
+
+    def _is_allowed_path(p: str) -> bool:
+        """Check if a path is within allowed directories or is a standard tool path."""
+        norm = os.path.normpath(p)
+        if IS_WINDOWS:
+            norm_lower = norm.lower()
+            if norm_lower.startswith(abs_data_lower):
+                return True
+            if abs_docs_lower and norm_lower.startswith(abs_docs_lower):
+                return True
+        else:
+            if norm.startswith(abs_data):
+                return True
+            if abs_docs and norm.startswith(abs_docs):
+                return True
+        # Allow standard Unix tool/device paths (check against original path
+        # since os.path.normpath on Windows converts /usr/bin to \usr\bin)
+        if p.startswith(('/usr/bin/', '/usr/local/bin/', '/bin/',
+                         '/dev/null', '/dev/stdout', '/dev/stderr',
+                         '/dev/stdin', '/dev/fd/')):
+            return True
+        return False
+
+    # Match Unix-style absolute paths (/...)
     for match in re.finditer(r'(?:^|(?<=\s)|(?<=[;|&><]))(/[^\s;|&><"\'`\)]+)', command):
-        path = os.path.normpath(match.group(1))
-        # Allow paths within DATA_PATH or DOCUMENTS_PATH
-        if path.startswith(abs_data):
-            continue
-        if abs_docs and path.startswith(abs_docs):
-            continue
-        # Allow standard tool/device paths
-        if path.startswith(('/usr/bin/', '/usr/local/bin/', '/bin/',
-                            '/dev/null', '/dev/stdout', '/dev/stderr',
-                            '/dev/stdin', '/dev/fd/')):
-            continue
-        return (f"Command blocked: references path '{path}' outside allowed directories. "
-                f"Commands must operate within DATA_PATH ({abs_data})"
-                + (f" or DOCUMENTS_PATH ({abs_docs})" if abs_docs else "")
-                + ".")
+        if not _is_allowed_path(match.group(1)):
+            path = os.path.normpath(match.group(1))
+            return (f"Command blocked: references path '{path}' outside allowed directories. "
+                    f"Commands must operate within DATA_PATH ({abs_data})"
+                    + (f" or DOCUMENTS_PATH ({abs_docs})" if abs_docs else "")
+                    + ".")
+
+    # Match Windows-style absolute paths (C:\... or C:/...)
+    if IS_WINDOWS:
+        for match in re.finditer(r'(?:^|(?<=\s)|(?<=["]))([A-Za-z]:[/\\][^\s;|&><"\'`\)]*)', command):
+            if not _is_allowed_path(match.group(1)):
+                path = os.path.normpath(match.group(1))
+                return (f"Command blocked: references path '{path}' outside allowed directories. "
+                        f"Commands must operate within DATA_PATH ({abs_data})"
+                        + (f" or DOCUMENTS_PATH ({abs_docs})" if abs_docs else "")
+                        + ".")
 
     return None
 
@@ -253,15 +461,16 @@ def _validate_bash_command(command: str) -> str | None:
 
 Args:
 - command: Shell command to run (e.g., "ls -la", "python script.py", "grep -r 'TODO' .")
-- cwd: Working directory — must be within data_path (default: data_path)
+- cwd: FULL absolute path to working directory. Always use the complete working directory path from your system prompt (e.g., "/tmp/onit/data/<session_id>") - never use relative paths.
 - timeout: Max seconds to wait (default: 300)
 
 Returns JSON: {stdout, stderr, returncode, cwd, command, status}"""
 )
-def bash(
+async def bash(
     command: Optional[str] = None,
     cwd: str = ".",
-    timeout: int = DEFAULT_TIMEOUT
+    timeout: int = DEFAULT_TIMEOUT,
+    ctx: Context = None,
 ) -> str:
     if err := _validate_required(command=command):
         return err
@@ -275,6 +484,10 @@ def bash(
             })
 
         # Validate and normalize working directory
+        # Default to DATA_PATH when cwd is "." (default) to avoid
+        # rejecting commands when process cwd is outside allowed dirs
+        if cwd == ".":
+            cwd = DATA_PATH
         work_dir = os.path.abspath(os.path.expanduser(cwd))
         try:
             work_dir = _validate_dir_path(work_dir)
@@ -293,20 +506,22 @@ def bash(
         # Cap timeout at 5 minutes
         timeout = min(timeout, 300)
 
-        # Execute command with sandboxed environment
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            cwd=work_dir,
-            timeout=timeout,
-            env=_get_sandbox_env()
-        )
+        # Execute command with streaming output via ctx.log()
+        result = await _exec_shell_streaming(command, work_dir, timeout, ctx=ctx)
 
-        stdout = _truncate_output(result.stdout.strip())
-        stderr = result.stderr.strip()
-        returncode = result.returncode
+        stdout = _truncate_output(result["stdout"])
+        stderr = result["stderr"]
+        returncode = result["returncode"]
+
+        if result.get("timeout"):
+            return json.dumps({
+                "error": f"Command timed out after {timeout} seconds",
+                "stdout": stdout if stdout else None,
+                "stderr": stderr if stderr else None,
+                "command": command,
+                "cwd": work_dir,
+                "status": "timeout"
+            })
 
         # Provide helpful message for empty output
         if not stdout and not stderr and returncode == 0:
@@ -321,13 +536,6 @@ def bash(
             "status": "success" if returncode == 0 else "failed"
         }, indent=2)
 
-    except subprocess.TimeoutExpired:
-        return json.dumps({
-            "error": f"Command timed out after {timeout} seconds",
-            "command": command,
-            "cwd": cwd,
-            "status": "timeout"
-        })
     except Exception as e:
         return json.dumps({
             "error": str(e),
@@ -345,7 +553,7 @@ def bash(
     description="""Read file contents. Supports text files and PDFs. Binary files (images, audio, video) return metadata only.
 
 Args:
-- path: File path within data_path folder (e.g., "data_path/report.pdf", "data_path/output.txt")
+- path: FULL absolute file path (e.g., "/tmp/onit/data/<session_id>/report.pdf"). Always use the complete working directory path from your system prompt - never use relative paths.
 - encoding: Text encoding (default: utf-8)
 - max_chars: Max characters to read (default: 100000)
 
@@ -359,11 +567,9 @@ def read_file(
     if err := _validate_required(path=path):
         return err
     try:
-        # Normalize path
-        file_path = os.path.abspath(os.path.expanduser(path))
-
         # Validate path is within allowed directories
-        file_path = _validate_read_path(file_path)
+        # (relative paths are resolved against DATA_PATH by _validate_read_path)
+        file_path = _validate_read_path(path)
 
         # Check if file exists
         if not os.path.isfile(file_path):
@@ -551,10 +757,10 @@ def _read_text(file_path: str, file_size: int, file_ext: str, encoding: str, max
 @mcp.tool(
     title="Write File",
     description="""Write content to a file. Creates directories if needed.
-Files are created within data_path folder with owner-only access.
+Files are created within the working directory with owner-only access.
 
 Args:
-- path: File path within data_path folder, relative or absolute (required)
+- path: FULL absolute file path (e.g., "/tmp/onit/data/<session_id>/output.txt"). Always use the complete working directory path from your system prompt - never use relative paths.
 - content: Text content to write (required)
 - mode: "write" (overwrite) or "append" (add to end) (default: "write")
 - encoding: Text encoding (default: utf-8)
@@ -625,10 +831,10 @@ If callback_url is provided, uploads the file via HTTP POST and returns the down
 Otherwise, returns the file content as base64-encoded data (max 10MB).
 
 Args:
-- path: Path to the file within data_path folder (required)
+- path: FULL absolute file path (e.g., "/tmp/onit/data/<session_id>/file.pdf"). Always use the complete working directory path - never use relative paths. (required)
 - callback_url: Full upload URL prefix (e.g., "http://host:9000/uploads/session_id"). File is POSTed to {callback_url}/ (optional)
 
-Returns JSON: {filename, size_bytes, download_url, status} or {filename, size_bytes, content_base64, status}"""
+Returns JSON: {path, filename, size_bytes, download_url, status} or {path, filename, size_bytes, file_data_base64, status}"""
 )
 def send_file(
     path: Optional[str] = None,
@@ -637,10 +843,9 @@ def send_file(
     if err := _validate_required(path=path):
         return err
     try:
-        file_path = os.path.abspath(os.path.expanduser(path))
-
         # Validate path is within allowed directories
-        file_path = _validate_read_path(file_path)
+        # (relative paths are resolved against DATA_PATH by _validate_read_path)
+        file_path = _validate_read_path(path)
 
         if not os.path.isfile(file_path):
             return json.dumps({"error": f"File not found: {file_path}", "path": path})
@@ -660,6 +865,7 @@ def send_file(
                     )
                     resp.raise_for_status()
                 return json.dumps({
+                    "path": file_path,
                     "filename": filename,
                     "size_bytes": file_size,
                     "download_url": f"{cb}/{filename}",
@@ -668,6 +874,7 @@ def send_file(
             except Exception as e:
                 return json.dumps({
                     "error": f"Upload failed: {str(e)}",
+                    "path": file_path,
                     "filename": filename,
                     "status": "failed"
                 })
@@ -676,6 +883,7 @@ def send_file(
         if file_size > MAX_BASE64_SIZE:
             return json.dumps({
                 "error": f"File too large for base64 transfer ({file_size} bytes, max {MAX_BASE64_SIZE}). Provide a callback_url instead.",
+                "path": file_path,
                 "filename": filename,
                 "size_bytes": file_size,
                 "status": "failed"
@@ -685,9 +893,10 @@ def send_file(
             content = base64.b64encode(f.read()).decode('ascii')
 
         return json.dumps({
+            "path": file_path,
             "filename": filename,
             "size_bytes": file_size,
-            "content_base64": content,
+            "file_data_base64": content,
             "status": "success"
         })
 
@@ -709,15 +918,7 @@ def _run_command(command: str, cwd: str = ".", timeout: int = 60) -> Dict[str, A
         if not os.path.isdir(work_dir):
             return {"error": f"Directory does not exist: {work_dir}", "status": "error"}
 
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            cwd=work_dir,
-            timeout=timeout,
-            env=_get_sandbox_env()
-        )
+        result = _exec_shell(command, work_dir, timeout)
 
         return {
             "stdout": result.stdout.strip(),
@@ -731,105 +932,6 @@ def _run_command(command: str, cwd: str = ".", timeout: int = 60) -> Dict[str, A
         return {"error": str(e), "status": "error"}
 
 
-def _extract_pdf_text(file_path: str) -> str:
-    """Extract text from PDF file."""
-    try:
-        from pypdf import PdfReader
-        reader = PdfReader(file_path)
-        pages = []
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            pages.append(text)
-        return "\n\n".join(pages)
-    except ImportError:
-        logger.warning("pypdf not installed")
-        return ""
-    except Exception as e:
-        logger.error(f"Failed to read PDF: {e}")
-        return ""
-
-
-def _extract_pdf_tables(file_path: str) -> List[Dict[str, Any]]:
-    """Extract tables from PDF using pdfplumber."""
-    tables = []
-    try:
-        import pdfplumber
-        with pdfplumber.open(file_path) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                page_tables = page.extract_tables()
-                for table_idx, table in enumerate(page_tables, 1):
-                    if table and len(table) > 0:
-                        headers = table[0] if table else []
-                        rows = table[1:] if len(table) > 1 else []
-                        tables.append({
-                            "page": page_num,
-                            "table_index": table_idx,
-                            "headers": headers,
-                            "rows": rows,
-                            "row_count": len(rows)
-                        })
-        return tables
-    except ImportError:
-        logger.warning("pdfplumber not installed. Run: pip install pdfplumber")
-        return []
-    except Exception as e:
-        logger.error(f"Failed to extract tables from PDF: {e}")
-        return []
-
-
-def _extract_markdown_tables(content: str) -> List[Dict[str, Any]]:
-    """Extract tables from markdown content."""
-    tables = []
-    table_pattern = r'(\|[^\n]+\|\n\|[-:\| ]+\|\n(?:\|[^\n]+\|\n)*)'
-
-    matches = re.finditer(table_pattern, content)
-    for idx, match in enumerate(matches, 1):
-        table_text = match.group(1)
-        lines = table_text.strip().split('\n')
-
-        if len(lines) >= 2:
-            headers = [cell.strip() for cell in lines[0].split('|')[1:-1]]
-            rows = []
-            for line in lines[2:]:
-                cells = [cell.strip() for cell in line.split('|')[1:-1]]
-                if cells:
-                    rows.append(cells)
-
-            tables.append({
-                "table_index": idx,
-                "headers": headers,
-                "rows": rows,
-                "row_count": len(rows),
-                "raw": table_text
-            })
-
-    return tables
-
-
-def _get_file_content(file_path: str) -> tuple[str, str]:
-    """Get file content and format. Returns (content, format)."""
-    file_path = os.path.abspath(os.path.expanduser(file_path))
-
-    if not os.path.isfile(file_path):
-        return "", "error"
-
-    ext = Path(file_path).suffix.lower()
-
-    if ext == '.pdf':
-        return _extract_pdf_text(file_path), "pdf"
-    else:
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
-            if ext == '.md':
-                return content, "markdown"
-            else:
-                return content, "text"
-        except Exception as e:
-            logger.error(f"Failed to read file: {e}")
-            return "", "error"
-
-
 # =============================================================================
 # TOOL 5: SEARCH DOCUMENT
 # =============================================================================
@@ -840,7 +942,7 @@ def _get_file_content(file_path: str) -> tuple[str, str]:
 Uses grep-like regex pattern matching and returns matching lines with surrounding context.
 
 IMPORTANT - Required parameters:
-- path: File path within data_path folder to search (e.g., "data_path/report.pdf", "data_path/README.md")
+- path: FULL absolute file path (e.g., "/tmp/onit/data/<session_id>/report.pdf"). Always use the complete working directory path from your system prompt — never use relative paths.
 - pattern: Regex search pattern to find in the document (e.g., "error.*timeout", "subjects")
   Do NOT use 'query' - the parameter name is 'pattern'.
 
@@ -851,86 +953,23 @@ Optional parameters:
 - max_matches: Maximum number of matches to return (default: 50).
   Do NOT use 'max_sections' - the parameter name is 'max_matches'.
 
-Example: search_document(path="data_path/report.pdf", pattern="conclusion")
+Example: search_document(path="/tmp/onit/data/<session_id>/report.pdf", pattern="conclusion")
 
 Returns JSON: {matches, total_matches, file, format, status}
 Each match includes: {line_number, match, context_before, context_after}"""
 )
 def search_document(
-    path: Annotated[Optional[str], Field(description="File path within data_path folder to search")] = None,
+    path: Annotated[Optional[str], Field(description="FULL absolute file path to search")] = None,
     pattern: Annotated[Optional[str], Field(description="Regex search pattern to find in the document (e.g., 'error.*timeout', 'subjects')")] = None,
     case_sensitive: Annotated[bool, Field(description="Whether search is case-sensitive")] = False,
     context_lines: Annotated[int, Field(description="Number of lines of context before/after each match")] = 3,
     max_matches: Annotated[int, Field(description="Maximum number of matches to return")] = 50
 ) -> str:
-    if err := _validate_required(path=path, pattern=pattern):
-        return err
-    try:
-        file_path = os.path.abspath(os.path.expanduser(path))
-
-        # Validate path is within allowed directories
-        file_path = _validate_read_path(file_path)
-
-        if not os.path.isfile(file_path):
-            return json.dumps({
-                "error": f"File not found: {file_path}",
-                "path": path,
-                "status": "error"
-            })
-
-        content, file_format = _get_file_content(file_path)
-
-        if file_format == "error":
-            return json.dumps({
-                "error": "Failed to read file",
-                "path": path,
-                "status": "error"
-            })
-
-        flags = 0 if case_sensitive else re.IGNORECASE
-        try:
-            regex = re.compile(pattern, flags)
-        except re.error as e:
-            return json.dumps({
-                "error": f"Invalid regex pattern: {e}",
-                "pattern": pattern,
-                "status": "error"
-            })
-
-        lines = content.split('\n')
-        matches = []
-
-        for i, line in enumerate(lines):
-            if regex.search(line):
-                start = max(0, i - context_lines)
-                end = min(len(lines), i + context_lines + 1)
-
-                matches.append({
-                    "line_number": i + 1,
-                    "match": line.strip(),
-                    "context_before": [l.strip() for l in lines[start:i]],
-                    "context_after": [l.strip() for l in lines[i+1:end]]
-                })
-
-                if len(matches) >= max_matches:
-                    break
-
-        return json.dumps({
-            "matches": matches,
-            "total_matches": len(matches),
-            "pattern": pattern,
-            "file": file_path,
-            "format": file_format,
-            "truncated": len(matches) >= max_matches,
-            "status": "success"
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "path": path,
-            "status": "error"
-        })
+    return search_document_impl(
+        path=path, pattern=pattern, case_sensitive=case_sensitive,
+        context_lines=context_lines, max_matches=max_matches,
+        validate_read_path=_validate_read_path,
+    )
 
 
 # =============================================================================
@@ -943,7 +982,7 @@ def search_document(
 Recursively searches text files matching the file pattern.
 
 Args:
-- directory: Directory within data_path folder to search (e.g., "data_path", "data_path/subdir")
+- directory: FULL absolute directory path (e.g., "/tmp/onit/data/<session_id>"). Always use the complete working directory path from your system prompt — never use relative paths.
 - pattern: Search pattern (regex with -E flag)
 - file_pattern: File glob pattern (default: "*" for all files)
 - case_sensitive: Case-sensitive search (default: false)
@@ -961,65 +1000,15 @@ def search_directory(
     include_hidden: bool = False,
     max_results: int = 100
 ) -> str:
-    if err := _validate_required(directory=directory, pattern=pattern):
-        return err
-    try:
-        dir_path = os.path.abspath(os.path.expanduser(directory))
-
-        # Validate directory is within allowed directories
-        dir_path = _validate_dir_path(dir_path)
-
-        if not os.path.isdir(dir_path):
-            return json.dumps({
-                "error": f"Directory not found: {dir_path}",
-                "directory": directory,
-                "status": "error"
-            })
-
-        grep_flags = "-rn"
-        if not case_sensitive:
-            grep_flags += "i"
-        grep_flags += "E"
-
-        exclude = "" if include_hidden else "--exclude-dir='.[!.]*' --exclude='.[!.]*'"
-
-        cmd = f"grep {grep_flags} {exclude} --include={shlex.quote(file_pattern)} {shlex.quote(pattern)} . 2>/dev/null | head -n {int(max_results)}"
-
-        result = _run_command(cmd, cwd=dir_path)
-
-        if result.get("status") == "error":
-            return json.dumps(result)
-
-        results = []
-        output = result.get("stdout", "")
-
-        if output:
-            for line in output.split('\n'):
-                if ':' in line:
-                    parts = line.split(':', 2)
-                    if len(parts) >= 3:
-                        results.append({
-                            "file": parts[0],
-                            "line_number": int(parts[1]) if parts[1].isdigit() else parts[1],
-                            "content": parts[2].strip()
-                        })
-
-        return json.dumps({
-            "results": results,
-            "total_matches": len(results),
-            "pattern": pattern,
-            "directory": dir_path,
-            "file_pattern": file_pattern,
-            "truncated": len(results) >= max_results,
-            "status": "success"
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "directory": directory,
-            "status": "error"
-        })
+    # Pre-resolve before validation (bash server convention)
+    resolved = os.path.abspath(os.path.expanduser(directory)) if directory else directory
+    return search_directory_impl(
+        directory=resolved, pattern=pattern, file_pattern=file_pattern,
+        case_sensitive=case_sensitive, include_hidden=include_hidden,
+        max_results=max_results,
+        validate_dir_path=_validate_dir_path,
+        run_command=_run_command,
+    )
 
 
 # =============================================================================
@@ -1032,7 +1021,7 @@ def search_directory(
 Tables are returned in a structured format with headers and rows.
 
 Args:
-- path: File path within data_path folder (e.g., "data_path/report.pdf", "data_path/README.md")
+- path: FULL absolute file path (e.g., "/tmp/onit/data/<session_id>/report.pdf"). Always use the complete working directory path from your system prompt — never use relative paths.
 - table_index: Specific table index to extract (1-based, default: all)
 - output_format: Output format - "json" or "markdown" (default: "json")
 
@@ -1044,85 +1033,10 @@ def extract_tables(
     table_index: Optional[int] = None,
     output_format: str = "json"
 ) -> str:
-    if err := _validate_required(path=path):
-        return err
-    try:
-        file_path = os.path.abspath(os.path.expanduser(path))
-
-        # Validate path is within allowed directories
-        file_path = _validate_read_path(file_path)
-
-        if not os.path.isfile(file_path):
-            return json.dumps({
-                "error": f"File not found: {file_path}",
-                "path": path,
-                "status": "error"
-            })
-
-        ext = Path(file_path).suffix.lower()
-        tables = []
-
-        if ext == '.pdf':
-            tables = _extract_pdf_tables(file_path)
-        elif ext in ['.md', '.markdown']:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            tables = _extract_markdown_tables(content)
-        else:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                tables = _extract_markdown_tables(content)
-            except Exception:
-                return json.dumps({
-                    "error": "File format not supported for table extraction",
-                    "path": path,
-                    "supported_formats": ["pdf", "md", "markdown"],
-                    "status": "error"
-                })
-
-        if table_index is not None:
-            if 1 <= table_index <= len(tables):
-                tables = [tables[table_index - 1]]
-            else:
-                return json.dumps({
-                    "error": f"Table index {table_index} out of range (1-{len(tables)})",
-                    "total_tables": len(tables),
-                    "status": "error"
-                })
-
-        if output_format == "markdown":
-            md_tables = []
-            for table in tables:
-                headers = table.get("headers", [])
-                rows = table.get("rows", [])
-
-                if headers:
-                    md = "| " + " | ".join(str(h) for h in headers) + " |\n"
-                    md += "| " + " | ".join("---" for _ in headers) + " |\n"
-                    for row in rows:
-                        md += "| " + " | ".join(str(c) for c in row) + " |\n"
-                    md_tables.append({
-                        "table_index": table.get("table_index"),
-                        "page": table.get("page"),
-                        "markdown": md
-                    })
-            tables = md_tables
-
-        return json.dumps({
-            "tables": tables,
-            "total_tables": len(tables),
-            "file": file_path,
-            "format": ext.lstrip('.'),
-            "status": "success"
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "path": path,
-            "status": "error"
-        })
+    return extract_tables_impl(
+        path=path, table_index=table_index, output_format=output_format,
+        validate_read_path=_validate_read_path,
+    )
 
 
 # =============================================================================
@@ -1132,17 +1046,16 @@ def extract_tables(
 @mcp.tool(
     title="Find Files",
     description="""Find files matching patterns using the find command.
-Searches recursively from the specified directory within data_path folder.
+Searches recursively from the specified directory.
 
 Args:
-- directory: Directory within data_path folder to search (default: data_path)
+- directory: FULL absolute directory path (e.g., "/tmp/onit/data/<session_id>"). Always use the complete working directory path from your system prompt — never use relative paths.
 - name_pattern: File name pattern (glob, e.g., "*.py", "test_*")
 - file_type: Type filter - "f" (file), "d" (directory), or None (all)
 - max_depth: Maximum directory depth (default: unlimited)
 - size_filter: Size filter (e.g., "+1M", "-100k", "50k")
 - modified_days: Modified within N days (e.g., 7 for last week)
 - max_results: Maximum results (default: 100)
-- include_hidden: Include hidden files/directories (names starting with ".") (default: False)
 
 Returns JSON: {files, total_files, directory, status}"""
 )
@@ -1153,110 +1066,17 @@ def find_files(
     max_depth: Optional[int] = None,
     size_filter: Optional[str] = None,
     modified_days: Optional[int] = None,
-    max_results: int = 100,
-    include_hidden: bool = False
+    max_results: int = 100
 ) -> str:
-    try:
-        dir_path = os.path.abspath(os.path.expanduser(directory))
-
-        # Validate directory is within allowed directories
-        dir_path = _validate_dir_path(dir_path)
-
-        if not os.path.isdir(dir_path):
-            return json.dumps({
-                "error": f"Directory not found: {dir_path}",
-                "directory": directory,
-                "status": "error"
-            })
-
-        # Validate numeric parameters
-        max_results = int(max_results)
-        if max_results <= 0:
-            max_results = 100
-
-        if max_depth is not None:
-            max_depth = int(max_depth)
-            if max_depth < 0:
-                return json.dumps({"error": "max_depth must be non-negative", "status": "error"})
-
-        if modified_days is not None:
-            modified_days = int(modified_days)
-            if modified_days < 0:
-                return json.dumps({"error": "modified_days must be non-negative", "status": "error"})
-
-        # Validate file_type against allowlist
-        allowed_file_types = {"f", "d", "l", "b", "c", "p", "s"}
-        if file_type and file_type not in allowed_file_types:
-            return json.dumps({
-                "error": f"Invalid file_type: {file_type}. Must be one of: {', '.join(sorted(allowed_file_types))}",
-                "status": "error"
-            })
-
-        # Validate size_filter format
-        if size_filter and not re.match(r'^[+-]?\d+[bcwkMG]?$', size_filter):
-            return json.dumps({
-                "error": f"Invalid size_filter: {size_filter}. Expected format: [+-]N[bcwkMG]",
-                "status": "error"
-            })
-
-        cmd_parts = ["find", shlex.quote(dir_path)]
-
-        if max_depth is not None:
-            cmd_parts.append(f"-maxdepth {max_depth}")
-
-        if file_type:
-            cmd_parts.append(f"-type {file_type}")
-
-        if name_pattern:
-            cmd_parts.append(f"-name {shlex.quote(name_pattern)}")
-
-        if size_filter:
-            cmd_parts.append(f"-size {size_filter}")
-
-        if modified_days is not None:
-            cmd_parts.append(f"-mtime -{modified_days}")
-
-        if not include_hidden:
-            cmd_parts.append("-not -name '.*'")
-
-        cmd = " ".join(cmd_parts) + f" 2>/dev/null | head -n {max_results}"
-
-        result = _run_command(cmd, cwd=dir_path)
-
-        if result.get("status") == "error":
-            return json.dumps(result)
-
-        output = result.get("stdout", "")
-        files = [f.strip() for f in output.split('\n') if f.strip()]
-
-        file_info = []
-        for f in files:
-            try:
-                stat = os.stat(f)
-                file_info.append({
-                    "path": f,
-                    "name": os.path.basename(f),
-                    "size_bytes": stat.st_size,
-                    "is_dir": os.path.isdir(f)
-                })
-            except Exception:
-                file_info.append({"path": f, "name": os.path.basename(f)})
-
-        return json.dumps({
-            "files": file_info,
-            "total_files": len(file_info),
-            "directory": dir_path,
-            "pattern": name_pattern,
-            "truncated": len(files) >= max_results,
-            "status": "success"
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "directory": directory,
-            "status": "error"
-        })
+    # Pre-resolve before validation (bash server convention)
+    resolved = os.path.abspath(os.path.expanduser(directory))
+    return find_files_impl(
+        directory=resolved, name_pattern=name_pattern, file_type=file_type,
+        max_depth=max_depth, size_filter=size_filter, modified_days=modified_days,
+        max_results=max_results,
+        validate_dir_path=_validate_dir_path,
+        run_command=_run_command,
+    )
 
 
 # =============================================================================
@@ -1285,75 +1105,16 @@ def transform_text(
     expression: Optional[str] = None,
     is_file: bool = False
 ) -> str:
-    if err := _validate_required(input_text=input_text, operation=operation, expression=expression):
-        return err
-    try:
-        if operation not in ["sed", "awk", "tr"]:
-            return json.dumps({
-                "error": f"Invalid operation: {operation}. Use 'sed', 'awk', or 'tr'",
-                "status": "error"
-            })
+    # Pre-resolve file path before validation (bash server convention)
+    def _bash_validate_read_path(p: str) -> str:
+        return _validate_read_path(os.path.abspath(os.path.expanduser(p)))
 
-        if is_file:
-            file_path = os.path.abspath(os.path.expanduser(input_text))
-            # Validate path is within allowed directories
-            file_path = _validate_read_path(file_path)
-            if not os.path.isfile(file_path):
-                return json.dumps({
-                    "error": f"File not found: {file_path}",
-                    "status": "error"
-                })
-            input_source = f"cat {shlex.quote(file_path)}"
-        else:
-            tmp_dir = os.path.join(os.path.abspath(os.path.expanduser(DATA_PATH)), "tmp")
-            _secure_makedirs(tmp_dir)
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, dir=tmp_dir) as f:
-                f.write(input_text)
-                temp_path = f.name
-            os.chmod(temp_path, 0o600)
-            input_source = f"cat {shlex.quote(temp_path)}"
-
-        if operation == "sed":
-            cmd = f"{input_source} | sed {shlex.quote(expression)}"
-        elif operation == "awk":
-            cmd = f"{input_source} | awk {shlex.quote(expression)}"
-        elif operation == "tr":
-            try:
-                tr_args = shlex.split(expression)
-                quoted_tr_args = " ".join(shlex.quote(arg) for arg in tr_args)
-                cmd = f"{input_source} | tr {quoted_tr_args}"
-            except ValueError as e:
-                return json.dumps({
-                    "error": f"Invalid tr expression: {e}",
-                    "status": "error"
-                })
-
-        result = _run_command(cmd)
-
-        if not is_file:
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                pass
-
-        if result.get("status") == "error":
-            return json.dumps(result)
-
-        output = _truncate_output(result.get("stdout", ""))
-
-        return json.dumps({
-            "output": output,
-            "operation": operation,
-            "expression": expression,
-            "status": "success"
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "operation": operation,
-            "status": "error"
-        })
+    return transform_text_impl(
+        input_text=input_text, operation=operation, expression=expression,
+        is_file=is_file, data_path=DATA_PATH,
+        validate_read_path=_bash_validate_read_path,
+        run_command=_run_command,
+    )
 
 
 # =============================================================================
@@ -1366,7 +1127,7 @@ def transform_text(
 Searches for keywords and returns surrounding context that can support answers.
 
 Args:
-- path: Document path within data_path folder (text, PDF, or markdown)
+- path: FULL absolute file path (e.g., "/tmp/onit/data/<session_id>/document.pdf"). Always use the complete working directory path — never use relative paths.
 - query: The question or topic to find context for
 - keywords: Additional keywords to search (comma-separated)
 - context_chars: Characters of context around matches (default: 500)
@@ -1382,259 +1143,11 @@ def get_document_context(
     context_chars: int = 500,
     max_sections: int = 5
 ) -> str:
-    if err := _validate_required(path=path, query=query):
-        return err
-    try:
-        file_path = os.path.abspath(os.path.expanduser(path))
-
-        # Validate path is within allowed directories
-        file_path = _validate_read_path(file_path)
-
-        if not os.path.isfile(file_path):
-            return json.dumps({
-                "error": f"File not found: {file_path}",
-                "path": path,
-                "status": "error"
-            })
-
-        content, file_format = _get_file_content(file_path)
-
-        if file_format == "error" or not content:
-            return json.dumps({
-                "error": "Failed to read file",
-                "path": path,
-                "status": "error"
-            })
-
-        search_terms = set()
-
-        stopwords = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can',
-                     'had', 'her', 'was', 'one', 'our', 'out', 'has', 'have', 'been',
-                     'what', 'when', 'where', 'which', 'who', 'how', 'this', 'that',
-                     'with', 'from', 'they', 'will', 'would', 'there', 'their'}
-
-        for word in re.findall(r'\b\w+\b', query.lower()):
-            if len(word) > 3 and word not in stopwords:
-                search_terms.add(word)
-
-        if keywords:
-            for kw in keywords.split(','):
-                kw = kw.strip().lower()
-                if kw:
-                    search_terms.add(kw)
-
-        if not search_terms:
-            search_terms = {w.lower() for w in query.split() if len(w) > 2}
-
-        matches = []
-        content_lower = content.lower()
-
-        for term in search_terms:
-            for match in re.finditer(re.escape(term), content_lower):
-                matches.append({
-                    "position": match.start(),
-                    "term": term
-                })
-
-        matches.sort(key=lambda x: x["position"])
-
-        sections = []
-        used_ranges = []
-
-        for match in matches:
-            pos = match["position"]
-
-            is_covered = any(start <= pos <= end for start, end in used_ranges)
-            if is_covered:
-                continue
-
-            start = max(0, pos - context_chars // 2)
-            end = min(len(content), pos + context_chars // 2)
-
-            if start > 0:
-                sentence_start = content.rfind('.', start - 100, start)
-                if sentence_start > start - 100:
-                    start = sentence_start + 1
-
-            if end < len(content):
-                sentence_end = content.find('.', end, end + 100)
-                if sentence_end != -1:
-                    end = sentence_end + 1
-
-            section_content = content[start:end].strip()
-
-            section_keywords = [t for t in search_terms if t in section_content.lower()]
-
-            sections.append({
-                "content": section_content,
-                "relevance_keywords": section_keywords,
-                "position": pos,
-                "char_range": [start, end]
-            })
-
-            used_ranges.append((start, end))
-
-            if len(sections) >= max_sections:
-                break
-
-        return json.dumps({
-            "sections": sections,
-            "total_sections": len(sections),
-            "query": query,
-            "search_terms": list(search_terms),
-            "file": file_path,
-            "format": file_format,
-            "status": "success"
-        }, indent=2)
-
-    except Exception as e:
-        return json.dumps({
-            "error": str(e),
-            "path": path,
-            "status": "error"
-        })
-
-
-# =============================================================================
-# DATETIME TOOLS
-# =============================================================================
-
-@mcp.tool()
-def get_datetime(timezone: str = None) -> str:
-    """Get the current date and time with full calendar information.
-
-    Args:
-        timezone: IANA timezone name (e.g. 'Asia/Manila', 'America/New_York', 'Europe/London', 'UTC').
-                  If not provided, uses the system's local timezone.
-
-    Returns:
-        JSON with date, time (12h and 24h), timezone, weekday, week number, day of year,
-        days in month, leap year flag, and unix timestamp.
-    """
-    from datetime import datetime
-    import zoneinfo
-    import calendar as cal_mod
-
-    try:
-        tz = None
-        tz_name = timezone
-
-        if timezone and timezone.lower() != 'local':
-            tz = zoneinfo.ZoneInfo(timezone)
-        else:
-            # Detect system timezone
-            try:
-                localtime_path = "/etc/localtime"
-                if os.path.islink(localtime_path):
-                    link = os.readlink(localtime_path)
-                    if "zoneinfo/" in link:
-                        tz_name = link.split("zoneinfo/")[-1]
-            except Exception:
-                pass
-            if tz_name is None or tz_name == timezone:
-                try:
-                    with open("/etc/timezone") as f:
-                        tz_name = f.read().strip()
-                except Exception:
-                    pass
-            if tz_name and tz_name != timezone:
-                tz = zoneinfo.ZoneInfo(tz_name)
-
-        now = datetime.now(tz) if tz else datetime.now().astimezone()
-        if tz_name is None or tz_name == timezone:
-            tz_name = str(now.tzinfo)
-
-        days_in_month = cal_mod.monthrange(now.year, now.month)[1]
-
-        return json.dumps({
-            "date": now.strftime("%Y-%m-%d"),
-            "time_24h": now.strftime("%H:%M:%S"),
-            "time_12h": now.strftime("%I:%M:%S %p"),
-            "datetime_iso": now.isoformat(),
-            "timezone": tz_name,
-            "timezone_abbr": now.strftime("%Z"),
-            "utc_offset": now.strftime("%z"),
-            "weekday": now.strftime("%A"),
-            "weekday_short": now.strftime("%a"),
-            "day_of_year": now.timetuple().tm_yday,
-            "week_of_year": now.isocalendar()[1],
-            "days_in_month": days_in_month,
-            "is_leap_year": cal_mod.isleap(now.year),
-            "unix_timestamp": int(now.timestamp()),
-        })
-    except zoneinfo.ZoneInfoNotFoundError:
-        return json.dumps({"error": f"Unknown timezone: '{timezone}'. Use IANA names like 'America/New_York', 'Asia/Manila', 'Europe/London', or 'UTC'."})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-@mcp.tool()
-def convert_timezone(datetime_str: str, from_timezone: str, to_timezone: str) -> str:
-    """Convert a datetime string from one timezone to another.
-
-    Args:
-        datetime_str: Datetime in ISO 8601 or common formats, e.g. '2026-02-24T14:30:00',
-                      '2026-02-24 14:30', '2026-02-24'. Time defaults to 00:00 if omitted.
-        from_timezone: Source IANA timezone (e.g. 'UTC', 'America/New_York').
-                       Use 'local' to use the system timezone.
-        to_timezone:   Target IANA timezone (e.g. 'Asia/Tokyo', 'Europe/London').
-                       Use 'local' to use the system timezone.
-
-    Returns:
-        JSON with the converted datetime, both timezone details, and the UTC offset difference.
-    """
-    from datetime import datetime
-    import zoneinfo
-
-    def resolve_tz(name: str):
-        if name.lower() == 'local':
-            tz_name = None
-            try:
-                localtime_path = "/etc/localtime"
-                if os.path.islink(localtime_path):
-                    link = os.readlink(localtime_path)
-                    if "zoneinfo/" in link:
-                        tz_name = link.split("zoneinfo/")[-1]
-            except Exception:
-                pass
-            if tz_name is None:
-                try:
-                    with open("/etc/timezone") as f:
-                        tz_name = f.read().strip()
-                except Exception:
-                    pass
-            return zoneinfo.ZoneInfo(tz_name) if tz_name else datetime.now().astimezone().tzinfo, tz_name or 'local'
-        return zoneinfo.ZoneInfo(name), name
-
-    try:
-        src_tz, src_name = resolve_tz(from_timezone)
-        dst_tz, dst_name = resolve_tz(to_timezone)
-
-        # Parse datetime string
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M",
-                    "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-            try:
-                naive_dt = datetime.strptime(datetime_str.strip(), fmt)
-                break
-            except ValueError:
-                continue
-        else:
-            return json.dumps({"error": f"Could not parse datetime string: '{datetime_str}'. Use ISO 8601 format like '2026-02-24T14:30:00'."})
-
-        src_dt = naive_dt.replace(tzinfo=src_tz)
-        dst_dt = src_dt.astimezone(dst_tz)
-
-        offset_diff = int((dst_dt.utcoffset() - src_dt.utcoffset()).total_seconds() / 3600)
-
-        return json.dumps({
-            "input": {"datetime": src_dt.strftime("%Y-%m-%d %H:%M:%S"), "timezone": src_name, "utc_offset": src_dt.strftime("%z")},
-            "output": {"datetime": dst_dt.strftime("%Y-%m-%d %H:%M:%S"), "datetime_iso": dst_dt.isoformat(), "time_12h": dst_dt.strftime("%I:%M %p"), "timezone": dst_name, "utc_offset": dst_dt.strftime("%z"), "weekday": dst_dt.strftime("%A")},
-            "offset_difference_hours": offset_diff,
-        })
-    except zoneinfo.ZoneInfoNotFoundError as e:
-        return json.dumps({"error": f"Unknown timezone: {e}. Use IANA names like 'America/New_York', 'Asia/Manila', 'UTC'."})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    return get_document_context_impl(
+        path=path, query=query, keywords=keywords,
+        context_chars=context_chars, max_sections=max_sections,
+        validate_read_path=_validate_read_path,
+    )
 
 
 # =============================================================================
@@ -1658,6 +1171,8 @@ def run(
 
     if 'data_path' in options:
         DATA_PATH = options['data_path']
+    elif os.environ.get('ONIT_DATA_PATH'):
+        DATA_PATH = os.environ['ONIT_DATA_PATH']
     _secure_makedirs(os.path.abspath(os.path.expanduser(DATA_PATH)))
 
     if 'documents_path' in options:
@@ -1670,7 +1185,7 @@ def run(
 
     logger.info(f"Starting Bash MCP Server at {host}:{port}{path}")
     logger.info(f"Data path: {DATA_PATH}")
-    logger.info("12 Core Tools: bash, read_file, write_file, send_file, search_document, search_directory, extract_tables, find_files, transform_text, get_document_context, get_datetime, convert_timezone")
+    logger.info("10 Core Tools: bash, read_file, write_file, send_file, search_document, search_directory, extract_tables, find_files, transform_text, get_document_context")
 
     quiet = 'verbose' not in options
     if quiet:

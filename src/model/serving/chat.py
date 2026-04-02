@@ -23,93 +23,55 @@ import logging
 import os
 import json
 import re
-import tempfile
-import time
+import types
 import uuid
+import httpx
 from openai import AsyncOpenAI, OpenAIError, APITimeoutError
 from typing import List, Optional, Any
 
-from ...lib.spatial_memory import MOTION_TOOL_NAMES, SpatialMemory
-
 logger = logging.getLogger(__name__)
 
-
-def _derive_retry_max_tokens_from_context_error(error_message: str,
-                                                requested_max_tokens: int) -> Optional[tuple[int, int, int, int]]:
-    """Parse a vLLM/OpenAI-compatible context error and derive a safe retry budget."""
-    lower_error = error_message.lower()
-    if "context length" not in lower_error or "input tokens" not in lower_error:
-        return None
-
-    context_match = re.search(r"context length is only (\d+) tokens", error_message, re.IGNORECASE)
-    input_match = re.search(r"you passed (\d+) input tokens", error_message, re.IGNORECASE)
-    output_match = re.search(r"requested (\d+) output tokens", error_message, re.IGNORECASE)
-    if not context_match or not input_match:
-        return None
-
-    context_length = int(context_match.group(1))
-    input_tokens = int(input_match.group(1))
-    requested_output_tokens = int(output_match.group(1)) if output_match else requested_max_tokens
-    available_output_tokens = context_length - input_tokens
-    if available_output_tokens <= 0:
-        return context_length, input_tokens, requested_output_tokens, 1
-
-    safety_margin = 32 if available_output_tokens > 64 else 0
-    retry_max_tokens = max(1, available_output_tokens - safety_margin)
-    return context_length, input_tokens, requested_output_tokens, retry_max_tokens
+# Maximum characters for a tool response stored in conversation history.
+# Larger responses are truncated to avoid blowing up the context window.
+MAX_TOOL_RESPONSE = 16000
 
 
-def _tool_call_succeeded(tool_response: str) -> bool:
-    if not tool_response:
-        return False
-    if tool_response.startswith("Error:") or "timed out" in tool_response.lower():
-        return False
-    payload = None
-    try:
-        payload = json.loads(tool_response)
-    except Exception:
-        return True
-    if isinstance(payload, dict) and payload.get("error"):
-        return False
-    status = str(payload.get("status", "")).lower() if isinstance(payload, dict) else ""
-    return status not in {"failed", "error", "cancelled", "canceled", "aborted"}
+def _truncate_tool_response(response: str) -> str:
+    """Truncate a tool response if it exceeds MAX_TOOL_RESPONSE characters."""
+    if len(response) <= MAX_TOOL_RESPONSE:
+        return response
+    half = MAX_TOOL_RESPONSE // 2
+    return response[:half] + f"\n\n... [truncated {len(response) - MAX_TOOL_RESPONSE} chars] ...\n\n" + response[-half:]
 
 
-async def _refresh_pose_after_motion(tool_registry,
-                                     timeout: int | None,
-                                     session_id: str | None,
-                                     task_id: str | None,
-                                     spatial_memory: SpatialMemory | None) -> None:
-    if spatial_memory is None or tool_registry is None or "get_robot_pose" not in getattr(tool_registry, "tools", set()):
-        return
-    pose_handler = tool_registry["get_robot_pose"]
-    pose_timeout = min(timeout or 10, 10)
-    pose_kwargs = {
-        "_session_id": session_id,
-        "_task_id": task_id,
-        "_operation_id": f"mcp_{uuid.uuid4().hex[:12]}",
-    }
-    try:
-        pose_response = await asyncio.wait_for(pose_handler(**pose_kwargs), timeout=pose_timeout)
-    except Exception:
-        return
-    pose_text = "" if pose_response is None else str(pose_response)
-    spatial_memory.observe("get_robot_pose", {}, pose_text)
+def _log_to_ui_or_verbose(message: str, chat_ui, verbose: bool, level: str = "info") -> None:
+    if chat_ui:
+        chat_ui.add_log(message, level=level)
+    elif verbose:
+        print(message)
 
 
 def _resolve_api_key(host: str, host_key: str = "EMPTY") -> str:
     """Resolve the API key based on the host URL.
 
-    For OpenRouter hosts, use host_key param or OPENROUTER_API_KEY env var.
-    For vLLM and other local hosts, default to "EMPTY".
+    For OpenRouter hosts, use host_key param or OPENROUTER_API_KEY env var
+    or OS keychain. For vLLM and other local hosts, default to "EMPTY".
     """
     if "openrouter.ai" in host:
         if host_key and host_key != "EMPTY":
             return host_key
         key = os.environ.get("OPENROUTER_API_KEY", "")
         if not key:
+            # Try OS keychain via setup module
+            try:
+                from src.setup import get_secret
+                key = get_secret("host_key") or ""
+            except Exception:
+                pass
+        if not key:
             raise ValueError(
                 "OpenRouter requires an API key. Set it via:\n"
+                "  - onit setup (recommended)\n"
                 "  - serving.host_key in the config YAML\n"
                 "  - OPENROUTER_API_KEY environment variable"
             )
@@ -117,13 +79,91 @@ def _resolve_api_key(host: str, host_key: str = "EMPTY") -> str:
     return host_key
 
 
-def _parse_tool_call_from_content(content: str, tool_registry) -> Optional[dict]:
+async def _resolve_model_id(client: AsyncOpenAI, host: str) -> str:
+    """Fetch the first available model ID from the endpoint.
+
+    vLLM typically serves a single model, so models.data[0].id is used.
+    For OpenRouter, the caller should always supply the model name explicitly.
+    """
+    models = await client.models.list()
+    if not models.data:
+        raise ValueError(f"No models available at {host}")
+    model_id = models.data[0].id
+    logger.info("Auto-detected model: %s from %s", model_id, host)
+    return model_id
+
+
+async def _get_model_max_context(host: str, api_key: str, model: str) -> Optional[int]:
+    """Query vLLM for the model's maximum context length.
+
+    vLLM exposes ``max_model_len`` in the ``/v1/models`` response as an extra
+    field.  Returns None for OpenRouter or any host that doesn't provide it.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            resp = await http_client.get(
+                f"{host.rstrip('/')}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if resp.status_code == 200:
+                for m in resp.json().get("data", []):
+                    if m.get("id") == model:
+                        val = m.get("max_model_len")
+                        if val:
+                            return int(val)
+    except Exception as e:
+        logger.debug("Could not query max_model_len from vLLM: %s", e)
+    return None
+
+
+def _parse_commands_format(obj: dict, tool_registry) -> Optional[list[dict]]:
+    """Parse the commands-style response format used by some models.
+
+    Expects a dict like:
+        {"state_analysis": "...", "explanation": "...",
+         "commands": [{"keystrokes": "tool_name arg1 arg2\n", ...}],
+         "is_task_complete": false}
+
+    Returns a list of {"name": ..., "arguments": ...} dicts, or None if
+    the format doesn't match.
+    """
+    if not isinstance(obj, dict) or "commands" not in obj:
+        return None
+    commands = obj.get("commands", [])
+    if not isinstance(commands, list) or not commands:
+        return None
+    results = []
+    for cmd in commands:
+        keystrokes = cmd.get("keystrokes", "").strip()
+        if not keystrokes:
+            continue
+        # keystrokes is "tool_name [args...]\n" — split into name and the rest
+        parts = keystrokes.split(None, 1)
+        tool_name = parts[0]
+        if tool_name not in tool_registry.tools:
+            continue
+        # If there's text after the tool name, treat it as a single positional
+        # argument (the tool schema decides how to interpret it).
+        arguments = {}
+        if len(parts) > 1:
+            arguments = {"input": parts[1]}
+        results.append({
+            "name": tool_name,
+            "arguments": arguments,
+            "_timeout_sec": cmd.get("timeout_sec"),
+            "_is_blocking": cmd.get("is_blocking", True),
+        })
+    return results if results else None
+
+
+def _parse_tool_call_from_content(content: str, tool_registry) -> Optional[dict | list[dict]]:
     """Detect a raw JSON tool call in message content.
 
     Some models return tool calls as plain JSON in the response body instead of
     using the structured tool_calls field.  This function tries to parse the
     content and, if it looks like a valid tool call for a known tool, returns
-    a dict with 'name' and 'arguments'.
+    a dict with 'name' and 'arguments' (or a list of such dicts for the
+    commands format).
     """
     if not content or not tool_registry:
         return None
@@ -171,59 +211,11 @@ def _parse_tool_call_from_content(content: str, tool_registry) -> Optional[dict]
         if obj["name"] not in tool_registry.tools:
             return None
         return obj
+    # Try commands-style format: {"commands": [{"keystrokes": "tool\n", ...}]}
+    commands_result = _parse_commands_format(obj, tool_registry)
+    if commands_result:
+        return commands_result
     return None
-
-
-def _strip_image_content(messages: list) -> int:
-    """Remove all image_url content parts from messages in-place.
-
-    Replaces multipart user messages that contain image_url items with a
-    plain-text version, keeping only the text parts.  Tool messages that
-    were already replaced with '[image captured — displayed below]' are
-    left untouched.
-
-    Returns the number of image items removed.
-    """
-    removed = 0
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        if isinstance(content, list):
-            text_parts = [p for p in content if isinstance(p, dict) and p.get("type") == "text"]
-            img_parts  = [p for p in content if isinstance(p, dict) and p.get("type") == "image_url"]
-            if img_parts:
-                removed += len(img_parts)
-                msg["content"] = " ".join(p["text"] for p in text_parts) if text_parts else ""
-    return removed
-
-
-def _extract_data_url_images(tool_response: str, data_path: str) -> str:
-    """Find data-URL images in a tool response, save them to *data_path*,
-    and replace each data URL with the local file path.
-
-    This prevents huge base64 blobs from polluting the message chain and
-    lets the web UI serve the images via ``/uploads/``.
-    """
-    pattern = re.compile(r'data:image/([^;]+);base64,([A-Za-z0-9+/=\s]+)', re.DOTALL)
-    os.makedirs(data_path, exist_ok=True)
-
-    def _replace(m: re.Match) -> str:
-        mime_sub = m.group(1).strip()
-        b64 = m.group(2).replace("\n", "").replace("\r", "").replace(" ", "")
-        ext = "jpg" if mime_sub in ("jpeg", "jpg") else mime_sub
-        fname = f"{uuid.uuid4()}.{ext}"
-        fpath = os.path.join(data_path, fname)
-        try:
-            raw = base64.b64decode(b64)
-            fd = os.open(fpath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(raw)
-            return fpath
-        except Exception:
-            return m.group(0)  # leave unchanged on failure
-
-    return pattern.sub(_replace, tool_response)
 
 
 def _parse_truncated_tool_call(text: str, tool_registry) -> Optional[dict]:
@@ -292,52 +284,85 @@ def _looks_like_raw_tool_call(content: str) -> bool:
     if not content:
         return False
     text = content.split("</think>")[-1].strip() if "</think>" in content else content.strip()
-    # Quick heuristic: must contain both "name" and "arguments" keys in JSON-like syntax
-    return bool(re.search(r'"name"\s*:\s*"[^"]+"', text) and re.search(r'"arguments"\s*:', text))
+    # Quick heuristic: standard format or commands format
+    has_standard = bool(re.search(r'"name"\s*:\s*"[^"]+"', text) and re.search(r'"arguments"\s*:', text))
+    has_commands = bool(re.search(r'"commands"\s*:\s*\[', text) and re.search(r'"keystrokes"\s*:', text))
+    return has_standard or has_commands
 
 
-def _detect_tool_name_loop(history: list, min_repeats: int = 4) -> str | None:
-    """Detect if recent tool calls form a short repeating name pattern.
+def _resolve_sandbox_download_locally(args: dict, data_path: str) -> str | None:
+    """Handle sandbox_download_file locally when the file already exists on the host.
 
-    Checks for a 2-tool alternating pattern (A→B→A→B...) that repeats
-    at least *min_repeats* times.  Returns a human-readable description
-    of the pattern, or None.
+    The sandbox container may volume-mount data_path as /workspace.  If so,
+    files written there already exist on the host and we can skip the remote
+    server call entirely.  Returns a JSON result string on success, or None
+    to fall through to the remote server.
     """
-    names = [name for name, _ in history]
-    if len(names) < min_repeats * 2:
+    src_path = args.get("path", "")
+    if not src_path:
         return None
-    pair = (names[-2], names[-1])
-    count = 0
-    idx = len(names) - 2
-    while idx >= 0 and idx + 1 < len(names):
-        if (names[idx], names[idx + 1]) == pair:
-            count += 1
-            idx -= 2
-        else:
-            break
-    if count >= min_repeats:
-        return f"{pair[0]} → {pair[1]} (repeated {count} times)"
-    return None
+
+    abs_data = os.path.abspath(data_path)
+
+    # Resolve to a relative path under data_path
+    if src_path.startswith("/workspace/"):
+        relative = src_path[len("/workspace/"):]
+    elif src_path.startswith("/workspace"):
+        relative = src_path[len("/workspace"):]
+    elif os.path.abspath(src_path).startswith(abs_data):
+        relative = os.path.relpath(os.path.abspath(src_path), abs_data)
+    else:
+        return None
+
+    if not relative or relative == ".":
+        return None
+
+    local_path = os.path.join(data_path, relative)
+    if not os.path.exists(local_path):
+        return None  # not on host — must go through remote server
+
+    try:
+        size_bytes = os.path.getsize(local_path)
+    except OSError:
+        size_bytes = None
+    return json.dumps({
+        "status": "ok",
+        "filename": os.path.basename(relative),
+        "dest": local_path,
+        "size_bytes": size_bytes,
+    }, indent=2)
 
 
-def _extract_base64_file(tool_response: str, data_path: str) -> str:
+def _extract_base64_file(tool_response: str, data_path: str) -> tuple[str, str | None, str | None]:
     """Detect base64-encoded file data in a tool response and save it to disk.
 
     If the response is JSON containing a 'file_data_base64' field, decode it,
-    write the file to data_path, and return a cleaned JSON string with the
-    base64 data replaced by the local file path.  Otherwise return the
-    original response unchanged.
+    write the file to data_path, and return a tuple:
+      (cleaned_json_str, image_base64_or_None, mime_type_or_None)
+
+    When the file is an image (mime_type starts with 'image/'), the base64 data
+    and mime_type are returned so callers can inject the image into the
+    conversation for VLM processing.  Otherwise return
+    (original_response, None, None).
     """
     try:
         data = json.loads(tool_response)
     except (json.JSONDecodeError, TypeError):
-        return tool_response
+        return tool_response, None, None
 
     if not isinstance(data, dict) or "file_data_base64" not in data:
-        return tool_response
+        return tool_response, None, None
 
     file_data_b64 = data.pop("file_data_base64")
-    file_name = data.get("file_name", f"{uuid.uuid4()}.bin")
+    mime_type = data.get("mime_type", "application/octet-stream")
+
+    # Pick a sensible extension from the mime type
+    _ext_map = {
+        "image/jpeg": ".jpg", "image/png": ".png",
+        "image/gif": ".gif", "image/webp": ".webp",
+    }
+    ext = _ext_map.get(mime_type, ".bin")
+    file_name = data.get("file_name", f"{uuid.uuid4()}{ext}")
     safe_name = os.path.basename(file_name)
     filepath = os.path.join(data_path, safe_name)
     os.makedirs(data_path, exist_ok=True)
@@ -350,181 +375,199 @@ def _extract_base64_file(tool_response: str, data_path: str) -> str:
     data["saved_path"] = filepath
     data["download_url"] = f"/uploads/{safe_name}"
     data["file_size_bytes"] = len(file_bytes)
-    return json.dumps(data)
+
+    # Return image base64 + mime for VLM injection when the file is an image
+    image_b64 = file_data_b64 if mime_type.startswith("image/") else None
+    return json.dumps(data), image_b64, mime_type if image_b64 else None
 
 
-async def _execute_tool_call(function_name: str,
-                             function_arguments: dict,
-                             tool_call_id: str,
-                             tool_registry,
-                             timeout: int | None,
-                             data_path: str,
-                             chat_ui,
-                             verbose: bool,
-                             trace_recorder,
-                             session_id: str | None,
-                             task_id: str | None,
-                             spatial_memory: SpatialMemory | None = None) -> dict:
-    if trace_recorder:
-        trace_recorder.record(
-            "agent.tool_decision",
-            session_id=session_id,
-            task_id=task_id,
-            tool_name=function_name,
-            arguments=function_arguments,
-            timeout_seconds=timeout,
-        )
+def _strip_old_images(messages: list) -> None:
+    """Replace base64 image payloads in stale tool messages with a short placeholder.
 
+    The image is kept intact in the most-recently-added image-bearing tool message
+    so the model sees it once, then stripped from all older messages to avoid
+    re-sending large base64 blobs on every subsequent turn.
+    """
+    last_image_idx = -1
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "tool" and isinstance(msg.get("content"), list):
+            if any(part.get("type") == "image_url" for part in msg["content"]):
+                last_image_idx = i
+
+    if last_image_idx == -1:
+        return
+
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if i == last_image_idx:
+            continue  # keep the latest image intact
+        if msg.get("role") == "tool" and isinstance(msg.get("content"), list):
+            if any(part.get("type") == "image_url" for part in msg["content"]):
+                text = next((p["text"] for p in msg["content"] if p.get("type") == "text"), "")
+                msg["content"] = text + "\n[image omitted — already analyzed]"
+
+
+async def _execute_tool(function_name: str, function_arguments: dict,
+                        tool_call_id: str, tool_registry, timeout, data_path,
+                        chat_ui, verbose, messages: list,
+                        tool_call_history: list,
+                        max_repeated: int,
+                        is_structured: bool = False,
+                        session_id: str = "") -> Optional[str]:
+    """Execute a single tool call and append the result to messages.
+
+    Returns a bail-out message string if repeated-call limit is hit,
+    otherwise returns None (caller should continue).
+    """
+    # Inject session_id / data_path into tool calls whose schema declares
+    # these parameters, so callers (e.g. sandbox MCP servers) receive them
+    # automatically without hardcoding tool names.
+    if session_id and tool_registry.tool_accepts_param(function_name, "session_id"):
+        function_arguments.setdefault("session_id", session_id)
+    if data_path and tool_registry.tool_accepts_param(function_name, "data_path"):
+        function_arguments.setdefault("data_path", data_path)
+    # Intercept sandbox_download_file for /workspace/ paths.  The container
+    # volume-mounts data_path as /workspace, so those files already exist on
+    # the host — no need to call the remote server (which may be containerized
+    # and unable to write to host paths).
+    if function_name == "sandbox_download_file" and data_path:
+        result = _resolve_sandbox_download_locally(function_arguments, data_path)
+        if result is not None:
+            if chat_ui:
+                chat_ui.add_tool_call(function_name, function_arguments)
+                chat_ui.show_tool_start(function_name, function_arguments)
+            tool_message = {'role': 'tool', 'content': result, 'name': function_name,
+                            'parameters': function_arguments, "tool_call_id": tool_call_id}
+            messages.append(tool_message)
+            if chat_ui:
+                chat_ui.add_tool_result(function_name, result)
+                if is_structured:
+                    chat_ui.show_tool_done(function_name, result)
+            return None
     if chat_ui:
-        chat_ui.add_log(f"Calling: {function_name}({function_arguments})", level="info")
-        if hasattr(chat_ui, 'show_tool_call'):
-            chat_ui.show_tool_call(function_name, function_arguments)
-        chat_ui.render()
+        chat_ui.add_tool_call(function_name, function_arguments)
+        chat_ui.show_tool_start(function_name, function_arguments)
+        chat_ui.start_tool_spinner(function_name, function_arguments)
     elif verbose:
         print(f"{function_name}({function_arguments})")
 
-    if not tool_registry or function_name not in tool_registry.tools:
-        return {
-            'role': 'tool',
-            'content': f'Error: tool {function_name} not found',
-            'name': function_name,
-            'parameters': function_arguments,
-            'tool_call_id': tool_call_id,
-        }
-
-    try:
+    if function_name not in tool_registry.tools:
+        tool_message = {'role': 'tool', 'content': f'Error: tool {function_name} not found',
+                        'name': function_name, 'parameters': function_arguments,
+                        "tool_call_id": tool_call_id}
+        messages.append(tool_message)
+    else:
         tool_handler = tool_registry[function_name]
-        call_kwargs = dict(function_arguments)
-        call_kwargs['_session_id'] = session_id
-        call_kwargs['_task_id'] = task_id
-        call_kwargs['_operation_id'] = f"mcp_{uuid.uuid4().hex[:12]}"
-        _tool_start = time.monotonic()
         try:
-            tool_response = await asyncio.wait_for(
-                tool_handler(**call_kwargs),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            tool_response = (
-                f"- tool call timed out after {timeout} seconds. Tool might have succeeded "
-                "but no response was received. Check expected output. "
-                "This is a transient error — the tool may work on a future call."
-            )
+            try:
+                # Build a log handler to forward MCP notifications/message
+                # to the UI in real-time (e.g. sandbox stdout/stderr).
+                _log_handler = None
+                if chat_ui and hasattr(chat_ui, 'tool_log'):
+                    async def _log_handler(msg):
+                        chat_ui.tool_log(function_name, msg.data, level=msg.level)
+                tool_task = asyncio.ensure_future(tool_handler(log_handler=_log_handler, **function_arguments))
+
+                async def _heartbeat(interval=10):
+                    """Send periodic progress events to keep SSE alive."""
+                    elapsed = 0
+                    while True:
+                        await asyncio.sleep(interval)
+                        elapsed += interval
+                        if chat_ui:
+                            chat_ui.tool_progress(function_name, elapsed)
+
+                heartbeat_task = asyncio.ensure_future(_heartbeat())
+                try:
+                    tool_response = await asyncio.wait_for(tool_task, timeout=timeout)
+                finally:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+            except asyncio.TimeoutError:
+                tool_response = (f"- tool call timed out after {timeout} seconds. "
+                                 "Tool might have succeeded but no response was received. "
+                                 "Check expected output.")
+                _log_to_ui_or_verbose(f"{function_name} timed out after {timeout}s", chat_ui, verbose, level="warning")
+            if is_structured and chat_ui:
+                chat_ui.stop_tool_spinner()
+            tool_response = "" if tool_response is None else str(tool_response)
+            _vision_b64, _vision_mime = None, None
+            if data_path and "file_data_base64" in tool_response:
+                tool_response, _vision_b64, _vision_mime = _extract_base64_file(tool_response, data_path)
+            tool_response = _truncate_tool_response(tool_response)
+            if _vision_b64:
+                tool_content = [
+                    {"type": "text", "text": tool_response},
+                    {"type": "image_url", "image_url": {"url": f"data:{_vision_mime};base64,{_vision_b64}"}},
+                ]
+            else:
+                tool_content = tool_response
+            tool_message = {'role': 'tool', 'content': tool_content, 'name': function_name,
+                            'parameters': function_arguments, "tool_call_id": tool_call_id}
+            messages.append(tool_message)
             if chat_ui:
-                chat_ui.add_log(f"{function_name} timed out after {timeout}s", level="warning")
-                if hasattr(chat_ui, 'show_tool_result'):
-                    chat_ui.show_tool_result(function_name, round((time.monotonic() - _tool_start) * 1000),
-                                             success=False, error=f"timed out after {timeout}s")
+                chat_ui.add_tool_result(function_name, tool_response)
+                if is_structured:
+                    chat_ui.show_tool_done(function_name, tool_response)
             elif verbose:
-                print(f"{function_name} timed out after {timeout}s")
-        _tool_elapsed_ms = round((time.monotonic() - _tool_start) * 1000)
-        tool_response = "" if tool_response is None else str(tool_response)
-        if data_path and "file_data_base64" in tool_response:
-            tool_response = _extract_base64_file(tool_response, data_path)
-        if data_path and "data:image/" in tool_response:
-            tool_response = _extract_data_url_images(tool_response, data_path)
-        if spatial_memory:
-            spatial_update = spatial_memory.observe(function_name, function_arguments, tool_response)
-            if spatial_update:
-                tool_response = f"{tool_response}\n\n{spatial_update}"
-        if function_name in MOTION_TOOL_NAMES and _tool_call_succeeded(tool_response):
-            await _refresh_pose_after_motion(
-                tool_registry=tool_registry,
-                timeout=timeout,
-                session_id=session_id,
-                task_id=task_id,
-                spatial_memory=spatial_memory,
-            )
-        if spatial_memory and spatial_memory.should_surface_to_planner(function_name):
-            planner_context = spatial_memory.planner_context()
-            if planner_context and planner_context not in tool_response:
-                tool_response = f"{tool_response}\n\n{planner_context}"
+                truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
+                print(f"{function_name}({function_arguments}) returned: {truncated}")
+        except Exception as e:
+            if chat_ui:
+                if is_structured:
+                    chat_ui.stop_tool_spinner()
+                    chat_ui.show_tool_done(function_name, str(e), success=False)
+            _log_to_ui_or_verbose(f"{function_name} error: {e}", chat_ui, verbose, level="error")
+            tool_message = {'role': 'tool', 'content': f'Error: {e}', 'name': function_name,
+                            'parameters': function_arguments, "tool_call_id": tool_call_id}
+            messages.append(tool_message)
 
-        truncated = tool_response[:500] + "..." if len(tool_response) > 500 else tool_response
-        if chat_ui:
-            chat_ui.add_log(f"{function_name} [{_tool_elapsed_ms} ms] returned: {truncated}", level="debug")
-            if hasattr(chat_ui, 'show_tool_result'):
-                chat_ui.show_tool_result(function_name, _tool_elapsed_ms)
-        elif verbose:
-            print(f"{function_name} [{_tool_elapsed_ms} ms] returned: {truncated}")
-
-        return {
-            'role': 'tool',
-            'content': tool_response,
-            'name': function_name,
-            'parameters': function_arguments,
-            'tool_call_id': tool_call_id,
-        }
-    except Exception as e:
-        if chat_ui:
-            chat_ui.add_log(f"{function_name}({function_arguments}) error: {e}", level="error")
-            if hasattr(chat_ui, 'show_tool_result'):
-                chat_ui.show_tool_result(function_name, 0, success=False, error=str(e))
-        elif verbose:
-            print(f"{function_name}({function_arguments}) encountered an error: {e}")
-        return {
-            'role': 'tool',
-            'content': f'Error: {e}. This is a transient error — the tool may work on a future call.',
-            'name': function_name,
-            'parameters': function_arguments,
-            'tool_call_id': tool_call_id,
-        }
+    # Check for repeated tool calls
+    call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
+    tool_call_history.append(call_key)
+    if tool_call_history.count(call_key) >= max_repeated:
+        msg = f"I am sorry 😊. Could you try to rephrase or provide additional details?"
+        _log_to_ui_or_verbose(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", chat_ui, verbose, level="warning")
+        return msg
+    return None
 
 
-async def chat(host: str = "http://127.0.0.1:8001/v1",
-         host_key: str = "EMPTY",
-         model: str = "Qwen/Qwen3-8B",
-         instruction: str = "Tell me more about yourself.",
-         images: List[str]|str = None,
-         tool_registry: Optional[Any] = None,
-         timeout: int = None,
-         stream: bool = False,
-         think: bool = False,
-         safety_queue: Optional[asyncio.Queue] = None,
-         error_container: Optional[list] = None,
-         **kwargs) -> Optional[str]:
-
-    tools = tool_registry.get_tool_items() if tool_registry else []
-    chat_ui = kwargs['chat_ui'] if 'chat_ui' in kwargs else None
-    verbose = kwargs['verbose'] if 'verbose' in kwargs else False
-    data_path = kwargs.get('data_path', '')
-    max_tokens = kwargs.get('max_tokens', 8192)
-    memories = kwargs.get('memories', None)
-    prompt_intro = kwargs.get('prompt_intro', "I am a helpful AI assistant. My name is OnIt.")
-    trace_recorder = kwargs.get('trace_recorder')
-    session_id = kwargs.get('session_id')
-    task_id = kwargs.get('task_id')
-    spatial_memory = SpatialMemory(
-        data_path=data_path,
-        trace_recorder=trace_recorder,
-        session_id=session_id,
-        task_id=task_id,
-    ) if data_path else None
-
-    images_bytes = []
+def _load_images(images: List[str] | str | None, chat_ui, verbose: bool) -> list[str]:
+    """Read image files from disk and return their base64-encoded bytes."""
+    images_bytes: list[str] = []
     if isinstance(images, list):
         for image_path in images:
             if os.path.exists(image_path):
                 with open(image_path, 'rb') as image_file:
                     images_bytes.append(base64.b64encode(image_file.read()).decode('utf-8'))
             else:
-                if chat_ui:
-                    chat_ui.add_log(f"Image file {image_path} not found, proceeding without this image.", level="warning")
-                elif verbose:
-                    print(f"Image file {image_path} not found, proceeding without this image.")
+                _log_to_ui_or_verbose(f"Image file {image_path} not found, proceeding without this image.", chat_ui, verbose, level="warning")
     elif isinstance(images, str):
         image_path = images
         if os.path.exists(image_path):
             with open(image_path, 'rb') as image_file:
                 images_bytes = [base64.b64encode(image_file.read()).decode('utf-8')]
         else:
-            if chat_ui:
-                chat_ui.add_log(f"Image file {image_path} not found, proceeding without this image.", level="warning")
-            elif verbose:
-                print(f"Image file {image_path} not found, proceeding without this image.")
+            _log_to_ui_or_verbose(f"Image file {image_path} not found, proceeding without this image.", chat_ui, verbose, level="warning")
+    return images_bytes
 
+
+def _build_messages(instruction: str, images_bytes: list[str],
+                    prompt_intro: str, session_history: list | None,
+                    memories: Any) -> list[dict]:
+    """Assemble the initial message list for the API call.
+
+    Includes the system message, session history, the current user instruction,
+    and the empty tool sentinel when appropriate.
+    """
     if images_bytes:
-        messages = [{
+        messages: list[dict] = [{
             "role": "system",
             "content": (
                 f"{prompt_intro} "
@@ -541,13 +584,10 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
     # Inject session history BEFORE the current instruction so the model
     # sees prior context first and treats the latest user message as the
     # one to respond to.
-    session_history = kwargs.get('session_history', None)
-    history_turn_count = 0
     if session_history:
         for entry in session_history:
             messages.append({"role": "user", "content": entry["task"]})
             messages.append({"role": "assistant", "content": entry["response"]})
-            history_turn_count += 1
 
     # Current instruction goes last so the model responds to it
     if images_bytes:
@@ -559,360 +599,545 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             ]
         })
     else:
-        messages.append({"role": "user", "content": instruction})   
-        
+        messages.append({"role": "user", "content": instruction})
+
+    # Note: previously an empty tool sentinel message was appended here when
+    # there was no session history or memories.  This violated the OpenAI API
+    # spec (tool messages must follow an assistant message with tool_calls) and
+    # caused some vLLM versions to reject the request outright.
+
+    return messages
+
+
+async def _process_streaming_response(
+    chat_completion, safety_queue: asyncio.Queue,
+    chat_ui, think: bool,
+) -> tuple[str, str, dict, bool, Any] | None:
+    """Consume a streaming chat completion and return accumulated results.
+
+    Returns (full_content, full_reasoning, full_tool_calls_dict, ui_was_streaming, usage)
+    or None if the safety queue fired mid-stream.  ``usage`` is the
+    CompletionUsage object from the final chunk (requires stream_options
+    include_usage=True), or None if not available.
+    """
+    full_content = ""
+    full_reasoning = ""
+    full_tool_calls: dict = {}  # index -> {id, name, arguments}
+    ui_streaming = False
+    usage = None
+    in_think = think  # True if we expect <think>...</think> in delta.content
+
+    async for chunk in chat_completion:
+        if not safety_queue.empty():
+            if ui_streaming and chat_ui:
+                chat_ui.stream_end()
+            return None
+        # Capture usage from the final chunk (stream_options include_usage=True)
+        if chunk.usage is not None:
+            usage = chunk.usage
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+
+        # Accumulate structured tool-call deltas
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                idx = tc.index
+                if idx not in full_tool_calls:
+                    full_tool_calls[idx] = {"id": "", "name": "", "arguments": ""}
+                if tc.id:
+                    full_tool_calls[idx]["id"] = tc.id
+                if tc.function:
+                    if tc.function.name:
+                        full_tool_calls[idx]["name"] += tc.function.name
+                    if tc.function.arguments:
+                        full_tool_calls[idx]["arguments"] += tc.function.arguments
+
+        # vLLM/OpenAI reasoning_content: thinking tokens in a dedicated field
+        reasoning_tok = getattr(delta, 'reasoning_content', None)
+        if reasoning_tok and not full_tool_calls:
+            full_reasoning += reasoning_tok
+            if chat_ui:
+                if not ui_streaming:
+                    chat_ui.stream_start()
+                    ui_streaming = True
+                chat_ui.stream_think_token(reasoning_tok)
+
+        # Stream content (answer) tokens to UI
+        if delta.content:
+            token = delta.content
+            full_content += token
+            if chat_ui and not full_tool_calls:
+                if in_think:
+                    # Three cases:
+                    # 1. vLLM sends thinking via reasoning_content -> no <think> in content
+                    # 2. Model chose not to think -> no <think> in content
+                    # 3. Model embeds <think>...</think> inside content
+                    if "<think>" not in full_content:
+                        # Cases 1 & 2 -- stream answer directly
+                        in_think = False
+                        if not ui_streaming:
+                            chat_ui.stream_start()
+                            ui_streaming = True
+                        chat_ui.stream_token(token)
+                    elif "</think>" in full_content:
+                        # Case 3 end: think block closed, stream the answer part
+                        in_think = False
+                        post_think = full_content.split("</think>", 1)[1]
+                        if post_think:
+                            if not ui_streaming:
+                                chat_ui.stream_start()
+                                ui_streaming = True
+                            chat_ui.stream_token(post_think)
+                    else:
+                        # Case 3 mid: inside inline <think> block
+                        if not ui_streaming:
+                            chat_ui.stream_start()
+                            ui_streaming = True
+                        chat_ui.stream_think_token(token.replace("<think>", ""))
+                else:
+                    if not ui_streaming:
+                        chat_ui.stream_start()
+                        ui_streaming = True
+                    chat_ui.stream_token(token)
+
+    if ui_streaming and chat_ui:
+        chat_ui.stream_end()
+
+    return full_content, full_reasoning, full_tool_calls, ui_streaming, usage
+
+
+def _unify_streaming_result(
+    full_content: str, full_tool_calls: dict,
+) -> tuple[str | None, list | None, dict]:
+    """Convert accumulated streaming data into unified content/tool_calls/history variables."""
+    if full_tool_calls:
+        tool_call_objs = [
+            types.SimpleNamespace(
+                id=v["id"],
+                function=types.SimpleNamespace(name=v["name"], arguments=v["arguments"])
+            )
+            for v in full_tool_calls.values()
+        ]
+        message_for_history = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": v["id"], "type": "function",
+                 "function": {"name": v["name"], "arguments": v["arguments"]}}
+                for v in full_tool_calls.values()
+            ]
+        }
+        return None, tool_call_objs, message_for_history
+    return full_content, None, {"role": "assistant", "content": full_content}
+
+
+def _extract_final_response(content: str, full_reasoning: str, full_content: str) -> str:
+    """Clean up the final text response, stripping think tags and applying fallbacks."""
+    last_response = content
+    if "</think>" in last_response:
+        last_response = last_response.split("</think>")[1]
+    # Fallback: if delta.content was empty but reasoning_content had the answer,
+    # surface the reasoning so the user gets a non-empty reply.
+    if not last_response or not last_response.strip():
+        if full_reasoning and full_reasoning.strip():
+            last_response = full_reasoning.strip()
+        elif full_content and "<think>" in full_content:
+            # Model put entire answer inside inline <think> tags
+            think_body = full_content.split("<think>", 1)[1].split("</think>", 1)[0].strip()
+            if think_body:
+                last_response = think_body
+    return last_response
+
+
+async def _handle_raw_tool_call(
+    last_response: str, tool_registry, timeout, data_path,
+    chat_ui, verbose: bool, messages: list,
+    tool_call_history: list, max_repeated: int,
+    session_id: str = "",
+) -> tuple[bool, str | None]:
+    """Handle a raw JSON tool call embedded in model content.
+
+    Returns (should_continue, bail_message).
+    If should_continue is True, the caller should loop back for another iteration.
+    If bail_message is not None, the caller should return it immediately.
+    """
+    raw_tool = _parse_tool_call_from_content(last_response, tool_registry)
+    if raw_tool:
+        # Normalize to a list (commands format returns a list, legacy returns a dict)
+        tool_calls = raw_tool if isinstance(raw_tool, list) else [raw_tool]
+        messages.append({"role": "assistant", "content": last_response})
+        for tc in tool_calls:
+            function_name = tc["name"]
+            function_arguments = {k: v for k, v in tc.get("arguments", {}).items()}
+            synthetic_id = f"call_{uuid.uuid4().hex[:24]}"
+            bail = await _execute_tool(
+                function_name, function_arguments, synthetic_id,
+                tool_registry, timeout, data_path, chat_ui, verbose,
+                messages, tool_call_history, max_repeated,
+                is_structured=False, session_id=session_id,
+            )
+            if bail:
+                return False, bail
+        return True, None  # loop back for the model to generate the final response
+
+    # Guard against returning raw tool-call JSON to the user.
+    # If the content looks like a tool call but couldn't be parsed,
+    # ask the model to retry without tools.
+    if _looks_like_raw_tool_call(last_response):
+        _log_to_ui_or_verbose("Model returned unparseable raw tool-call JSON, retrying without tools.", chat_ui, verbose, level="warning")
+        messages.append({"role": "assistant", "content": last_response})
+        messages.append({"role": "user", "content": "Please provide your answer as plain text, not as a JSON tool call."})
+        return True, None
+
+    return False, None
+
+
+_SAFETY_ABORT = object()  # sentinel distinct from None
+
+
+async def _handle_structured_tool_calls(
+    tool_calls: list, message_for_history, tool_registry,
+    timeout, data_path, chat_ui, verbose: bool,
+    messages: list, tool_call_history: list,
+    max_repeated: int, safety_queue: asyncio.Queue,
+    session_id: str = "",
+) -> str | object | None:
+    """Execute structured tool calls and append results to messages.
+
+    Returns:
+      - A bail-out message string if a repeated-call limit is hit.
+      - _SAFETY_ABORT sentinel if the safety queue fired.
+      - None when all tools completed normally.
+    """
+    messages.append(message_for_history)
+    for tool in tool_calls:
+        await asyncio.sleep(0.1)
+        if not safety_queue.empty():
+            if verbose:
+                print("Safety queue triggered, exiting chat loop.")
+            return _SAFETY_ABORT
+        function_name = tool.function.name
+        try:
+            function_arguments = json.loads(tool.function.arguments)
+        except json.JSONDecodeError:
+            # Try fixing common issues: single quotes, trailing commas
+            import re
+            fixed = tool.function.arguments.strip()
+            # Replace single quotes with double quotes
+            fixed = fixed.replace("'", '"')
+            # Remove trailing commas before closing braces/brackets
+            fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+            try:
+                function_arguments = json.loads(fixed)
+            except json.JSONDecodeError as e:
+                if verbose:
+                    print(f"Failed to parse tool arguments for {function_name}: {e}")
+                    print(f"Raw arguments: {tool.function.arguments}")
+                function_arguments = {}
+        bail = await _execute_tool(
+            function_name, function_arguments, tool.id,
+            tool_registry, timeout, data_path, chat_ui, verbose,
+            messages, tool_call_history, max_repeated,
+            is_structured=True, session_id=session_id,
+        )
+        if bail:
+            return bail
+    return None
+
+
+async def _compact_context(
+    messages: list, client: AsyncOpenAI, model: str,
+    max_tokens: int, chat_ui, verbose: bool,
+) -> list:
+    """Summarize the conversation and return a compacted messages list.
+
+    Keeps the system message, generates a dense LLM summary of all other
+    messages, and returns [system_msg, compacted_user_msg, ack_assistant_msg].
+    Falls back to the original messages list if the summarization call fails.
+    """
+    system_msg = (
+        messages[0]
+        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system"
+        else None
+    )
+    messages_to_summarize = messages[1:] if system_msg else messages[:]
+    if not messages_to_summarize:
+        return messages
+
+    # Build plain-text conversation transcript for the summarization prompt
+    parts: list[str] = []
+    for msg in messages_to_summarize:
+        role = msg.get("role", "?")
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+        content = str(content)
+        name = msg.get("name", "")
+        if role == "user":
+            parts.append(f"User: {content[:600]}")
+        elif role == "assistant":
+            tcs = msg.get("tool_calls")
+            if tcs:
+                tc_names = []
+                for tc in tcs:
+                    if isinstance(tc, dict):
+                        tc_names.append(tc.get("function", {}).get("name", "?"))
+                    else:
+                        tc_names.append(getattr(getattr(tc, "function", None), "name", "?"))
+                parts.append(f"Assistant called tools: {', '.join(tc_names)}")
+            elif content:
+                parts.append(f"Assistant: {content[:600]}")
+        elif role == "tool":
+            parts.append(f"Tool({name}): {content[:400]}")
+
+    compaction_prompt = (
+        "Summarize the following agent conversation. Include: the original task, "
+        "key tool results and findings, decisions made, and what still needs to be "
+        "done. Be thorough but concise — this summary replaces the full history.\n\n"
+        + "\n".join(parts)
+    )
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": compaction_prompt}],
+            max_tokens=min(2048, max_tokens),
+            stream=False,
+        )
+        summary = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.warning("Context compaction failed: %s", e)
+        return messages
+
+    _log_to_ui_or_verbose(
+        f"Context compacted: {len(messages_to_summarize)} messages → {len(summary):,} char summary",
+        chat_ui, verbose, level="info",
+    )
+    if chat_ui and hasattr(chat_ui, "show_context_compaction"):
+        chat_ui.show_context_compaction(len(messages_to_summarize), len(summary))
+
+    new_messages: list = []
+    if system_msg:
+        new_messages.append(system_msg)
+    new_messages.append({
+        "role": "user",
+        "content": (
+            "[CONTEXT COMPACTED]\nThe following is a summary of prior work:\n\n"
+            + summary
+            + "\n\n[Continue the task based on the summary above.]"
+        ),
+    })
+    new_messages.append({
+        "role": "assistant",
+        "content": "Understood. Continuing based on the context summary.",
+    })
+    return new_messages
+
+
+async def chat(host: str = "http://127.0.0.1:8001/v1",
+         host_key: str = "EMPTY",
+         model: str = None,
+         instruction: str = "Tell me more about yourself.",
+         images: List[str]|str = None,
+         tool_registry: Optional[Any] = None,
+         timeout: int = None,
+         stream: bool = False,
+         think: bool = False,
+         safety_queue: Optional[asyncio.Queue] = None,
+         **kwargs) -> Optional[str]:
+
+    tools = tool_registry.get_tool_items() if tool_registry else []
+    chat_ui = kwargs['chat_ui'] if 'chat_ui' in kwargs else None
+    verbose = kwargs['verbose'] if 'verbose' in kwargs else False
+    data_path = kwargs.get('data_path', '')
+    session_id = kwargs.get('session_id', '')
+    max_tokens = kwargs.get('max_tokens', 8192)
+    memories = kwargs.get('memories', None)
+    prompt_intro = kwargs.get('prompt_intro', "I am a helpful AI assistant. My name is OnIt.")
+    max_context_tokens: Optional[int] = kwargs.get('max_context_tokens', None)
+
+    images_bytes = _load_images(images, chat_ui, verbose)
+    messages = _build_messages(instruction, images_bytes, prompt_intro,
+                               kwargs.get('session_history', None), memories)
+
     api_key = _resolve_api_key(host, host_key)
-    client = AsyncOpenAI(base_url=host, api_key=api_key)
+    # Use explicit timeout if provided; -1 or None means no timeout (infinite wait).
+    _client_timeout = None if (timeout is None or timeout < 0) else timeout
+    client = AsyncOpenAI(base_url=host, api_key=api_key, timeout=_client_timeout)
+
+    # Resolve model: use explicit name if provided, otherwise auto-detect.
+    if not model:
+        _MODEL_RETRIES = 3
+        for _attempt in range(1, _MODEL_RETRIES + 1):
+            try:
+                model = await _resolve_model_id(client, host)
+                break
+            except Exception as e:
+                _err = f"Failed to resolve model from {host} (attempt {_attempt}/{_MODEL_RETRIES}): {e}"
+                logger.error(_err)
+                _log_to_ui_or_verbose(_err, chat_ui, verbose, level="error")
+                if _attempt < _MODEL_RETRIES:
+                    await asyncio.sleep(min(2 ** _attempt, 10))
+        if model is None:
+            return None
 
     if chat_ui:
-        chat_ui.add_log(f"Starting chat with model: {model}", level="info")
+        chat_ui.model_name = model
+    _log_to_ui_or_verbose(f"Starting chat with model: {model}", chat_ui, verbose, level="info")
 
-    MAX_CHAT_ITERATIONS = 100
+    # Query vLLM for the model's maximum context window if not provided in config.
+    # Skip for OpenRouter (doesn't expose max_model_len).
+    if max_context_tokens is None and "openrouter.ai" not in host:
+        max_context_tokens = await _get_model_max_context(host, api_key, model)
+        if max_context_tokens:
+            _log_to_ui_or_verbose(
+                f"Model max context: {max_context_tokens:,} tokens", chat_ui, verbose, level="info"
+            )
+
+    MAX_CHAT_ITERATIONS = -1
     MAX_REPEATED_TOOL_CALLS = 30
-    MAX_TOOL_LOOP_PATTERN_REPEATS = 4  # 4 repeats of a 2-tool pair = 8 calls
+    MAX_API_RETRIES = 3
+    CONTEXT_COMPACT_THRESHOLD = 0.90
     iteration_count = 0
-    tool_call_history = []  # list of (name, args_json) tuples
-    loop_warning_injected = False
-    non_vlm_mode = False  # set True after a "not a multimodal model" error
-    no_tool_mode = False   # set True after server rejects tool_choice="auto"
+    tool_call_history: list = []  # list of (name, args_json) tuples
+    _last_prompt_tokens: int = 0  # prompt token count from the last API response
 
     while True:
         iteration_count += 1
-        if iteration_count > MAX_CHAT_ITERATIONS:
+        if MAX_CHAT_ITERATIONS >= 0 and iteration_count > MAX_CHAT_ITERATIONS:
             msg = f"I am sorry 😊. Could you try to rephrase or provide additional details?"
-            if chat_ui:
-                chat_ui.add_log(f"Chat loop exceeded {MAX_CHAT_ITERATIONS} iterations, stopping.", level="warning")
-            elif verbose:
-                print(f"Chat loop exceeded {MAX_CHAT_ITERATIONS} iterations, stopping.")
+            _log_to_ui_or_verbose(f"Chat loop exceeded {MAX_CHAT_ITERATIONS} iterations, stopping.", chat_ui, verbose, level="warning")
             return msg
 
-        try:
-            if not safety_queue.empty():
-                logger.warning("Safety queue triggered before API call, exiting chat loop.")
-                return None
+        # Context compaction: check if the previous call used ≥90% of the context window.
+        if _last_prompt_tokens > 0 and max_context_tokens:
+            usage_pct = _last_prompt_tokens / max_context_tokens
+            if chat_ui and hasattr(chat_ui, "set_context_usage"):
+                chat_ui.set_context_usage(usage_pct * 100, max_context_tokens)
+            if usage_pct >= CONTEXT_COMPACT_THRESHOLD:
+                _log_to_ui_or_verbose(
+                    f"Context at {usage_pct:.0%} ({_last_prompt_tokens:,}/{max_context_tokens:,} tokens). Compacting...",
+                    chat_ui, verbose, level="warning",
+                )
+                messages = await _compact_context(messages, client, model, max_tokens, chat_ui, verbose)
+                _last_prompt_tokens = 0
 
-            llm_started = time.monotonic()
+        _strip_old_images(messages)
 
-            completion_kwargs = dict(
-                model=model,
-                messages=messages,
-                stream=stream,
-                temperature=0.6,             # official recommendation
-                top_p=0.95,
-                max_tokens=max_tokens,             # cap to prevent runaway generation
-                extra_body={
-                    "top_k": 20,             # vLLM extension, important for Qwen3
-                    "repetition_penalty": 1.05,  # helps break repetition loops
-                    "chat_template_kwargs": {"enable_thinking": think},  # if not using CoT
-                },
-            )
-            if tools and not no_tool_mode:
-                completion_kwargs["tools"] = tools
-                completion_kwargs["tool_choice"] = "auto"  # never "required"
+        # Track streaming state across the try block for the final-response path
+        _full_content = ""
+        _full_reasoning = ""
 
-            # In non-VLM mode strip any image_url content before every request
-            if non_vlm_mode:
-                _strip_image_content(messages)
+        # Retry loop for transient API errors — preserves accumulated messages/tool history
+        api_error = None
+        for api_attempt in range(1, MAX_API_RETRIES + 1):
+            api_error = None
+            try:
+                if not safety_queue.empty():
+                    logger.warning("Safety queue triggered before API call, exiting chat loop.")
+                    return None
 
-            llm_operation_id = f"llm_{uuid.uuid4().hex[:12]}"
-            if trace_recorder:
-                trace_recorder.summarize_llm_request(
-                    session_id=session_id,
-                    task_id=task_id,
-                    operation_id=llm_operation_id,
+                completion_kwargs = dict(
                     model=model,
-                    host=host,
-                    iteration=iteration_count,
                     messages=messages,
-                    tool_count=len(tools),
+                    stream=stream,
+                    tool_choice="auto",          # never "required"
+                    temperature=0.6,             # official recommendation
+                    top_p=0.9,
+                    max_tokens=max_tokens,             # cap to prevent runaway generation
+                    extra_body={
+                        "top_k": 20,             # vLLM extension, important for Qwen3
+                        "repetition_penalty": 1.0 if think else 1.05,  # avoid penalizing <think> tokens
+                        "chat_template_kwargs": {"enable_thinking": think},  # if not using CoT
+                    },
                 )
+                if tools: # and not images_bytes:  # vLLM doesn't support tools + images in the same message, so only include tools if no images are present
+                    completion_kwargs["tools"] = tools
+                if stream:
+                    completion_kwargs["stream_options"] = {"include_usage": True}
 
-            chat_completion = await client.chat.completions.create(**completion_kwargs)
-            llm_latency_ms = (time.monotonic() - llm_started) * 1000
+                chat_completion = await client.chat.completions.create(**completion_kwargs)
 
-            if chat_ui:
-                chat_ui.add_log(f"LLM responded in {llm_latency_ms:.0f} ms (iter {iteration_count})", level="debug")
-            elif verbose:
-                print(f"LLM responded in {llm_latency_ms:.0f} ms (iter {iteration_count})")
-
-            response_message = chat_completion.choices[0].message
-            response_preview = response_message.content if isinstance(response_message.content, str) else None
-            finish_reason = getattr(chat_completion.choices[0], 'finish_reason', None)
-            response_tool_calls = response_message.tool_calls or []
-            if trace_recorder:
-                trace_recorder.summarize_llm_response(
-                    session_id=session_id,
-                    task_id=task_id,
-                    operation_id=llm_operation_id,
-                    model=model,
-                    iteration=iteration_count,
-                    latency_ms=llm_latency_ms,
-                    finish_reason=finish_reason,
-                    content_preview=response_preview,
-                    tool_call_count=len(response_tool_calls),
-                )
-
-            await asyncio.sleep(0.1)
-            if not safety_queue.empty():
-                logger.warning("Safety queue triggered after API call, exiting chat loop.")
-                return None
-        except APITimeoutError as e:
-            error_message = f"Request to {host} timed out after {timeout} seconds."
-            logger.error(error_message)
-            if trace_recorder:
-                trace_recorder.summarize_llm_error(
-                    session_id=session_id,
-                    task_id=task_id,
-                    operation_id=llm_operation_id if 'llm_operation_id' in locals() else None,
-                    model=model,
-                    iteration=iteration_count,
-                    latency_ms=(time.monotonic() - llm_started) * 1000 if 'llm_started' in locals() else None,
-                    error=error_message,
-                )
-            if chat_ui:
-                chat_ui.add_log(error_message, level="error")
-            elif verbose:
-                print(error_message)
-            if error_container is not None:
-                error_container.append(error_message)
-            return None
-        except OpenAIError as e:
-            error_str = str(e)
-            # Auto-recover: context length exceeded — reduce max_tokens to fit
-            retry_budget = _derive_retry_max_tokens_from_context_error(error_str, max_tokens)
-            if retry_budget is not None:
-                ctx_len, input_tokens, requested_output_tokens, new_max = retry_budget
-                changes = []
-                if new_max < max_tokens:
-                    changes.append(f"reducing max_tokens from {max_tokens} to {new_max}")
-                max_tokens = min(max_tokens, new_max)
-
-                if history_turn_count > 0:
-                    del messages[1:3]
-                    history_turn_count -= 1
-                    changes.append("dropping the oldest session turn")
-                elif tools and not no_tool_mode:
-                    no_tool_mode = True
-                    changes.append("retrying without tools")
-
-                if not changes:
-                    changes.append("retrying with the same prompt")
-
-                warn = (
-                    f"Context budget exceeded ({input_tokens} input + {requested_output_tokens} requested "
-                    f"output > {ctx_len}); {', '.join(changes)}."
-                )
-                if chat_ui:
-                    chat_ui.add_log(warn, level="warning")
-                elif verbose:
-                    print(warn)
-                continue
-            # Auto-recover: server does not support tool calling
-            if "enable-auto-tool-choice" in error_str or ("400" in error_str and "tool-call-parser" in error_str):
-                no_tool_mode = True
-                warn = f"Server does not support tool calling — retrying without tools."
-                logger.warning(warn)
-                if chat_ui:
-                    chat_ui.add_log(warn, level="warning")
-                elif verbose:
-                    print(warn)
-                continue
-            # Auto-recover: model rejected image content because it is text-only
-            if "not a multimodal model" in error_str or ("400" in error_str and "multimodal" in error_str):
-                non_vlm_mode = True
-                removed = _strip_image_content(messages)
-                # Detect available vision tools for the hint
-                vision_tools = []
-                if tool_registry:
-                    for tname in ("ask_vision_agent", "ask_cosmos_agent", "ask_vlm"):
-                        if tname in tool_registry.tools:
-                            vision_tools.append(tname)
-                if vision_tools:
-                    hint = (
-                        f"Note: this model cannot process images directly. "
-                        f"Use the {' or '.join(vision_tools)} tool to analyze any camera images instead."
+                # Streaming path: iterate chunks, populate shared variables
+                if stream:
+                    stream_result = await _process_streaming_response(
+                        chat_completion, safety_queue, chat_ui, think,
                     )
-                else:
-                    hint = (
-                        "Note: this model cannot process images directly. "
-                        "Describe what the camera tool would normally show based on context, "
-                        "or inform the user that a vision-capable model is required."
+                    if stream_result is None:
+                        return None
+                    _full_content, _full_reasoning, _full_tool_calls, _, _stream_usage = stream_result
+                    if _stream_usage is not None:
+                        _last_prompt_tokens = _stream_usage.prompt_tokens
+                        if max_context_tokens and chat_ui and hasattr(chat_ui, "set_context_usage"):
+                            chat_ui.set_context_usage(_last_prompt_tokens / max_context_tokens * 100, max_context_tokens)
+                    _content, _tool_calls, _message_for_history = _unify_streaming_result(
+                        _full_content, _full_tool_calls,
                     )
-                warn = f"Model is not multimodal — stripped {removed} image(s) and retrying with vision tool hint."
-                if chat_ui:
-                    chat_ui.add_log(warn, level="warning")
-                elif verbose:
-                    print(warn)
-                # Inject the hint into the last user message, or append a new one
-                for msg in reversed(messages):
-                    if isinstance(msg, dict) and msg.get("role") == "user" and isinstance(msg.get("content"), str):
-                        msg["content"] = msg["content"].rstrip() + f"\n\n[System hint: {hint}]"
-                        break
-                else:
-                    messages.append({"role": "user", "content": f"[System hint: {hint}]"})
-                continue  # retry without images
-            error_message = f"Error communicating with {host}: {e}."
-            logger.error(error_message)
-            if trace_recorder:
-                trace_recorder.summarize_llm_error(
-                    session_id=session_id,
-                    task_id=task_id,
-                    operation_id=llm_operation_id if 'llm_operation_id' in locals() else None,
-                    model=model,
-                    iteration=iteration_count,
-                    latency_ms=(time.monotonic() - llm_started) * 1000 if 'llm_started' in locals() else None,
-                    error=error_message,
-                )
-            if chat_ui:
-                chat_ui.add_log(error_message, level="warning")
-            elif verbose:
-                print(error_message)
-            if error_container is not None:
-                error_container.append(error_message)
+
+                await asyncio.sleep(0.1)
+                if not safety_queue.empty():
+                    logger.warning("Safety queue triggered after API call, exiting chat loop.")
+                    return None
+                break  # success — exit retry loop
+            except (APITimeoutError, httpx.ReadTimeout) as e:
+                api_error = f"Request to {host} timed out (read timeout during streaming)."
+                logger.error(api_error)
+                _log_to_ui_or_verbose(api_error, chat_ui, verbose, level="error")
+            except OpenAIError as e:
+                api_error = f"Error communicating with {host}: {e}."
+                logger.error(api_error)
+                _log_to_ui_or_verbose(api_error, chat_ui, verbose, level="warning")
+            except Exception as e:
+                api_error = f"Unexpected error ({type(e).__name__}): {e}"
+                logger.error(api_error, exc_info=True)
+                _log_to_ui_or_verbose(api_error, chat_ui, verbose, level="error")
+
+            # Log retry attempt if we haven't exhausted retries
+            if api_attempt < MAX_API_RETRIES:
+                retry_msg = f"Retrying API call (attempt {api_attempt + 1}/{MAX_API_RETRIES})..."
+                logger.info(retry_msg)
+                _log_to_ui_or_verbose(retry_msg, chat_ui, verbose, level="info")
+                await asyncio.sleep(min(2 ** api_attempt, 10))  # exponential backoff
+
+        if api_error is not None:
+            # All retries exhausted
             return None
-        except Exception as e:
-            error_message = f"Unexpected error: {e}"
-            logger.error(error_message)
-            if trace_recorder:
-                trace_recorder.summarize_llm_error(
-                    session_id=session_id,
-                    task_id=task_id,
-                    operation_id=llm_operation_id if 'llm_operation_id' in locals() else None,
-                    model=model,
-                    iteration=iteration_count,
-                    latency_ms=(time.monotonic() - llm_started) * 1000 if 'llm_started' in locals() else None,
-                    error=error_message,
-                )
-            if chat_ui:
-                chat_ui.add_log(error_message, level="error")
-            elif verbose:
-                print(error_message)
-            if error_container is not None:
-                error_container.append(error_message)
-            return error_message
-            
-        tool_calls = chat_completion.choices[0].message.tool_calls
+
+        # Non-streaming: extract from response object into unified variables
+        if not stream:
+            _msg = chat_completion.choices[0].message
+            _content = _msg.content
+            _tool_calls = _msg.tool_calls if _msg.tool_calls else None
+            _message_for_history = _msg
+            # Capture token usage for context tracking
+            if chat_completion.usage is not None:
+                _last_prompt_tokens = chat_completion.usage.prompt_tokens
+                if max_context_tokens and chat_ui and hasattr(chat_ui, "set_context_usage"):
+                    chat_ui.set_context_usage(_last_prompt_tokens / max_context_tokens * 100, max_context_tokens)
+
+        tool_calls = _tool_calls
         if tool_calls is None or len(tool_calls) == 0:
-            last_response = chat_completion.choices[0].message.content
-            # Check if the model returned a tool call as raw JSON in the content
-            raw_tool = _parse_tool_call_from_content(last_response, tool_registry)
-            if raw_tool:
-                function_name = raw_tool["name"]
-                function_arguments = raw_tool["arguments"]
-                synthetic_id = f"call_{uuid.uuid4().hex[:24]}"
-                messages.append({"role": "assistant", "content": last_response})
-                tool_message = await _execute_tool_call(
-                    function_name=function_name,
-                    function_arguments=function_arguments,
-                    tool_call_id=synthetic_id,
-                    tool_registry=tool_registry,
-                    timeout=timeout,
-                    data_path=data_path,
-                    chat_ui=chat_ui,
-                    verbose=verbose,
-                    trace_recorder=trace_recorder,
-                    session_id=session_id,
-                    task_id=task_id,
-                    spatial_memory=spatial_memory,
-                )
-                messages.append(tool_message)
-                # Check for repeated tool calls
-                call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
-                tool_call_history.append(call_key)
-                if tool_call_history.count(call_key) >= MAX_REPEATED_TOOL_CALLS:
-                    msg = f"I am sorry 😊. Could you try to rephrase or provide additional details?"
-                    if chat_ui:
-                        chat_ui.add_log(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", level="warning")
-                    elif verbose:
-                        print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
-                    return msg
-                # Check for tool-name pattern loop (e.g. describe_scene→rotate_angle repeating)
-                loop_pattern = _detect_tool_name_loop(tool_call_history, MAX_TOOL_LOOP_PATTERN_REPEATS)
-                if loop_pattern:
-                    if loop_warning_injected:
-                        if chat_ui:
-                            chat_ui.add_log(f"Tool loop persisted after warning: {loop_pattern}", level="warning")
-                        return "I got stuck in a repetitive action loop. Let me report what I found so far and try a different approach next time."
-                    loop_warning_injected = True
-                    if chat_ui:
-                        chat_ui.add_log(f"Tool loop detected, injecting redirect: {loop_pattern}", level="warning")
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"[SYSTEM] Tool-call loop detected: {loop_pattern}. "
-                            "STOP the current repetitive pattern immediately. You MUST either: "
-                            "(1) navigate_to_pose or move_distance to a completely different location at least 1 m away, then scan from there, OR "
-                            "(2) if you believe the target cannot be found, summarize what you have searched and report your findings."
-                        ),
-                    })
-                continue  # loop back for the model to generate the final response
-
-            # Guard against returning raw tool-call JSON to the user.
-            # If the content looks like a tool call but couldn't be parsed,
-            # ask the model to retry without tools.
-            if _looks_like_raw_tool_call(last_response):
-                if chat_ui:
-                    chat_ui.add_log("Model returned unparseable raw tool-call JSON, retrying without tools.", level="warning")
-                elif verbose:
-                    print("Model returned unparseable raw tool-call JSON, retrying without tools.")
-                messages.append({"role": "assistant", "content": last_response})
-                messages.append({"role": "user", "content": "Please provide your answer as plain text, not as a JSON tool call."})
+            # No structured tool calls -- check for raw JSON tool calls in content
+            should_continue, bail = await _handle_raw_tool_call(
+                _content, tool_registry, timeout, data_path,
+                chat_ui, verbose, messages, tool_call_history,
+                MAX_REPEATED_TOOL_CALLS, session_id=session_id,
+            )
+            if bail:
+                return bail
+            if should_continue:
                 continue
 
-            if "</think>" in last_response:
-                last_response = last_response.split("</think>")[1]
-            return last_response
+            return _extract_final_response(_content, _full_reasoning, _full_content)
 
-        messages.append(chat_completion.choices[0].message)
-        for tool in tool_calls:
-            await asyncio.sleep(0.1)
-            if not safety_queue.empty():
-                if verbose:
-                    print("Safety queue triggered, exiting chat loop.")
-                return None
-            function_name = tool.function.name
-            function_arguments = json.loads(tool.function.arguments)
-            tool_message = await _execute_tool_call(
-                function_name=function_name,
-                function_arguments=function_arguments,
-                tool_call_id=tool.id,
-                tool_registry=tool_registry,
-                timeout=timeout,
-                data_path=data_path,
-                chat_ui=chat_ui,
-                verbose=verbose,
-                trace_recorder=trace_recorder,
-                session_id=session_id,
-                task_id=task_id,
-                spatial_memory=spatial_memory,
-            )
-            messages.append(tool_message)
-            # Check for repeated tool calls
-            call_key = (function_name, json.dumps(function_arguments, sort_keys=True))
-            tool_call_history.append(call_key)
-            if tool_call_history.count(call_key) >= MAX_REPEATED_TOOL_CALLS:
-                msg = f"I am sorry 😊. Could you try to rephrase or provide additional details?"
-                if chat_ui:
-                    chat_ui.add_log(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args", level="warning")
-                elif verbose:
-                    print(f"Repeated tool call detected: {function_name} called {tool_call_history.count(call_key)} times with same args")
-                return msg
-        # Check for tool-name pattern loop after processing all tool calls in this batch
-        loop_pattern = _detect_tool_name_loop(tool_call_history, MAX_TOOL_LOOP_PATTERN_REPEATS)
-        if loop_pattern:
-            if loop_warning_injected:
-                if chat_ui:
-                    chat_ui.add_log(f"Tool loop persisted after warning: {loop_pattern}", level="warning")
-                return "I got stuck in a repetitive action loop. Let me report what I found so far and try a different approach next time."
-            loop_warning_injected = True
-            if chat_ui:
-                chat_ui.add_log(f"Tool loop detected, injecting redirect: {loop_pattern}", level="warning")
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"[SYSTEM] Tool-call loop detected: {loop_pattern}. "
-                    "STOP the current repetitive pattern immediately. You MUST either: "
-                    "(1) navigate_to_pose or move_distance to a completely different location at least 1 m away, then scan from there, OR "
-                    "(2) if you believe the target cannot be found, summarize what you have searched and report your findings."
-                ),
-            })
+        # Structured tool calls: execute them and loop back
+        bail = await _handle_structured_tool_calls(
+            tool_calls, _message_for_history, tool_registry,
+            timeout, data_path, chat_ui, verbose,
+            messages, tool_call_history, MAX_REPEATED_TOOL_CALLS,
+            safety_queue, session_id=session_id,
+        )
+        if bail is _SAFETY_ABORT:
+            return None
+        if bail:
+            return bail

@@ -22,7 +22,6 @@ def _make_config(tmp_path, overrides=None):
     cfg = {
         "serving": {
             "host": "http://localhost:8000/v1",
-            "model": "test-model",
             "think": False,
             "max_tokens": 1024,
         },
@@ -83,9 +82,11 @@ class TestOnItInit:
             with _mock_discover():
                 OnIt(config=12345)
 
-    def test_init_no_prompts_server_raises(self, tmp_path):
+    def test_init_prompts_server_disabled_raises(self, tmp_path):
         cfg = _make_config(tmp_path)
-        cfg["mcp"]["servers"] = [{"name": "Other", "url": "http://x", "enabled": True}]
+        cfg["mcp"]["servers"] = [
+            {"name": "PromptsMCPServer", "url": "http://x", "enabled": False},
+        ]
         with _mock_discover():
             with pytest.raises(ValueError, match="PromptsMCPServer"):
                 OnIt(config=cfg)
@@ -498,6 +499,7 @@ class TestOnItA2AExecutor:
         """Different context_ids get different sessions."""
         mock_onit = MagicMock()
         mock_onit.session_path = str(tmp_path / "sessions" / "test.jsonl")
+        mock_onit.config_data.get.return_value = None
         os.makedirs(os.path.dirname(mock_onit.session_path), exist_ok=True)
 
         executor = OnItA2AExecutor(mock_onit)

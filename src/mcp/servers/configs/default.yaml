@@ -17,6 +17,15 @@ servers:
     path : /sse
     transport : 'sse'
 
+  - name: VLMToolsMCPServer
+    module: src.mcp.vlm_web.tools
+    description: "MCP server for vision-language model tools"
+    enabled: true
+    host : 0.0.0.0
+    port : 18222
+    path: /sse
+    transport : 'sse'
+
   - name: EcoFlowMCPServer
     module: tasks.iot.ecoflow.mcp_server
     description: "EcoFlow PowerStream — local MQTT solar generation and power-flow data"

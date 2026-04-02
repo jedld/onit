@@ -20,60 +20,8 @@ import yaml
 
 import logging
 from pathlib import Path
-from datetime import datetime
-import zoneinfo
 
 logger = logging.getLogger(__name__)
-
-
-def _datetime_context() -> str:
-   """Return a formatted string with the current local date, time, timezone, and calendar info."""
-   try:
-      # Read system timezone from /etc/localtime symlink or /etc/timezone file
-      tz_name = None
-      try:
-         import os
-         localtime_path = "/etc/localtime"
-         if os.path.islink(localtime_path):
-            link = os.readlink(localtime_path)
-            # Extract timezone name from path like .../zoneinfo/Asia/Manila
-            if "zoneinfo/" in link:
-               tz_name = link.split("zoneinfo/")[-1]
-      except Exception:
-         pass
-
-      if tz_name is None:
-         try:
-            with open("/etc/timezone") as f:
-               tz_name = f.read().strip()
-         except Exception:
-            pass
-
-      if tz_name:
-         tz = zoneinfo.ZoneInfo(tz_name)
-      else:
-         tz = datetime.now().astimezone().tzinfo
-
-      now = datetime.now(tz)
-      tz_display = now.strftime("%Z")  # e.g. PST, PHT, EST
-
-      # Calendar info
-      weekday = now.strftime("%A")
-      day_of_year = now.timetuple().tm_yday
-      week_num = now.isocalendar()[1]
-      days_in_month = (now.replace(month=now.month % 12 + 1, day=1) - __import__('datetime').timedelta(days=1)).day if now.month < 12 else 31
-
-      return (
-         f"Current date: {now.strftime('%B %d, %Y')} ({weekday})\n"
-         f"Current time: {now.strftime('%I:%M %p')} ({tz_display}, UTC{now.strftime('%z')[:3]}:{now.strftime('%z')[3:]})\n"
-         f"Timezone: {tz_name or tz_display}\n"
-         f"Week: {week_num} of {now.year} | Day {day_of_year} of the year | "
-         f"Day {now.day} of {days_in_month} in {now.strftime('%B %Y')}"
-      )
-   except Exception as e:
-      # Fallback: best-effort local time without timezone
-      now = datetime.now()
-      return f"Current date and time: {now.strftime('%B %d, %Y %I:%M %p')} (local time)"
 
 
 mcp_prompts = FastMCP("Prompts MCP")
@@ -84,9 +32,21 @@ async def assistant_instruction(task: str,
                                 template_path: str = None,
                                 file_server_url: str = None,
                                 documents_path: str = None,
-                                topic: str = None) -> str:
+                                topic: str = None,
+                                sandbox_available: str | bool = False,
+                                session_id: str = "") -> str:
    if not data_path:
       raise ValueError("data_path is required and must be a non-empty string")
+
+   # Normalize "null" strings to None once at entry
+   if topic and topic == "null":
+      topic = None
+   if file_server_url and file_server_url == "null":
+      file_server_url = None
+   if documents_path and documents_path == "null":
+      documents_path = None
+   if isinstance(sandbox_available, str) and sandbox_available.lower() in ("false", "null", "none", "0", ""):
+      sandbox_available = False
 
    Path(data_path).mkdir(parents=True, exist_ok=True)
    current_date = datetime.now().strftime("%B %d, %Y")
@@ -96,72 +56,43 @@ You are an autonomous agent with access to tools and a file system.
 
 ## Context
 - **Today's date**: {current_date}
-- **Working directory**: {data_path} — sandbox folder for reading and writing files.
-
-## Constraints
-- NEVER create or modify files outside of `{data_path}`.
+- **Working directory**: `{data_path}` - this is the agent local filesystem. If sandbox filesystem is available, use it instead and treat this as a staging area for file transfers.
 
 ## Task
 {task}
-
-## Execution Policy
-- Translate the task into observable success conditions before acting.
-- Use tools to gather evidence, act in short verifiable steps, and re-check after each material action.
-- Do not claim success from stale, partial, or ambiguous observations.
-
-## Persistent Landmark Hypothesis Contract
-When the task involves a physical object, place, doorway, person, landmark, or requested viewing relation:
-- After the **first credible detection**, create and preserve a landmark hypothesis instead of restarting the search from scratch on every new frame.
-- Maintain and update these structured fields whenever evidence improves:
-  - `object_label`
-  - `estimated_bearing_deg`
-  - `approximate_range_m`
-  - `visible_face`
-  - `last_confirmed_pose`
-  - `confidence`
-- Reuse the current landmark hypothesis after each camera refresh or motion step; update it incrementally rather than discarding it.
-- If a fresh observation is weak or ambiguous, treat that as a local reacquisition problem around the existing hypothesis, not as a reason to restart global search.
-
-## Relational Task Decomposition
-For tasks such as going **behind**, **around**, **beside**, or otherwise achieving a spatial relationship to a target, you MUST follow this order:
-1. Confirm the target identity with direct evidence.
-2. Determine which face or side of the target is currently visible.
-3. Choose a left or right circumnavigation direction based on clearance and safety.
-4. Move in short segments while preserving the landmark hypothesis.
-5. Re-verify target identity and visible face after every short segment.
-6. Verify the requested final relation, such as rear-side evidence, before claiming success.
-
-## Loss Handling
-- If the target is lost, first attempt bounded local reacquisition using the current landmark hypothesis.
-- Abort the relational maneuver and report the blocker if the target remains unconfirmed for 3 consecutive local verification steps, or if the path is blocked or unsafe.
 """
 
    template = default_template
 
    if template_path:
       template_file = Path(template_path)
-      if template_file.exists() and template_file.suffix in ('.yaml', '.yml'):
-         with open(template_file, 'r') as f:
+      if template_file.suffix in ('.yaml', '.yml'):
+         try:
+            with open(template_file, 'r') as f:
                config = yaml.safe_load(f)
                template = config.get('instruction_template', default_template)
+         except (OSError, yaml.YAMLError):
+            pass
 
-   datetime_block = "## Current Date & Time\n" + _datetime_context() + "\n\n"
+   class _DefaultDict(dict):
+      """Return the placeholder itself for missing keys so .format_map never raises."""
+      def __missing__(self, key):
+         return "{" + key + "}"
 
-   session_id = Path(data_path).name
-   instruction = datetime_block + template.format(
+   instruction = template.format_map(_DefaultDict(
       task=task,
       current_date=current_date,
       data_path=data_path,
       session_id=session_id,
-   )
+   ))
 
-   if topic and topic != "null":
+   if topic:
       instruction += f"""
 ## Topic
 Unless specified, assume that the topic is about `{topic}`.
 """
 
-   if file_server_url and file_server_url != "null":
+   if file_server_url:
       upload_id = Path(data_path).name
       upload_prefix = f"{file_server_url}/uploads/{upload_id}"
       instruction += f"""
@@ -174,11 +105,51 @@ Always download before reading and upload after writing.
 When using create_presentation, create_excel, or create_document tools, always pass callback_url="{upload_prefix}" so files are automatically uploaded.
 """
 
-   if documents_path and documents_path != "null":
+   if documents_path:
       instruction += f"""
 ## Relevant Information
 Search and read related documents (PDF, TXT, DOCX, XLSX, PPTX, and Markdown (MD)) in `{documents_path}`.
 Search the web for additional information **if and only if** above documents are insufficient to complete the task.
+"""
+
+   # Add sandbox routing instructions when sandbox tools are available
+   if sandbox_available:
+      instruction += f"""
+## Code Development and Execution
+**Do ALL** development inside the sandboxed Docker container.
+**DO NOT** run code in the agent environment or local filesystem.
+
+---
+
+### Filesystem Rules
+- Use the sandbox filesystem for all code, data, and outputs. 
+- The sandbox filesystem is the only environment where code should be executed.
+- Use sandbox tools exclusively for all sandbox file operations.
+- Never modify files outside the sandbox.
+
+---
+
+### Git Workflow (If using git repository)
+- Use git related tools for all file operations (create, read, update, delete). Commit and push changes with clear messages.
+
+---
+
+### Workflow
+1. Check sandbox status. 
+2. Check the sandbox filesystem structure. 
+3. Check installed packages, GPU, mounted data directories.
+4. Write → run → verify → fix → repeat until the code works end-to-end and the target is achieved.
+5. Delete unnecessary files.
+6. Commit or save the codebase and documentation.
+
+---
+
+### Definition of Done
+Do not stop until **all** are true:
+- [ ] Code runs end-to-end without errors.
+- [ ] The target is achieved.
+- [ ] Codebase is committed or saved.
+
 """
 
    instruction += f"""
@@ -187,9 +158,7 @@ Search the web for additional information **if and only if** above documents are
 2. Otherwise, reason step by step, invoke tools as needed, and work toward a final answer.
 3. If critical information is missing and cannot be inferred, ask exactly one clarifying question before proceeding.
 4. If a file was generated, provide a download link to the file.
-5. Conclude with your final answer in this format:
-
-<your answer here>
+5. Conclude with your final answer.
 """
    return instruction
 

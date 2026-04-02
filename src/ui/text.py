@@ -21,10 +21,16 @@ If not, it will fall back to standard print statements.
 
 '''
 import asyncio
+import json
 import sys
-import tty
-import termios
+import time
 import threading
+
+if sys.platform != "win32":
+    import tty
+    import termios
+else:
+    import msvcrt
 from collections import deque
 from dataclasses import dataclass
 from rich.console import Console
@@ -37,6 +43,7 @@ from rich.status import Status
 from rich.box import Box
 from rich.box import ROUNDED, HEAVY
 from datetime import datetime
+import re
 
 from typing import Callable, Optional, Any, Literal, Union
 
@@ -55,10 +62,11 @@ HORIZONTAL_THICK = Box(
 @dataclass
 class Message:
     """Strongly typed message structure"""
-    role: Literal["user", "assistant", "system"]
+    role: Literal["user", "assistant", "system", "tool_call", "tool_result"]
     content: str
     timestamp: str
     elapsed: str = ""
+    name: str = ""
 
 class ChatUI:
     def __init__(
@@ -123,6 +131,21 @@ class ChatUI:
         ]
         self._spinner_step = 0
         self._spinner_timer: Optional[threading.Timer] = None
+        self._thinking_stop_event: Optional[threading.Event] = None
+        self._thinking_thread: Optional[threading.Thread] = None
+        self.model_name = ""  # auto-detected model name, set by chat()
+        self._context_pct: float = 0.0  # context window usage 0-100, updated after each LLM call
+        self._context_max_tokens: int = 0  # max context window size in tokens
+        self._stream_header_printed = False  # lazy: header deferred until first visible token
+        self._stream_pending = ""  # buffer tokens until first non-whitespace
+        self._stream_think_started = False  # True while a think block is open
+        self._tag_buf = ""  # buffer for partial tag detection across tokens
+        self._trail_buf = ""  # buffer whitespace-only tokens to suppress trailing blank lines
+        self._stream_cursor_shown = False  # blinking block cursor during streaming
+        self._link_buf = ""  # buffer for detecting markdown links during streaming
+        self._link_state = 0  # 0=normal, 1=in label [..., 2=after ](, eating URL
+        self._stream_token_count = 0  # token counter for tok/s calculation
+        self._stream_start_time = 0.0  # monotonic time when streaming started
         self.initialize()
         
     def set_theme(self, theme: str) -> None:
@@ -214,6 +237,25 @@ class ChatUI:
             self.messages.extend(messages_to_keep)
         else:
             self.messages.clear()
+
+    def add_tool_call(self, name: str, arguments: dict) -> None:
+        """Add a tool invocation message inline in the chat history."""
+        self.messages.append(Message(
+            role="tool_call",
+            content=json.dumps(arguments),
+            timestamp=self.format_timestamp(),
+            name=name,
+        ))
+
+    def add_tool_result(self, name: str, result: str, truncate: int = 300) -> None:
+        """Add a tool result message inline in the chat history."""
+        display = result if len(result) <= truncate else result[:truncate] + "…"
+        self.messages.append(Message(
+            role="tool_result",
+            content=display,
+            timestamp=self.format_timestamp(),
+            name=name,
+        ))
 
     def add_log(
         self,
@@ -327,8 +369,14 @@ class ChatUI:
                 msg_time = msg.timestamp if isinstance(msg, Message) else msg["time"]
                 msg_elapsed = msg.elapsed if isinstance(msg, Message) else msg.get("elapsed", "")
 
+                msg_name = msg.name if isinstance(msg, Message) else msg.get("name", "")
+
                 if role == "user":
                     self._render_user_message(content, msg_content, msg_time)
+                elif role == "tool_call":
+                    self._render_tool_call_message(content, msg_name, msg_content, msg_time)
+                elif role == "tool_result":
+                    self._render_tool_result_message(content, msg_name, msg_content, msg_time)
                 else:
                     self._render_assistant_message(content, msg_content, msg_time, msg_elapsed)
 
@@ -372,6 +420,21 @@ class ChatUI:
             padding=(1, 0)
         )
 
+    def _render_tool_call_message(self, content: Text, name: str, args_str: str, msg_time: str) -> None:
+        content.append(f"┌─ ⚙️  {name} ", style="bold dark_orange3")
+        content.append(f"[{msg_time}]", style=self.theme.styles.get("timestamp", "cyan"))
+        if self._context_pct > 0:
+            content.append(f"  {self._fmt_ctx_label()}", style="bright_cyan")
+        content.append("\n", style="default")
+        content.append(f"{args_str}\n", style="bright_white")
+        content.append("└" + "─" * 40 + "\n", style="dark_orange3")
+
+    def _render_tool_result_message(self, content: Text, name: str, result_str: str, msg_time: str) -> None:
+        content.append(f"┌─ ↩  {name} ", style="bold green")
+        content.append(f"[{msg_time}]\n", style=self.theme.styles.get("timestamp", "cyan"))
+        content.append(f"{result_str}\n", style="bright_white")
+        content.append("└" + "─" * 40 + "\n", style="green")
+
     def _render_user_message(self, content: Text, msg_content: str, msg_time: str) -> None:
         """
         Render a user message to the content Text object.
@@ -386,6 +449,15 @@ class ChatUI:
         content.append(f"{msg_content}\n", style="white")
         content.append("└" + "─" * 40 + "\n", style=self.theme.styles.get("user", "cyan"))
 
+    @staticmethod
+    def _strip_markdown_links(text: str) -> str:
+        """Replace markdown links with just their display text.
+
+        Handles regular URLs and data-URIs so the terminal doesn't show
+        huge base64 blobs.  ``[label](url)`` → ``label``
+        """
+        return re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+
     def _render_assistant_message(self, content: Text, msg_content: str, msg_time: str, msg_elapsed: str) -> None:
         """
         Render an assistant message to the content Text object.
@@ -396,12 +468,13 @@ class ChatUI:
             msg_time: The message timestamp
             msg_elapsed: The elapsed time string (optional)
         """
-        content.append(f"┌─ 🤖 AI ", style=self.theme.styles.get("assistant", "bold magenta"))
-        content.append(f"[{msg_time}] - ", style=self.theme.styles.get("timestamp", "dim magenta"))
+        _ai_label = f"┌─ 🤖 AI ({self.model_name}) " if self.model_name else "┌─ 🤖 AI "
+        content.append(_ai_label, style=self.theme.styles.get("assistant", "bold magenta"))
+        content.append(f"[{msg_time}]", style=self.theme.styles.get("timestamp", "dim magenta"))
         if msg_elapsed:
-            content.append(f"{msg_elapsed}\n", style=self.theme.styles.get("warning", "dim magenta"))
-        else:
-            content.append("\n", style=self.theme.styles.get("warning", "dim magenta"))
+            content.append(f" - {msg_elapsed}", style=self.theme.styles.get("warning", "dim magenta"))
+        content.append("\n", style=self.theme.styles.get("warning", "dim magenta"))
+        msg_content = self._strip_markdown_links(msg_content)
         content.append(f"{msg_content}\n", style="bright_white")
         content.append("└" + "─" * 40 + "\n", style=self.theme.styles.get("assistant", "magenta"))
 
@@ -497,6 +570,330 @@ class ChatUI:
             # Silently fail - status stopping is not critical
             pass
 
+    def _start_thinking_spinner(self) -> None:
+        """Start a background thread that shows an animated spinner with rotating messages."""
+        self._thinking_stop_event = threading.Event()
+
+        _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+        def _animate() -> None:
+            # Show blinking block cursor while thinking
+            sys.stdout.write("\033[?25h\033[1 q")
+            sys.stdout.flush()
+            msg_idx = 0
+            frame_idx = 0
+            ticks = 0
+            while True:
+                frame = _FRAMES[frame_idx % len(_FRAMES)]
+                msg = self._spinner_messages[msg_idx % len(self._spinner_messages)]
+                line = f"\r\033[1;96m{frame} {msg}\033[0m\033[K"
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                frame_idx += 1
+                ticks += 1
+                # Rotate message every ~30 frames (~2.4s at 80ms/frame)
+                if ticks % 30 == 0:
+                    msg_idx += 1
+                if self._thinking_stop_event.wait(0.08):
+                    break
+
+        self._thinking_thread = threading.Thread(target=_animate, daemon=True)
+        self._thinking_thread.start()
+
+    def _stop_thinking_spinner(self) -> None:
+        """Stop the rotating thinking display and clear the line."""
+        stop_event = self._thinking_stop_event
+        thread = self._thinking_thread
+        if stop_event:
+            stop_event.set()
+        if thread:
+            thread.join(timeout=1.0)
+        self._thinking_stop_event = None
+        self._thinking_thread = None
+        # Erase the entire current line and restore blinking block cursor
+        sys.stdout.write("\r\033[2K\033[?25h\033[1 q")
+        sys.stdout.flush()
+
+    def start_thinking(self) -> None:
+        """Public API: start the animated thinking spinner."""
+        self._start_thinking_spinner()
+
+    def stop_thinking(self) -> None:
+        """Public API: stop the animated thinking spinner."""
+        self._stop_thinking_spinner()
+
+    # ── Context usage display ──────────────────────────────────────
+
+    def _fmt_ctx_label(self) -> str:
+        """Return a compact ctx label like 'ctx:42%/128k'."""
+        label = f"ctx: {self._context_pct:.0f}%"
+        if self._context_max_tokens:
+            k = f"{self._context_max_tokens // 1000:,}"
+            label += f", max toks: {k}k"
+        return label
+
+    def set_context_usage(self, pct: float, max_tokens: int = 0) -> None:
+        """Update the context window usage percentage (0–100) and max token count."""
+        self._context_pct = pct
+        if max_tokens:
+            self._context_max_tokens = max_tokens
+
+    def show_context_compaction(self, orig_msg_count: int, summary_chars: int) -> None:
+        """Print an inline notification when the context window is compacted."""
+        self.console.print(
+            f"  ⚡ Context compacted  ({orig_msg_count} messages → {summary_chars:,} char summary)",
+            style="bold yellow",
+        )
+
+    # ── Inline tool-call display (streaming mode) ──────────────────
+
+    def show_tool_start(self, name: str, arguments: dict) -> None:
+        """Print a bordered tool-call block inline (mirrors chat history style)."""
+        self._erase_stream_cursor()  # pause blinking cursor during tool execution
+        ts = self.format_timestamp()
+        args_str = json.dumps(arguments, ensure_ascii=False)
+        t = Text()
+        ctx_suffix = f"  {self._fmt_ctx_label()}" if self._context_pct > 0 else ""
+        t.append(f"┌─ ⚙️  {name} ", style="bold dark_orange3")
+        t.append(f"[{ts}]", style=self.theme.styles.get("timestamp", "cyan"))
+        if ctx_suffix:
+            t.append(ctx_suffix, style="bright_cyan")
+        t.append("\n", style="default")
+        t.append(f"{args_str}\n", style="bright_white")
+        t.append("└" + "─" * 40, style="dark_orange3")
+        self.console.print(t)
+
+    def start_tool_spinner(self, name: str, arguments: dict) -> None:
+        pass  # Bordered output provides visual feedback; spinner not needed here
+
+    def stop_tool_spinner(self) -> None:
+        pass
+
+    def tool_log(self, name: str, data: str, level: str = "info") -> None:
+        """Display real-time log messages from MCP tools (e.g. sandbox output)."""
+        style = "bright_yellow" if level == "warning" else "bright_red" if level == "error" else "bright_cyan"
+        self.console.print(f"  [{name}] {data}", style=style)
+
+    def tool_progress(self, name: str, elapsed_seconds: int) -> None:
+        """No-op for text UI; spinner already indicates progress."""
+        pass
+
+    def show_tool_done(self, name: str, result: str, success: bool = True) -> None:
+        """Print a bordered tool-result block inline (mirrors chat history style)."""
+        ts = self.format_timestamp()
+        display = result if len(result) <= 300 else result[:300] + "…"
+        border_style = "bold green" if success else "bold red"
+        t = Text()
+        t.append(f"┌─ ↩  {name} ", style=border_style)
+        t.append(f"[{ts}]\n", style=self.theme.styles.get("timestamp", "cyan"))
+        t.append(f"{display}\n", style="bright_white")
+        t.append("└" + "─" * 40, style="green" if success else "red")
+        self.console.print(t)
+
+    # ── Blinking cursor helpers ────────────────────────────────────
+
+    def _show_stream_cursor(self) -> None:
+        """Hide terminal cursor and show a blinking white block."""
+        if not self._stream_cursor_shown:
+            sys.stdout.write("\033[?25l")          # hide terminal cursor
+            sys.stdout.write("\033[5m\u2588\033[0m")  # blinking white block
+            sys.stdout.flush()
+            self._stream_cursor_shown = True
+
+    def _erase_stream_cursor(self) -> None:
+        """Remove the blinking block and restore the terminal cursor."""
+        if self._stream_cursor_shown:
+            sys.stdout.write("\b \b")              # erase the block char
+            sys.stdout.write("\033[?25h")           # restore terminal cursor
+            sys.stdout.flush()
+            self._stream_cursor_shown = False
+
+    # ── Token streaming ───────────────────────────────────────────
+
+    def stream_start(self) -> None:
+        """Prepare for streaming. Resets all stream state; header is deferred lazily."""
+        self.stop_status()  # safety: stop spinner if running
+        self._stop_thinking_spinner()  # stop rotating lobby messages
+        self._streaming_content = ""
+        self._stream_header_printed = False
+        self._stream_pending = ""
+        self._stream_think_started = False
+        self._tag_buf = ""
+        self._link_buf = ""
+        self._link_state = 0
+        self._stream_token_count = 0
+        self._stream_start_time = time.monotonic()
+
+    def stream_think_token(self, token: str) -> None:
+        """Print a reasoning/thinking token in dim italic, opening a think block if needed."""
+        if not self._stream_think_started:
+            self._stream_think_started = True
+            self.console.print(
+                f"┌─ 💭 Thinking [{self.format_timestamp()}]",
+                style="dim italic",
+            )
+        print(f"\033[2m\033[3m{token}\033[0m", end="", flush=True)
+
+    def stream_think_end(self) -> None:
+        """Close the thinking block if it is open."""
+        if self._stream_think_started:
+            print()  # newline after last think token
+            self.console.print("└" + "─" * 40, style="dim")
+            self._stream_think_started = False
+
+    def stream_token(self, token: str) -> None:
+        """Stream an answer token. Auto-closes any open think block on first call."""
+        self._streaming_content += token
+        self._stream_token_count += 1
+        if self._stream_think_started:
+            self.stream_think_end()  # reasoning just finished, close think block
+        display = self._filter_display_token(token)
+        display = self._filter_markdown_links(display)
+        if not display:
+            return
+        self._erase_stream_cursor()
+        if not self._stream_header_printed:
+            self._stream_pending += display
+            if self._stream_pending.strip():
+                # First real answer content — print header then flush buffer
+                self._stream_header_printed = True
+                self.console.print(
+                    f"┌─ 🤖 AI ({self.model_name}) [{self.format_timestamp()}]" if self.model_name else f"┌─ 🤖 AI [{self.format_timestamp()}]",
+                    style=self.theme.styles.get("assistant", "bold magenta"),
+                )
+                print(self._stream_pending.lstrip(), end="", flush=True)
+                self._stream_pending = ""
+                self._show_stream_cursor()
+        else:
+            if display.strip():
+                # Non-whitespace: flush any buffered trailing whitespace then print
+                if self._trail_buf:
+                    print(self._trail_buf, end="", flush=True)
+                    self._trail_buf = ""
+                print(display, end="", flush=True)
+                self._show_stream_cursor()
+            else:
+                # Whitespace-only token: buffer it; discard if stream ends before real content
+                self._trail_buf += display
+                self._show_stream_cursor()
+
+    def _filter_display_token(self, token: str) -> str:
+        """Strip <answer>/<answer> wrapper tags, buffering a partial '<' across tokens."""
+        buf = self._tag_buf + token
+        buf = buf.replace("<answer>", "").replace("</answer>", "")
+        if buf.endswith("<"):
+            self._tag_buf = "<"
+            return buf[:-1]
+        self._tag_buf = ""
+        return buf
+
+    def _filter_markdown_links(self, text: str) -> str:
+        """Filter markdown links from streaming tokens.
+
+        Buffers ``[label](url)`` patterns across token boundaries and emits
+        only the label text, suppressing the URL (which may be a huge
+        data-URI).  State machine: 0=normal, 1=inside label ``[…``,
+        2=consuming URL after ``](``.
+        """
+        out = []
+        for ch in text:
+            if self._link_state == 0:
+                if ch == '[':
+                    self._link_state = 1
+                    self._link_buf = ""
+                else:
+                    out.append(ch)
+            elif self._link_state == 1:
+                if ch == ']':
+                    # Peek-ahead not possible across tokens; buffer the label
+                    # and move to a transition state.  We abuse _link_state=2
+                    # but first need to see '('.
+                    self._link_state = 2
+                elif ch == '\n':
+                    # Newline inside bracket — not a link, flush as literal
+                    out.append('[')
+                    out.append(self._link_buf)
+                    out.append(ch)
+                    self._link_buf = ""
+                    self._link_state = 0
+                else:
+                    self._link_buf += ch
+            elif self._link_state == 2:
+                if ch == '(':
+                    # Confirmed markdown link — consume URL until ')'
+                    self._link_state = 3
+                else:
+                    # Not a markdown link — flush buffered label as literal
+                    out.append('[')
+                    out.append(self._link_buf)
+                    out.append(']')
+                    out.append(ch)
+                    self._link_buf = ""
+                    self._link_state = 0
+            elif self._link_state == 3:
+                if ch == ')':
+                    # End of URL — emit only the label
+                    out.append(self._link_buf)
+                    self._link_buf = ""
+                    self._link_state = 0
+                # else: swallow URL characters
+        return "".join(out)
+
+    def stream_end(self, elapsed: str = "") -> None:
+        """Close the streamed block. Message saving is handled by onit.py (has correct elapsed)."""
+        self._erase_stream_cursor()
+        self.stream_think_end()  # close think block if still open
+        if not self._stream_header_printed:
+            # Only whitespace or tool-call-only response — skip the empty block
+            self._streaming_content = ""
+            self._stream_pending = ""
+            self._trail_buf = ""
+            self._tag_buf = ""
+            self._link_buf = ""
+            self._link_state = 0
+            return
+        # Discard trailing whitespace — just emit a single newline before the footer
+        self._trail_buf = ""
+        print()  # final newline after the last token
+        footer = "└" + "─" * 40
+        if elapsed:
+            footer += f"  {elapsed}"
+        # Append average tokens/sec if we tracked any tokens
+        stream_elapsed = time.monotonic() - self._stream_start_time if self._stream_start_time else 0
+        if stream_elapsed > 0 and self._stream_token_count > 0:
+            tok_s = self._stream_token_count / stream_elapsed
+            footer += f"  ({tok_s:.1f} tok/s)"
+        if self._context_pct > 0:
+            t = Text()
+            t.append(footer, style=self.theme.styles.get("assistant", "magenta"))
+            t.append(f"  {self._fmt_ctx_label()}", style="bright_cyan")
+            self.console.print(t)
+        else:
+            self.console.print(footer, style=self.theme.styles.get("assistant", "magenta"))
+        # Warn when context is getting full (≥75%)
+        if self._context_pct >= 90:
+            self.console.print(
+                f"  ⚠  Context window {self._context_pct:.0f}% full — compaction imminent",
+                style="bold red",
+            )
+        elif self._context_pct >= 75:
+            self.console.print(
+                f"  ⚠  Context window {self._context_pct:.0f}% full",
+                style="bold yellow",
+            )
+        # Save to history so intermediate AI turns appear in the chat panel.
+        # Strip all XML-style tags (same as remove_tags) so the final turn's
+        # content matches onit.py's comparison and gets elapsed time updated.
+        content = re.sub(r"<[^>]+>", "", self._streaming_content).strip()
+        if content:
+            self.add_message("assistant", content)
+        self._streaming_content = ""
+        self._stream_pending = ""
+        self._tag_buf = ""
+        self._link_buf = ""
+        self._link_state = 0
+        self._stream_header_printed = False
+
     def render(self, thinking: bool = False) -> Union[Panel, None]:
         """
         Render complete layout including chat messages and optionally execution logs.
@@ -536,8 +933,141 @@ class ChatUI:
         self.console.print(Align.center(Text("OnIt may produce inaccurate information. Verify important details independently.", style="dim italic")))
     
     def _input_with_history(self, prompt: str = "➤ ") -> str:
+        """Dispatch to the platform-appropriate raw-input implementation."""
+        if sys.platform == "win32":
+            return self._input_with_history_windows(prompt)
+        return self._input_with_history_unix(prompt)
+
+    @staticmethod
+    def _redraw_line(prompt: str, current_input: list[str], prev_lines: int = 1) -> int:
+        """Clear and redraw the prompt with the given input (supports multiline).
+
+        Returns:
+            Number of display lines used.
+        """
+        # Move cursor up to the first line of the current display
+        if prev_lines > 1:
+            sys.stdout.write(f'\033[{prev_lines - 1}A')
+        # Clear from start of first line to end of screen
+        sys.stdout.write('\r\033[J')
+
+        text = ''.join(current_input)
+        lines = text.split('\n')
+        sys.stdout.write(f"\033[1;32m{prompt}\033[0m{lines[0]}")
+        for line in lines[1:]:
+            sys.stdout.write(f"\r\n\033[1;32m  \033[0m{line}")
+        sys.stdout.flush()
+        return len(lines)
+
+    def _handle_arrow_keys(
+        self,
+        code: str,
+        prompt: str,
+        current_input: list[str],
+        cursor_pos: int,
+        temp_history_index: int,
+        saved_input: str,
+        num_display_lines: int = 1,
+    ) -> tuple[list[str], int, int, str, int]:
+        """Handle up/down/left/right arrow key navigation.
+
+        Returns:
+            Updated (current_input, cursor_pos, temp_history_index, saved_input, num_display_lines).
+        """
+        if code == 'A' and self.input_history:  # Up arrow
+            if temp_history_index == -1:
+                saved_input = ''.join(current_input)
+                temp_history_index = len(self.input_history) - 1
+            elif temp_history_index > 0:
+                temp_history_index -= 1
+
+            if temp_history_index >= 0:
+                current_input = list(self.input_history[temp_history_index])
+                cursor_pos = len(current_input)
+                num_display_lines = self._redraw_line(prompt, current_input, num_display_lines)
+
+        elif code == 'B' and temp_history_index != -1:  # Down arrow
+            temp_history_index += 1
+            if temp_history_index >= len(self.input_history):
+                temp_history_index = -1
+                current_input = list(saved_input)
+            else:
+                current_input = list(self.input_history[temp_history_index])
+            cursor_pos = len(current_input)
+            num_display_lines = self._redraw_line(prompt, current_input, num_display_lines)
+
+        elif code == 'C' and cursor_pos < len(current_input):  # Right arrow
+            cursor_pos += 1
+            sys.stdout.write('\033[C')
+            sys.stdout.flush()
+
+        elif code == 'D' and cursor_pos > 0:  # Left arrow
+            cursor_pos -= 1
+            sys.stdout.write('\033[D')
+            sys.stdout.flush()
+
+        return current_input, cursor_pos, temp_history_index, saved_input, num_display_lines
+
+    @staticmethod
+    def _handle_delete_key(
+        current_input: list[str],
+        cursor_pos: int,
+    ) -> tuple[list[str], int]:
+        """Handle the Delete key (ESC [ 3 ~), removing the char at cursor_pos.
+
+        Returns:
+            Updated (current_input, cursor_pos).
+        """
+        next3 = sys.stdin.read(1)
+        if next3 == '~' and cursor_pos < len(current_input):
+            del current_input[cursor_pos]
+            sys.stdout.write(''.join(current_input[cursor_pos:]) + ' ')
+            sys.stdout.write('\033[' + str(len(current_input) - cursor_pos + 1) + 'D')
+            sys.stdout.flush()
+        return current_input, cursor_pos
+
+    @staticmethod
+    def _handle_backspace(
+        current_input: list[str],
+        cursor_pos: int,
+    ) -> tuple[list[str], int]:
+        """Handle the Backspace key, removing the char before cursor_pos.
+
+        Returns:
+            Updated (current_input, cursor_pos).
+        """
+        if cursor_pos > 0:
+            cursor_pos -= 1
+            del current_input[cursor_pos]
+            sys.stdout.write('\b' + ''.join(current_input[cursor_pos:]) + ' ')
+            sys.stdout.write('\033[' + str(len(current_input) - cursor_pos + 1) + 'D')
+            sys.stdout.flush()
+        return current_input, cursor_pos
+
+    @staticmethod
+    def _handle_printable(
+        char: str,
+        current_input: list[str],
+        cursor_pos: int,
+    ) -> tuple[list[str], int]:
+        """Insert a printable character at cursor_pos and update the display.
+
+        Returns:
+            Updated (current_input, cursor_pos).
+        """
+        current_input.insert(cursor_pos, char)
+        cursor_pos += 1
+        sys.stdout.write(char + ''.join(current_input[cursor_pos:]))
+        if cursor_pos < len(current_input):
+            sys.stdout.write('\033[' + str(len(current_input) - cursor_pos) + 'D')
+        sys.stdout.flush()
+        return current_input, cursor_pos
+
+    def _input_with_history_unix(self, prompt: str = "➤ ") -> str:
         """
         Get user input with history navigation using up/down arrow keys.
+        Uses termios/tty for raw terminal control (Unix/Linux/macOS only).
+        Supports bracketed paste mode for pasting multi-line text.
 
         Args:
             prompt: The prompt string to display
@@ -545,33 +1075,43 @@ class ChatUI:
         Returns:
             The user's input string
         """
-        # Print prompt
-        sys.stdout.write(f"\033[1;32m{prompt}\033[0m")  # Bold green prompt
+        # Enable bracketed paste mode + show blinking bar cursor + bold green prompt
+        sys.stdout.write(f"\033[?2004h\033[?25h\033[1 q\033[1;32m{prompt}\033[0m")
         sys.stdout.flush()
 
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        old_settings = termios.tcgetattr(fd)  # type: ignore[name-defined]
 
         try:
-            tty.setraw(fd)
+            tty.setraw(fd)  # type: ignore[name-defined]
 
-            current_input = []
+            current_input: list[str] = []
             cursor_pos = 0
             temp_history_index = -1
-            saved_input = ""  # Save current input when browsing history
+            saved_input = ""
+            in_paste = False
+            num_display_lines = 1
 
             while True:
                 char = sys.stdin.read(1)
 
-                if char == '\r' or char == '\n':  # Enter key
-                    sys.stdout.write('\r\n')
-                    sys.stdout.flush()
-                    result = ''.join(current_input)
-                    # Add to history if non-empty and different from last entry
-                    if result.strip() and (not self.input_history or self.input_history[-1] != result):
-                        self.input_history.append(result)
-                    self.history_index = -1
-                    return result
+                if char in ('\r', '\n'):
+                    if in_paste:
+                        # Insert literal newline during paste
+                        current_input.insert(cursor_pos, '\n')
+                        cursor_pos += 1
+                        num_display_lines += 1
+                        sys.stdout.write('\r\n\033[1;32m  \033[0m')
+                        sys.stdout.flush()
+                    else:
+                        # Submit input
+                        sys.stdout.write('\r\n')
+                        sys.stdout.flush()
+                        result = ''.join(current_input)
+                        if result.strip() and (not self.input_history or self.input_history[-1] != result):
+                            self.input_history.append(result)
+                        self.history_index = -1
+                        return result
 
                 elif char == '\x03':  # Ctrl+C
                     sys.stdout.write('\r\n')
@@ -583,98 +1123,173 @@ class ChatUI:
                     sys.stdout.flush()
                     raise EOFError
 
-                elif char == '\x1b':  # Escape sequence (arrow keys)
+                elif char == '\x1b':  # Escape sequence
                     next1 = sys.stdin.read(1)
                     if next1 == '[':
                         next2 = sys.stdin.read(1)
-
-                        if next2 == 'A':  # Up arrow
-                            if self.input_history:
-                                if temp_history_index == -1:
-                                    # Save current input before browsing
-                                    saved_input = ''.join(current_input)
-                                    temp_history_index = len(self.input_history) - 1
-                                elif temp_history_index > 0:
-                                    temp_history_index -= 1
-
-                                if temp_history_index >= 0:
-                                    # Clear current line
-                                    sys.stdout.write('\r' + ' ' * (len(prompt) + len(current_input) + 5) + '\r')
-                                    sys.stdout.write(f"\033[1;32m{prompt}\033[0m")
-                                    # Show history item
-                                    current_input = list(self.input_history[temp_history_index])
-                                    cursor_pos = len(current_input)
-                                    sys.stdout.write(''.join(current_input))
-                                    sys.stdout.flush()
-
-                        elif next2 == 'B':  # Down arrow
-                            if temp_history_index != -1:
-                                temp_history_index += 1
-                                # Clear current line
-                                sys.stdout.write('\r' + ' ' * (len(prompt) + len(current_input) + 5) + '\r')
-                                sys.stdout.write(f"\033[1;32m{prompt}\033[0m")
-
-                                if temp_history_index >= len(self.input_history):
-                                    # Restore saved input
-                                    temp_history_index = -1
-                                    current_input = list(saved_input)
-                                else:
-                                    current_input = list(self.input_history[temp_history_index])
-
-                                cursor_pos = len(current_input)
-                                sys.stdout.write(''.join(current_input))
-                                sys.stdout.flush()
-
-                        elif next2 == 'C':  # Right arrow
-                            if cursor_pos < len(current_input):
-                                cursor_pos += 1
-                                sys.stdout.write('\033[C')
-                                sys.stdout.flush()
-
-                        elif next2 == 'D':  # Left arrow
-                            if cursor_pos > 0:
-                                cursor_pos -= 1
-                                sys.stdout.write('\033[D')
-                                sys.stdout.flush()
-
-                        elif next2 == '3':  # Delete key (might have another char)
+                        if next2 == '2':
+                            # Check for bracketed paste: \e[200~ (start) or \e[201~ (end)
                             next3 = sys.stdin.read(1)
-                            if next3 == '~' and cursor_pos < len(current_input):
-                                # Delete character at cursor
-                                del current_input[cursor_pos]
-                                # Rewrite line from cursor
-                                sys.stdout.write(''.join(current_input[cursor_pos:]) + ' ')
-                                # Move cursor back
-                                sys.stdout.write('\033[' + str(len(current_input) - cursor_pos + 1) + 'D')
-                                sys.stdout.flush()
+                            if next3 == '0':
+                                next4 = sys.stdin.read(1)
+                                next5 = sys.stdin.read(1)  # should be '~'
+                                if next4 == '0' and next5 == '~':
+                                    in_paste = True
+                                elif next4 == '1' and next5 == '~':
+                                    in_paste = False
+                                # else: unknown sequence, discard
+                            elif next3 == '~':
+                                pass  # Insert key (\e[2~), ignore
+                            # else: unknown \e[2X sequence, discard
+                        elif next2 == '3':  # Delete key
+                            current_input, cursor_pos = self._handle_delete_key(
+                                current_input, cursor_pos,
+                            )
+                        else:  # Arrow keys (A/B/C/D)
+                            current_input, cursor_pos, temp_history_index, saved_input, num_display_lines = (
+                                self._handle_arrow_keys(
+                                    next2, prompt, current_input, cursor_pos,
+                                    temp_history_index, saved_input, num_display_lines,
+                                )
+                            )
 
-                elif char == '\x7f' or char == '\b':  # Backspace
+                elif char in ('\x7f', '\b'):  # Backspace
+                    current_input, cursor_pos = self._handle_backspace(
+                        current_input, cursor_pos,
+                    )
+
+                elif ' ' <= char <= '~':  # Printable characters
+                    current_input, cursor_pos = self._handle_printable(
+                        char, current_input, cursor_pos,
+                    )
+
+        finally:
+            # Disable bracketed paste mode and restore terminal
+            sys.stdout.write("\033[?2004l")
+            sys.stdout.flush()
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)  # type: ignore[name-defined]
+
+    def _input_with_history_windows(self, prompt: str = "➤ ") -> str:
+        """
+        Get user input with history navigation using up/down arrow keys.
+        Uses msvcrt for raw character reading (Windows only).
+
+        Arrow keys on Windows emit two bytes via msvcrt.getwch():
+          prefix \x00 or \xe0, then a scan code:
+            \x48 = Up, \x50 = Down, \x4d = Right, \x4b = Left, \x53 = Delete
+
+        Args:
+            prompt: The prompt string to display
+
+        Returns:
+            The user's input string
+        """
+        # Show blinking bar cursor + bold green prompt
+        sys.stdout.write(f"\033[?25h\033[5 q\033[1;32m{prompt}\033[0m")
+        sys.stdout.flush()
+
+        current_input = []
+        cursor_pos = 0
+        temp_history_index = -1
+        saved_input = ""
+
+        while True:
+            char = msvcrt.getwch()
+
+            if char in ('\r', '\n'):  # Enter key
+                sys.stdout.write('\r\n')
+                sys.stdout.flush()
+                result = ''.join(current_input)
+                if result.strip() and (not self.input_history or self.input_history[-1] != result):
+                    self.input_history.append(result)
+                self.history_index = -1
+                return result
+
+            elif char == '\x03':  # Ctrl+C
+                sys.stdout.write('\r\n')
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+
+            elif char == '\x04':  # Ctrl+D
+                sys.stdout.write('\r\n')
+                sys.stdout.flush()
+                raise EOFError
+
+            elif char in ('\x00', '\xe0'):  # Special key prefix (arrows, Delete, etc.)
+                scan = msvcrt.getwch()
+
+                if scan == '\x48':  # Up arrow
+                    if self.input_history:
+                        if temp_history_index == -1:
+                            saved_input = ''.join(current_input)
+                            temp_history_index = len(self.input_history) - 1
+                        elif temp_history_index > 0:
+                            temp_history_index -= 1
+
+                        if temp_history_index >= 0:
+                            sys.stdout.write('\r' + ' ' * (len(prompt) + len(current_input) + 5) + '\r')
+                            sys.stdout.write(f"\033[1;32m{prompt}\033[0m")
+                            current_input = list(self.input_history[temp_history_index])
+                            cursor_pos = len(current_input)
+                            sys.stdout.write(''.join(current_input))
+                            sys.stdout.flush()
+
+                elif scan == '\x50':  # Down arrow
+                    if temp_history_index != -1:
+                        temp_history_index += 1
+                        sys.stdout.write('\r' + ' ' * (len(prompt) + len(current_input) + 5) + '\r')
+                        sys.stdout.write(f"\033[1;32m{prompt}\033[0m")
+
+                        if temp_history_index >= len(self.input_history):
+                            temp_history_index = -1
+                            current_input = list(saved_input)
+                        else:
+                            current_input = list(self.input_history[temp_history_index])
+
+                        cursor_pos = len(current_input)
+                        sys.stdout.write(''.join(current_input))
+                        sys.stdout.flush()
+
+                elif scan == '\x4d':  # Right arrow
+                    if cursor_pos < len(current_input):
+                        cursor_pos += 1
+                        sys.stdout.write('\033[C')
+                        sys.stdout.flush()
+
+                elif scan == '\x4b':  # Left arrow
                     if cursor_pos > 0:
                         cursor_pos -= 1
+                        sys.stdout.write('\033[D')
+                        sys.stdout.flush()
+
+                elif scan == '\x53':  # Delete key
+                    if cursor_pos < len(current_input):
                         del current_input[cursor_pos]
-                        # Move cursor back, rewrite rest of line, add space to clear last char
-                        sys.stdout.write('\b' + ''.join(current_input[cursor_pos:]) + ' ')
-                        # Move cursor back to position
+                        sys.stdout.write(''.join(current_input[cursor_pos:]) + ' ')
                         sys.stdout.write('\033[' + str(len(current_input) - cursor_pos + 1) + 'D')
                         sys.stdout.flush()
 
-                elif char >= ' ' and char <= '~':  # Printable characters
-                    current_input.insert(cursor_pos, char)
-                    cursor_pos += 1
-                    # Write char and rest of line
-                    sys.stdout.write(char + ''.join(current_input[cursor_pos:]))
-                    # Move cursor back if not at end
-                    if cursor_pos < len(current_input):
-                        sys.stdout.write('\033[' + str(len(current_input) - cursor_pos) + 'D')
+            elif char in ('\x7f', '\x08'):  # Backspace
+                if cursor_pos > 0:
+                    cursor_pos -= 1
+                    del current_input[cursor_pos]
+                    sys.stdout.write('\b' + ''.join(current_input[cursor_pos:]) + ' ')
+                    sys.stdout.write('\033[' + str(len(current_input) - cursor_pos + 1) + 'D')
                     sys.stdout.flush()
 
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            elif char >= ' ' and char <= '~':  # Printable characters
+                current_input.insert(cursor_pos, char)
+                cursor_pos += 1
+                sys.stdout.write(char + ''.join(current_input[cursor_pos:]))
+                if cursor_pos < len(current_input):
+                    sys.stdout.write('\033[' + str(len(current_input) - cursor_pos) + 'D')
+                sys.stdout.flush()
 
     def get_user_input(self) -> str:
         """Get user input from the console with history support (up/down arrows)"""
         self.stop_status()
         while True:
+            self.console.clear()
             self.console.print(self.render())
             self.console.print(Align.center(Text("OnIt may produce inaccurate information. Verify important details independently.", style="dim italic")))
             try:
@@ -683,11 +1298,11 @@ class ChatUI:
                 self.add_message("user", user_input)
                 self.console.clear()
 
-                # Show thinking indicator
+                # Show panel with the user's message, then a plain (non-Live)
+                # thinking indicator so the console is free for streaming tokens.
                 self.console.print(self.render())
                 self.console.print(Align.center(Text("OnIt may produce inaccurate information. Verify important details independently.", style="dim italic")))
                 self.console.print()
-                self.start_status()
                 return user_input
             # capture control-d
             except EOFError:

@@ -6,6 +6,8 @@ Usage: onit --gateway  (requires TELEGRAM_BOT_TOKEN env var)
 
 import asyncio
 import logging
+
+from . import split_message
 import os
 import uuid
 from pathlib import Path
@@ -25,24 +27,6 @@ logger = logging.getLogger(__name__)
 
 # Telegram message length limit
 MAX_MESSAGE_LENGTH = 4096
-
-
-def _split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
-    """Split a long message into chunks that fit within Telegram's limit."""
-    if len(text) <= limit:
-        return [text]
-    chunks = []
-    while text:
-        if len(text) <= limit:
-            chunks.append(text)
-            break
-        # Try to split at a newline boundary
-        split_at = text.rfind('\n', 0, limit)
-        if split_at == -1:
-            split_at = limit
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip('\n')
-    return chunks
 
 
 class TelegramGateway:
@@ -154,7 +138,7 @@ class TelegramGateway:
             print(f"[BOT] {response}")
 
         # Send response, splitting if needed
-        for chunk in _split_message(response):
+        for chunk in split_message(response, MAX_MESSAGE_LENGTH):
             await self._reply_with_retry(update.message, chunk)
 
     async def _handle_photo(self, update: Update, context) -> None:
@@ -226,7 +210,7 @@ class TelegramGateway:
         if self.show_logs:
             print(f"[BOT] {response}")
 
-        for chunk in _split_message(response):
+        for chunk in split_message(response, MAX_MESSAGE_LENGTH):
             await self._reply_with_retry(update.message, chunk)
 
     def run_sync(self) -> None:

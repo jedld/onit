@@ -18,6 +18,7 @@ env/
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
@@ -39,8 +40,6 @@ htmlcov/
 *.log
 
 # Scripts
-scripts/
+configs/*
+scripts/*
 *example.yaml
-
-# Local-only config (do not commit)
-configs/default.yaml

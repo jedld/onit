@@ -2,14 +2,14 @@
 
 *OnIt* — the AI is working on the given task and will deliver the results shortly.
 
-OnIt is an intelligent agent framework for task automation and assistance. It is built on [MCP](https://modelcontextprotocol.io/) (Model Context Protocol) for tool integration and supports the [A2A](https://a2a-protocol.org/) (Agent-to-Agent) protocol for multi-agent communication. OnIt connects to LLMs via any OpenAI-compatible API (private [vLLM](https://github.com/vllm-project/vllm) servers or [OpenRouter.ai](https://openrouter.ai/)) and orchestrates tasks through modular MCP servers.
+OnIt is an intelligent agent for task automation and assistance. It connects to any OpenAI-compatible LLM (private [vLLM](https://github.com/vllm-project/vllm) servers or [OpenRouter.ai](https://openrouter.ai/)) and uses [MCP](https://modelcontextprotocol.io/) tools for web search, file operations, and more. It also supports the [A2A](https://a2a-protocol.org/) protocol for multi-agent communication.
 
-## Quick Guide
+## Getting Started
 
 ### 1. Install
 
 ```bash
-pip install onit==0.1.3c
+pip install onit
 ```
 
 Or from source:
@@ -17,30 +17,22 @@ Or from source:
 ```bash
 git clone https://github.com/sibyl-oracles/onit.git
 cd onit
-pip install -e ".[all]" --upgrade
+pip install -e ".[all]"
 ```
 
-### 2. Configure
-
-Set your LLM host and at least one API key:
+### 2. Setup
 
 ```bash
-# Option A: Private vLLM server
-export ONIT_HOST=http://localhost:8000/v1
-
-# Option B: OpenRouter.ai
-export ONIT_HOST=https://openrouter.ai/api/v1
-export OPENROUTER_API_KEY=sk-or-v1-your-key-here
+onit setup
 ```
 
-Optional API keys for built-in tools:
+The setup wizard walks you through configuring your LLM endpoint, API keys, and preferences. Secrets are stored securely in your OS keychain. Settings are saved to `~/.onit/config.yaml`.
+
+To review your configuration at any time:
 
 ```bash
-export OLLAMA_API_KEY=your_key        # Web search. Best to enable this. Free rate limited.
-export OPENWEATHER_API_KEY=your_key   # Weather data. Free.
+onit setup --show
 ```
-
-Get your free API keys: [Ollama](https://ollama.com/) | [OpenWeatherMap](https://openweathermap.org/api)
 
 ### 3. Run
 
@@ -48,38 +40,52 @@ Get your free API keys: [Ollama](https://ollama.com/) | [OpenWeatherMap](https:/
 onit
 ```
 
-That's it. MCP servers start automatically, and you get an interactive terminal chat with tool access.
+That's it. MCP tools start automatically, and you get an interactive chat with tool access.
 
-**Other interfaces:**
+### Other interfaces
 
 ```bash
-onit --web                          # Gradio web UI on port 9000
+onit --web                          # Web UI on port 9000
 onit --gateway                      # Telegram/Viber bot gateway
 onit --a2a                          # A2A server on port 9001
-onit --client --task "your task"    # Send a task to an A2A server and print the answer
+onit --client --task "your task"    # Send a task to an A2A server
+onit --sandbox                      # Enable sandbox mode for code execution
 ```
 
 ## Configuration
 
-All options can be set via CLI flags, environment variables, or a YAML config file:
+`onit setup` is the recommended way to configure OnIt. It stores:
+
+- **Settings** in `~/.onit/config.yaml` (LLM endpoint, theme, ports, timeout)
+- **Secrets** in your OS keychain (API keys, bot tokens)
+
+You can also use environment variables or a project-level YAML config:
 
 ```bash
+# Environment variables
+export ONIT_HOST=https://openrouter.ai/api/v1
+export OPENROUTER_API_KEY=sk-or-v1-...
+
+# Or a custom config file
 onit --config configs/default.yaml
 ```
 
-Example config (`configs/default.yaml`):
+Priority order: CLI flags > environment variables > `~/.onit/config.yaml` > project config file.
+
+### Example config (`configs/default.yaml`)
 
 ```yaml
 serving:
   host: https://openrouter.ai/api/v1
   host_key: sk-or-v1-your-key-here   # or set OPENROUTER_API_KEY env var
-  model: google/gemini-2.5-pro
+  # model: auto-detected from endpoint. Set explicitly for OpenRouter:
+  # model: google/gemini-2.5-pro
   think: true
   max_tokens: 262144
 
 verbose: false
 timeout: 600
-# prompt_intro: "I am a helpful AI assistant. My name is OnIt."
+sandbox: false
 
 web: false
 web_port: 9000
@@ -92,33 +98,25 @@ mcp:
     - name: ToolsMCPServer
       url: http://127.0.0.1:18201/sse
       enabled: true
-
-observability:
-  tracing: true
-  trace_dir: ~/.onit/introspection
-  max_events: 2000
-  introspection: true
-  host: 127.0.0.1
-  port: 9100
 ```
 
-The LLM provider is auto-detected from the host URL. If it contains `openrouter.ai`, the API key is read from `host_key` or `OPENROUTER_API_KEY`. All other hosts default to vLLM with no key required.
-
-## CLI Options
+## CLI Reference
 
 **General:**
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--config` | Path to YAML configuration file | `configs/default.yaml` |
-| `--host` | LLM serving host URL (overrides config and `ONIT_HOST` env var) | — |
-| `--model` | Model name (overrides `serving.model` in config) | — |
+| `--host` | LLM serving host URL | — |
 | `--verbose` | Enable verbose logging | `false` |
 | `--timeout` | Request timeout in seconds (`-1` = none) | `600` |
 | `--template-path` | Path to custom prompt template YAML file | — |
-| `--documents-path` | Path to local documents directory (model searches here before the web) | — |
+| `--documents-path` | Path to local documents directory | — |
 | `--topic` | Default topic context (e.g. `"machine learning"`) | — |
-| `--prompt-intro` | Custom system prompt intro for the model | `"I am a helpful AI assistant. My name is OnIt."` |
+| `--prompt-intro` | Custom system prompt intro | — |
+| `--no-stream` | Disable token streaming | `false` |
+| `--think` | Enable thinking/reasoning mode (CoT) | `false` |
+| `--sandbox` | Enable sandbox mode for code execution in isolated containers | `false` |
 
 **Text UI:**
 
@@ -139,8 +137,8 @@ The LLM provider is auto-detected from the host URL. If it contains `openrouter.
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--gateway` | Auto-detect gateway (Telegram or Viber based on env vars) | — |
-| `--gateway telegram` | Run as a Telegram bot gateway (requires `TELEGRAM_BOT_TOKEN`) | — |
-| `--gateway viber` | Run as a Viber bot gateway (requires `VIBER_BOT_TOKEN`) | — |
+| `--gateway telegram` | Run as a Telegram bot | — |
+| `--gateway viber` | Run as a Viber bot | — |
 | `--viber-webhook-url` | Public HTTPS URL for Viber webhook | — |
 | `--viber-port` | Local port for Viber webhook server | `8443` |
 
@@ -150,31 +148,21 @@ The LLM provider is auto-detected from the host URL. If it contains `openrouter.
 |------|-------------|---------|
 | `--a2a` | Run as an A2A protocol server | `false` |
 | `--a2a-port` | A2A server port | `9001` |
-| `--client`, `--a2a-client` | Client mode: send a task to a remote A2A server | `false` |
+| `--client` | Send a task to a remote A2A server | `false` |
 | `--a2a-host` | A2A server URL for client mode | `http://localhost:9001` |
-| `--task`, `--a2a-task` | Task string for A2A loop or client mode | — |
-| `--file`, `--a2a-file` | File to upload to the A2A server with the task | — |
-| `--image`, `--a2a-image` | Image file to send for vision processing | — |
-| `--loop`, `--a2a-loop` | Enable A2A loop mode | `false` |
-| `--period`, `--a2a-period` | Seconds between A2A loop iterations | `10` |
+| `--task` | Task string for A2A client or loop mode | — |
+| `--file` | File to upload with the task | — |
+| `--image` | Image file for vision processing | — |
+| `--loop` | Enable A2A loop mode | `false` |
+| `--period` | Seconds between loop iterations | `10` |
 
 **MCP (Model Context Protocol):**
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--mcp-host` | Override the host/IP in all MCP server URLs (e.g. `192.168.1.100`) | — |
-| `--mcp-sse` | URL of an external MCP tools server using SSE transport (can be repeated) | — |
-
-**Observability:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--probe` | Run a one-shot connectivity and discovery probe, print JSON, and exit | `false` |
-| `--introspection` | Enable the external introspection HTTP server | config-driven |
-| `--introspection-host` | Host for the introspection HTTP server | `127.0.0.1` |
-| `--introspection-port` | Port for the introspection HTTP server | `9100` |
-| `--trace-dir` | Directory for JSONL trace files and persisted observability data | `~/.onit/introspection` |
-| `--trace-max-events` | Max in-memory events retained for introspection queries | `2000` |
+| `--mcp-host` | Override host/IP in all MCP server URLs | — |
+| `--mcp-sse` | URL of an external MCP server (SSE transport, can be repeated) | — |
+| `--mcp-server` | URL of an external MCP server (Streamable HTTP transport, can be repeated) | — |
 
 ## Features
 
@@ -184,17 +172,35 @@ Rich terminal UI with input history, theming, and execution logs. Press Enter or
 
 ### Web UI
 
-Gradio-based browser interface with file upload, copy buttons, and real-time polling:
+Gradio-based browser interface with file upload and real-time streaming:
 
 ```bash
-onit --web --web-port 9000
+onit --web
 ```
 
 Supports optional Google OAuth2 authentication — see [docs/WEB_AUTHENTICATION.md](docs/WEB_AUTHENTICATION.md).
 
+### Sandbox Mode
+
+Run code in isolated Docker containers. When enabled, the agent routes all code development and execution to a sandboxed environment, keeping the host system clean.
+
+```bash
+onit --sandbox
+```
+
+Or in `config.yaml`:
+
+```yaml
+sandbox: true
+```
+
+Sandbox mode requires an MCP server that provides sandbox tools (e.g. `sandbox_run_code`, `sandbox_install_packages`, `sandbox_stop`). The agent auto-injects `session_id` and `data_path` into any tool whose schema declares those parameters, so the MCP server can maintain per-session containers and mount the correct data directory.
+
+When the user interrupts a running task (Ctrl+C, Enter, or stop button), the agent automatically calls `sandbox_stop` to clean up the container.
+
 ### MCP Tool Integration
 
-MCP servers are started automatically. Tools are auto-discovered and available to the agent.
+MCP servers start automatically. Tools are auto-discovered and available to the agent.
 
 | Server | Description |
 |--------|-------------|
@@ -207,58 +213,16 @@ Connect to additional external MCP servers:
 onit --mcp-sse http://localhost:8080/sse --mcp-sse http://192.168.1.50:9090/sse
 ```
 
-### Tracing and Probes
+### Messaging Gateways
 
-OnIt can now expose model-to-MCP activity for external monitoring while you run robot tasks. With the default config, traces are written to `~/.onit/introspection/events.jsonl` and a local HTTP introspection server is started on `127.0.0.1:9100`.
-
-Probe the current runtime before a robot run:
+Chat with OnIt from **Telegram** or **Viber**. Configure bot tokens via `onit setup` or environment variables, then:
 
 ```bash
-onit --probe
-```
-
-Inspect live runtime state from another process or dashboard:
-
-```bash
-curl http://127.0.0.1:9100/healthz
-curl http://127.0.0.1:9100/probe
-curl 'http://127.0.0.1:9100/trace/events?limit=100'
-curl http://127.0.0.1:9100/trace/stats
-```
-
-Dashboard URL: http://127.0.0.1:9100/dashboard
-
-The trace stream covers:
-
-- LLM request and response cycles
-- Agent tool decisions
-- Prompt-server MCP traffic
-- MCP tool request/response/error events, including remote robot-control servers such as ROS bridges
-
-The live dashboard shows inflight tasks, completed tasks, inflight operations, completed operations, and a ROS-focused activity view updated once per second from the same introspection server.
-
-### Messaging Gateways (Telegram & Viber)
-
-Chat with OnIt remotely from **Telegram** or **Viber** using a bot.
-
-**Telegram:**
-
-```bash
-export TELEGRAM_BOT_TOKEN=your-bot-token-here
 onit --gateway telegram
+onit --gateway viber --viber-webhook-url https://your-domain.com/viber
 ```
 
-**Viber** (requires a public HTTPS webhook URL — see [Gateway Quick Start](docs/GATEWAY_QUICK_START.md)):
-
-```bash
-export VIBER_BOT_TOKEN=your-viber-token
-export VIBER_WEBHOOK_URL=https://your-domain.com/viber
-onit --gateway viber
-```
-
-Both gateways support text and photo messages. The photo caption is used as the prompt (defaults to "Describe this image." if no caption is provided). Use `--gateway` without a type to auto-detect based on which token is set.
-
-**Install the gateway dependency separately if not using `[all]`:**
+Install the gateway dependency separately if not using `[all]`:
 
 ```bash
 pip install "onit[gateway]"
@@ -269,7 +233,7 @@ pip install "onit[gateway]"
 Run OnIt as an [A2A](https://a2a-protocol.org/) server so other agents can send tasks:
 
 ```bash
-onit --a2a --a2a-port 9001
+onit --a2a
 ```
 
 The agent card is available at `http://localhost:9001/.well-known/agent.json`.
@@ -277,7 +241,8 @@ The agent card is available at `http://localhost:9001/.well-known/agent.json`.
 **Send a task via CLI:**
 
 ```bash
-onit --client --a2a-host http://192.168.86.101:9001 --task "what is the weather in Manila"
+onit --client --task "what is the weather in Manila"
+onit --client --task "describe this" --image photo.jpg
 ```
 
 **Send a task via Python (A2A SDK):**
@@ -296,74 +261,15 @@ async def main():
 asyncio.run(main())
 ```
 
-**Send a task with an image (VLM):**
-
-```bash
-# Server
-onit --a2a --host <ONIT_HOST> --model Qwen/Qwen3-VL-8B-Instruct
-
-# Client
-onit --client --task "are the rambutans ripe?" --a2a-image assets/rambutan_calamansi.jpg
-```
-
-**Send an image task via Python (A2A SDK):**
-
-```python
-import asyncio, base64, os, uuid
-from a2a.client import ClientFactory
-from a2a.types import FilePart, FileWithBytes, Message, Part, Role, TextPart
-
-async def main():
-    image_path = "assets/rambutan_calamansi.jpg"
-    with open(image_path, "rb") as f:
-        image_data = base64.b64encode(f.read()).decode("utf-8")
-
-    message = Message(
-        role=Role.user,
-        message_id=str(uuid.uuid4()),
-        parts=[
-            Part(root=TextPart(text="Are the rambutans ripe enough to be eaten?")),
-            Part(root=FilePart(file=FileWithBytes(
-                bytes=image_data,
-                mime_type="image/jpeg",
-                name=os.path.basename(image_path),
-            ))),
-        ],
-    )
-
-    client = await ClientFactory.connect("http://localhost:9001")
-    async for event in client.send_message(message):
-        print(event)
-
-asyncio.run(main())
-```
-
 ### Loop Mode
 
 Repeat a task on a configurable timer (useful for monitoring):
 
 ```bash
-onit --a2a-loop --task "Check the weather in Manila" --a2a-period 60
+onit --loop --task "Check the weather in Manila" --period 60
 ```
 
 ### Custom Prompt Templates
-
-Create a YAML file with an `instruction_template` field:
-
-```yaml
-# my_template.yaml
-instruction_template: |
-  You are a research assistant. Think step by step.
-
-  <task>
-  {task}
-  </task>
-
-  Save all results to `{data_path}`.
-  Session ID: {session_id}
-```
-
-Then use it:
 
 ```bash
 onit --template-path my_template.yaml
@@ -386,22 +292,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3-30B-A3B-Instruct-2507 \
 ```
 
 ```bash
-export ONIT_HOST=http://localhost:8000/v1
-onit
-```
-
-For vision-language models (VLM), serve on a separate port:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen3.5-35B-A3B \
-  --port 8001 --max-model-len 262144 \
-  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-  --reasoning-parser qwen3 --tensor-parallel-size 4
-```
-
-```bash
-export ONIT_HOST=http://localhost:8001/v1
-onit
+onit --host http://localhost:8000/v1
 ```
 
 ### OpenRouter.ai
@@ -409,21 +300,10 @@ onit
 [OpenRouter](https://openrouter.ai/) gives access to models from OpenAI, Google, Meta, Anthropic, and others through a single API.
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-v1-your-key-here
-export ONIT_HOST=https://openrouter.ai/api/v1
-onit
+onit --host https://openrouter.ai/api/v1
 ```
 
-Browse available models at [openrouter.ai/models](https://openrouter.ai/models) and use the model ID (e.g. `google/gemini-2.5-pro`, `meta-llama/llama-4-maverick`, `openai/gpt-4.1`).
-
-## Design Philosophy
-
-- **Portable** — Minimal dependencies. Deployable from embedded devices to GPU servers.
-- **Modular** — Clear separation of AI logic, tasks, and UIs. Easily extendable with new MCP servers.
-- **Scalable** — From a single tool to complex multi-server setups.
-- **Redundant** — Multiple ways to solve a problem. Let the AI decide the optimal path.
-- **Configurable** — Edit a YAML file and you are good to go.
-- **Responsive** — Safety routines can interrupt running tasks at any time.
+Browse available models at [openrouter.ai/models](https://openrouter.ai/models).
 
 ## Architecture
 
@@ -470,6 +350,7 @@ onit/
 ├── pyproject.toml              # Package configuration
 ├── src/
 │   ├── cli.py                  # CLI entry point
+│   ├── setup.py                # Setup wizard (onit setup)
 │   ├── onit.py                 # Core agent class
 │   ├── lib/
 │   │   ├── text.py             # Text utilities
@@ -477,6 +358,8 @@ onit/
 │   ├── mcp/
 │   │   ├── prompts/            # Prompt engineering (FastMCP)
 │   │   └── servers/            # MCP servers (tools, web, bash, filesystem)
+│   ├── type/
+│   │   └── tools.py            # Tool registry and schema utilities
 │   ├── model/
 │   │   └── serving/
 │   │       └── chat.py         # LLM interface (vLLM + OpenRouter)
@@ -494,7 +377,7 @@ onit/
 - [Testing](docs/TESTING.md) — Running the test suite
 - [Docker](docs/DOCKER.md) — Docker and Docker Compose setup
 - [Web Authentication](docs/WEB_AUTHENTICATION.md) — Web UI authentication reference
-- [Web Deployment](docs/DEPLOYMENT_WEB.md) — Production deployment with HTTP/HTTPS via nginx or Caddy
+- [Web Deployment](docs/DEPLOYMENT_WEB.md) — Production deployment with HTTP/HTTPS
 
 ## License
 
