@@ -29,6 +29,11 @@ import httpx
 from openai import AsyncOpenAI, OpenAIError, APITimeoutError
 from typing import List, Optional, Any
 
+try:
+    from lib.spatial_memory import SpatialMemory
+except ImportError:
+    from ...lib.spatial_memory import SpatialMemory
+
 logger = logging.getLogger(__name__)
 
 # Maximum characters for a tool response stored in conversation history.
@@ -410,18 +415,58 @@ def _strip_old_images(messages: list) -> None:
                 msg["content"] = text + "\n[image omitted — already analyzed]"
 
 
+# Seconds-per-unit estimates for motion commands (conservative).
+_MOTION_TIMEOUT_RULES: dict[str, tuple[str, float, float]] = {
+    # tool_name: (argument_key, seconds_per_unit, minimum_seconds)
+    "rotate_angle":     ("angle",    0.5,  15.0),
+    "move_distance":    ("distance", 3.0,  15.0),
+    "navigate_to_pose": (None,       0.0,  60.0),
+    "go_to_waypoint":   (None,       0.0,  60.0),
+    "move_robot":       ("distance", 3.0,  15.0),
+}
+
+
+def _motion_timeout(function_name: str, arguments: dict, base_timeout) -> int | float | None:
+    """Return a proportional timeout for motion tools.
+
+    For large rotations or long moves the default timeout may be too short.
+    Scale the timeout based on the magnitude of the requested motion,
+    using either the scaled value or the original base timeout — whichever
+    is larger.  Non-motion tools pass through unchanged.
+    """
+    if base_timeout is None:
+        return None
+    rule = _MOTION_TIMEOUT_RULES.get(function_name)
+    if rule is None:
+        return base_timeout
+    arg_key, secs_per_unit, minimum = rule
+    if arg_key and arg_key in arguments:
+        try:
+            magnitude = abs(float(arguments[arg_key]))
+        except (TypeError, ValueError):
+            return max(base_timeout, minimum)
+        scaled = magnitude * secs_per_unit + minimum
+        return max(base_timeout, scaled)
+    return max(base_timeout, minimum)
+
+
 async def _execute_tool(function_name: str, function_arguments: dict,
                         tool_call_id: str, tool_registry, timeout, data_path,
                         chat_ui, verbose, messages: list,
                         tool_call_history: list,
                         max_repeated: int,
                         is_structured: bool = False,
-                        session_id: str = "") -> Optional[str]:
+                        session_id: str = "",
+                        spatial_memory=None) -> Optional[str]:
     """Execute a single tool call and append the result to messages.
 
     Returns a bail-out message string if repeated-call limit is hit,
     otherwise returns None (caller should continue).
     """
+    # Snapshot pose before motion so we can produce a structured diff afterwards.
+    _is_motion = spatial_memory and spatial_memory.is_motion_tool(function_name)
+    if _is_motion:
+        spatial_memory.record_pre_motion_state()
     # Inject session_id / data_path into tool calls whose schema declares
     # these parameters, so callers (e.g. sandbox MCP servers) receive them
     # automatically without hardcoding tool names.
@@ -482,7 +527,8 @@ async def _execute_tool(function_name: str, function_arguments: dict,
 
                 heartbeat_task = asyncio.ensure_future(_heartbeat())
                 try:
-                    tool_response = await asyncio.wait_for(tool_task, timeout=timeout)
+                    effective_timeout = _motion_timeout(function_name, function_arguments, timeout)
+                    tool_response = await asyncio.wait_for(tool_task, timeout=effective_timeout)
                 finally:
                     heartbeat_task.cancel()
                     try:
@@ -490,10 +536,20 @@ async def _execute_tool(function_name: str, function_arguments: dict,
                     except asyncio.CancelledError:
                         pass
             except asyncio.TimeoutError:
-                tool_response = (f"- tool call timed out after {timeout} seconds. "
-                                 "Tool might have succeeded but no response was received. "
-                                 "Check expected output.")
-                _log_to_ui_or_verbose(f"{function_name} timed out after {timeout}s", chat_ui, verbose, level="warning")
+                _eff = effective_timeout if 'effective_timeout' in dir() else timeout
+                _diag_parts = [
+                    f"- tool call '{function_name}' timed out after {_eff} seconds.",
+                    "The command may still be executing on the robot.",
+                ]
+                if _is_motion:
+                    _diag_parts.append(
+                        "Recovery: 1) Query get_robot_pose to check current position. "
+                        "2) Use describe_scene to verify what changed. "
+                        "3) If the robot moved partially, adjust your next command accordingly. "
+                        "4) If stuck, try a smaller motion or a different approach angle."
+                    )
+                tool_response = " ".join(_diag_parts)
+                _log_to_ui_or_verbose(f"{function_name} timed out after {_eff}s", chat_ui, verbose, level="warning")
             if is_structured and chat_ui:
                 chat_ui.stop_tool_spinner()
             tool_response = "" if tool_response is None else str(tool_response)
@@ -501,6 +557,18 @@ async def _execute_tool(function_name: str, function_arguments: dict,
             if data_path and "file_data_base64" in tool_response:
                 tool_response, _vision_b64, _vision_mime = _extract_base64_file(tool_response, data_path)
             tool_response = _truncate_tool_response(tool_response)
+
+            # --- Post-motion structured feedback (CaP-X VDM-inspired) ---
+            if _is_motion and "get_robot_pose" in tool_registry.tools:
+                try:
+                    pose_handler = tool_registry["get_robot_pose"]
+                    pose_json = await asyncio.wait_for(pose_handler(), timeout=10)
+                    feedback = spatial_memory.post_motion_feedback(str(pose_json) if pose_json else None)
+                    if feedback:
+                        tool_response += feedback
+                except Exception:
+                    pass  # best-effort; don't fail the tool call
+
             if _vision_b64:
                 tool_content = [
                     {"type": "text", "text": tool_response},
@@ -524,7 +592,13 @@ async def _execute_tool(function_name: str, function_arguments: dict,
                     chat_ui.stop_tool_spinner()
                     chat_ui.show_tool_done(function_name, str(e), success=False)
             _log_to_ui_or_verbose(f"{function_name} error: {e}", chat_ui, verbose, level="error")
-            tool_message = {'role': 'tool', 'content': f'Error: {e}', 'name': function_name,
+            _err_parts = [f"Error running {function_name}: {e}"]
+            if _is_motion:
+                _err_parts.append(
+                    "Recovery: Query get_robot_pose and describe_scene to assess "
+                    "current state, then retry with adjusted parameters."
+                )
+            tool_message = {'role': 'tool', 'content': ' '.join(_err_parts), 'name': function_name,
                             'parameters': function_arguments, "tool_call_id": tool_call_id}
             messages.append(tool_message)
 
@@ -755,6 +829,7 @@ async def _handle_raw_tool_call(
     chat_ui, verbose: bool, messages: list,
     tool_call_history: list, max_repeated: int,
     session_id: str = "",
+    spatial_memory=None,
 ) -> tuple[bool, str | None]:
     """Handle a raw JSON tool call embedded in model content.
 
@@ -776,6 +851,7 @@ async def _handle_raw_tool_call(
                 tool_registry, timeout, data_path, chat_ui, verbose,
                 messages, tool_call_history, max_repeated,
                 is_structured=False, session_id=session_id,
+                spatial_memory=spatial_memory,
             )
             if bail:
                 return False, bail
@@ -802,6 +878,7 @@ async def _handle_structured_tool_calls(
     messages: list, tool_call_history: list,
     max_repeated: int, safety_queue: asyncio.Queue,
     session_id: str = "",
+    spatial_memory=None,
 ) -> str | object | None:
     """Execute structured tool calls and append results to messages.
 
@@ -840,6 +917,7 @@ async def _handle_structured_tool_calls(
             tool_registry, timeout, data_path, chat_ui, verbose,
             messages, tool_call_history, max_repeated,
             is_structured=True, session_id=session_id,
+            spatial_memory=spatial_memory,
         )
         if bail:
             return bail
@@ -985,6 +1063,9 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
         chat_ui.model_name = model
     _log_to_ui_or_verbose(f"Starting chat with model: {model}", chat_ui, verbose, level="info")
 
+    # Create spatial memory for visual differencing / post-motion feedback.
+    spatial_memory = SpatialMemory(data_path) if data_path else None
+
     # Query vLLM for the model's maximum context window if not provided in config.
     # Skip for OpenRouter (doesn't expose max_model_len).
     if max_context_tokens is None and "openrouter.ai" not in host:
@@ -1122,6 +1203,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
                 _content, tool_registry, timeout, data_path,
                 chat_ui, verbose, messages, tool_call_history,
                 MAX_REPEATED_TOOL_CALLS, session_id=session_id,
+                spatial_memory=spatial_memory,
             )
             if bail:
                 return bail
@@ -1136,6 +1218,7 @@ async def chat(host: str = "http://127.0.0.1:8001/v1",
             timeout, data_path, chat_ui, verbose,
             messages, tool_call_history, MAX_REPEATED_TOOL_CALLS,
             safety_queue, session_id=session_id,
+            spatial_memory=spatial_memory,
         )
         if bail is _SAFETY_ABORT:
             return None

@@ -80,6 +80,21 @@ instruction_template: |
   5. **Verify** — Confirm task completion using sensor feedback (e.g., reached waypoint, object detected, action confirmed).
   6. **Report** — Summarize what was accomplished and the final robot state.
 
+  ## Post-Action Verification Protocol (MANDATORY)
+  After EVERY motion or manipulation command you MUST follow this cycle:
+  1. **State your HYPOTHESIS** before moving: "I expect the robot will be at X, facing Y after this action."
+  2. **Check auto-feedback**: The system appends a `[Post-Motion Feedback]` block to every motion
+     tool response. Read it carefully — it shows the robot's pose before and after the motion,
+     together with a `[Scene Change]` summary describing what changed visually.
+  3. **Assess**: Does the feedback match your hypothesis?
+     - **YES** → update your task progress and move to the next step.
+     - **NO** → diagnose the discrepancy (stuck? obstacle? drift?), adjust your plan, and retry.
+  4. **Update task progress**: After each verified action, briefly state where you are in the
+     overall plan, e.g., "Step 2/5 complete — target is now ~1 m ahead."
+
+  Never issue two consecutive motion commands without reading the verification feedback between them.
+  Treat unverified motion as potentially failed — do not build further plans on top of it.
+
   ## Goal Framing & Success Criteria
   Before acting, translate the task into **observable success conditions**.
   - Restate the goal in terms of what the robot must be able to verify with sensors.

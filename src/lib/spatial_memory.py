@@ -283,6 +283,10 @@ class SpatialMemory:
         self._scans_since_move: int = 0
         self.camera_hfov_deg = DEFAULT_HFOV_DEG
         self.image_width_px = 640.0
+        # Visual differencing state: store the latest scene description so we
+        # can produce a structured diff after motion commands.
+        self._last_scene_description: str | None = None
+        self._pre_motion_pose: _Pose | None = None
         if self.state_path:
             os.makedirs(data_path, exist_ok=True)
 
@@ -387,6 +391,10 @@ class SpatialMemory:
         if scan_warning:
             sections.append(scan_warning)
         return "[" + " | " .join(sections) + "]" if sections else None
+
+    def is_motion_tool(self, function_name: str) -> bool:
+        """Return True if *function_name* is a known motion command."""
+        return function_name in MOTION_TOOL_NAMES
 
     def export(self) -> dict[str, Any]:
         return {
@@ -532,11 +540,15 @@ class SpatialMemory:
     def _observe_describe_scene(self, _arguments: dict[str, Any], tool_response: str) -> list[str]:
         self._scans_since_move += 1
         self._record_vantage()
+        # Store scene description for visual differencing
+        self._last_scene_description = self._extract_scene_text(tool_response)
         return self._observe_textual_scene("describe_scene", tool_response)
 
     def _observe_ask_vision_agent(self, _arguments: dict[str, Any], tool_response: str) -> list[str]:
         self._scans_since_move += 1
         self._record_vantage()
+        # Store scene description for visual differencing
+        self._last_scene_description = self._extract_scene_text(tool_response)
         return self._observe_textual_scene("ask_vision_agent", tool_response)
 
     def _observe_ask_cosmos_agent(self, _arguments: dict[str, Any], tool_response: str) -> list[str]:
@@ -567,6 +579,80 @@ class SpatialMemory:
         self.last_pose = None
         self._scans_since_move = 0
         return []
+
+    # ------------------------------------------------------------------
+    # Visual Differencing helpers (inspired by CaP-X VDM)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_scene_text(tool_response: str) -> str | None:
+        """Pull the human-readable scene description from a tool response."""
+        payload = _safe_json_loads(tool_response)
+        if isinstance(payload, dict):
+            return (
+                payload.get("vlm_response")
+                or payload.get("cosmos_response")
+                or payload.get("result")
+                or tool_response
+            )
+        return tool_response if tool_response else None
+
+    def record_pre_motion_state(self) -> None:
+        """Snapshot the current pose before a motion command executes."""
+        self._pre_motion_pose = _Pose(
+            self.last_pose.x, self.last_pose.y, self.last_pose.yaw_deg
+        ) if self.last_pose else None
+
+    def post_motion_feedback(self, new_pose_json: str | None) -> str | None:
+        """Return a structured feedback block comparing pre- and post-motion state.
+
+        Call this after a motion tool completes. *new_pose_json* is the raw
+        JSON string from a ``get_robot_pose`` call made right after the motion.
+        Returns a human-readable block to append to the tool response, or None
+        if insufficient data is available.
+        """
+        parts: list[str] = []
+
+        # --- Pose delta ---
+        new_pose_data = _safe_json_loads(new_pose_json) if new_pose_json else None
+        if isinstance(new_pose_data, dict):
+            yaw = new_pose_data.get("yaw_deg")
+            if yaw is None and new_pose_data.get("yaw_rad") is not None:
+                yaw = math.degrees(float(new_pose_data["yaw_rad"]))
+            if new_pose_data.get("x") is not None and new_pose_data.get("y") is not None and yaw is not None:
+                nx, ny, nyaw = float(new_pose_data["x"]), float(new_pose_data["y"]), float(yaw)
+                self.last_pose = _Pose(nx, ny, nyaw)
+                parts.append(f"Current pose: x={nx:.2f}, y={ny:.2f}, yaw={nyaw:.1f}°")
+                if self._pre_motion_pose:
+                    dx = nx - self._pre_motion_pose.x
+                    dy = ny - self._pre_motion_pose.y
+                    dist = math.hypot(dx, dy)
+                    dyaw = nyaw - self._pre_motion_pose.yaw_deg
+                    # Normalize to [-180, 180]
+                    dyaw = (dyaw + 180) % 360 - 180
+                    parts.append(
+                        f"Motion delta: moved {dist:.2f} m, rotated {dyaw:.1f}° "
+                        f"(from x={self._pre_motion_pose.x:.2f}, y={self._pre_motion_pose.y:.2f}, "
+                        f"yaw={self._pre_motion_pose.yaw_deg:.1f}°)"
+                    )
+                    if dist < 0.05 and abs(dyaw) < 2.0:
+                        parts.append("⚠ WARNING: Robot barely moved — possible obstacle or stuck.")
+
+        # --- Scene change (visual differencing) ---
+        if self._last_scene_description:
+            # Truncate to keep context manageable
+            scene_snippet = self._last_scene_description[:500]
+            parts.append(f"Last known scene (before motion): {scene_snippet}")
+            parts.append(
+                "The scene may have changed after this motion. "
+                "Use describe_scene or get_sensor_snapshot to verify."
+            )
+
+        self._pre_motion_pose = None  # consumed
+
+        if not parts:
+            return None
+        return "\n[Post-Motion Feedback]\n" + "\n".join(parts)
 
     def _observe_textual_scene(self, source: str, tool_response: str) -> list[str]:
         payload = _safe_json_loads(tool_response)
