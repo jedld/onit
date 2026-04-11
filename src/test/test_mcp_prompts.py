@@ -41,7 +41,7 @@ class TestAssistantInstruction:
         dp = str(tmp_path / "data")
         result = await _assistant_fn(task="test", data_path=dp)
         assert dp in result
-        assert "Persistent Landmark Hypothesis Contract" in result
+        assert "You are an autonomous agent with access to tools and a file system." in result
 
     @pytest.mark.asyncio
     async def test_custom_template(self, tmp_path):
