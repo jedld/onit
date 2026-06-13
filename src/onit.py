@@ -466,6 +466,8 @@ class OnIt(BaseModel):
     task: str | None = Field(default=None)
     web: bool = Field(default=False)
     web_port: int = Field(default=9000)
+    api: bool = Field(default=False)
+    api_port: int = Field(default=9002)
     web_google_client_id: str | None = Field(default=None)
     web_google_client_secret: str | None = Field(default=None)
     web_allowed_emails: list[str] | None = Field(default=None)
@@ -520,6 +522,8 @@ class OnIt(BaseModel):
                     verbose=self.verbose,
                 )
                 self.chat_ui._onit = self
+            elif self.api:
+                self.chat_ui = None
             else:
                 if self.a2a:
                     banner = "OnIt Agent to Agent Server"
@@ -694,6 +698,9 @@ class OnIt(BaseModel):
             else:
                 local_ip = "127.0.0.1"
             self.file_server_url = f"http://{local_ip}:{a2a_port}"
+        elif self.config_data.get('api', False):
+            api_port = self.config_data.get('api_port', 9002)
+            self.file_server_url = f"http://127.0.0.1:{api_port}"
 
     def _setup_config_fields(self) -> None:
         """Assign remaining configuration fields from config_data."""
@@ -711,6 +718,8 @@ class OnIt(BaseModel):
         self.task = self.config_data.get('task', None)
         self.web = self.config_data.get('web', False)
         self.web_port = self.config_data.get('web_port', 9000)
+        self.api = self.config_data.get('api', False)
+        self.api_port = self.config_data.get('api_port', 9002)
         self.web_google_client_id = self.config_data.get('web_google_client_id', None)
         self.web_google_client_secret = self.config_data.get('web_google_client_secret', None)
         # Nullify placeholder credentials so auth is cleanly disabled
@@ -768,6 +777,8 @@ class OnIt(BaseModel):
             self.status = "running"
             if self.a2a:
                 await self.run_a2a()
+            elif self.api:
+                await self.run_api()
             elif self.loop:
                 await self.run_loop()
             else:
@@ -1015,6 +1026,18 @@ class OnIt(BaseModel):
                 return
             except Exception:
                 await asyncio.sleep(self.period)
+
+    async def run_api(self) -> None:
+        """Run OnIt as a lightweight HTTP chat API for external web UIs."""
+        from .ui.api import ChatAPIServer
+
+        api = ChatAPIServer(
+            self,
+            port=self.api_port,
+            show_logs=self.show_logs,
+            session_path=self.session_path,
+        )
+        await api.serve()
 
     async def run_a2a(self) -> None:
         """Run OnIt as an A2A server, accepting tasks from other agents."""

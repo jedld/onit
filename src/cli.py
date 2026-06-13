@@ -560,6 +560,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--web-port', type=int, default=None,
                         help='Port for Gradio web UI (default: 9000).')
 
+    # Chat API options (embeddable HTTP API for external UIs)
+    parser.add_argument('--api', action='store_true', default=None,
+                        help='Launch lightweight HTTP chat API for external web UIs.')
+    parser.add_argument('--api-port', type=int, default=None,
+                        help='Chat API port (default: 9002).')
+
     # A2A options
     parser.add_argument('--a2a', action='store_true', default=None,
                         help='Run as an A2A protocol server.')
@@ -648,6 +654,8 @@ def _parse_and_resolve_config(args: argparse.Namespace) -> dict:
         'show_logs': 'show_logs',
         'web': 'web',
         'web_port': 'web_port',
+        'api': 'api',
+        'api_port': 'api_port',
         'data_path': 'data_path',
         'template_path': 'template_path',
         'documents_path': 'documents_path',
